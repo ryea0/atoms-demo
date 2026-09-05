@@ -33,7 +33,11 @@ export function openSqlite(dbFile: string): Database.Database {
 class SqliteStorage implements StorageProvider {
   private readonly db: SqliteDb;
 
-  constructor(db: SqliteDb) {
+  constructor(
+    private readonly dbFile: string,
+    private readonly client: Database.Database,
+    db: SqliteDb,
+  ) {
     this.db = db;
   }
 
@@ -53,11 +57,29 @@ class SqliteStorage implements StorageProvider {
       .where(eq(projects.sessionId, sessionId))
       .orderBy(desc(projects.updatedAt));
   }
+
+  /** 关闭连接（幂等）：文件库实例同时移出缓存，之后需重新走工厂 */
+  close(): void {
+    fileStorages.delete(this.dbFile);
+    if (this.client.open) this.client.close();
+  }
 }
 
-/** 工厂：dbFile 传 ':memory:' 即内存库（测试用），否则为文件库路径 */
+/** 文件库实例缓存（按 dbFile 路径 memoize）：同进程同库只持一个连接，防句柄泄漏与 WAL 写者叠加 */
+const fileStorages = new Map<string, StorageProvider>();
+
+/**
+ * 工厂：dbFile 传 ':memory:' 即内存库，否则为文件库路径。
+ * 生命周期：文件库按路径 memoize——在模块层调用一次并长期持有，勿每请求新建；释放走 `storage.close()`。
+ * ':memory:' 不缓存：每次调用返回全新独立内存库（测试隔离语义，见 src/lib/db/test-util.ts）。
+ */
 export function createSqliteStorage(dbFile: string): StorageProvider {
+  const isMemory = dbFile === ':memory:';
+  const cached = isMemory ? undefined : fileStorages.get(dbFile);
+  if (cached) return cached;
   const client = openSqlite(dbFile);
   ensureSchema(client);
-  return new SqliteStorage(drizzle(client, { schema }));
+  const storage = new SqliteStorage(dbFile, client, drizzle(client, { schema }));
+  if (!isMemory) fileStorages.set(dbFile, storage);
+  return storage;
 }

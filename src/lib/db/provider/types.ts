@@ -40,4 +40,10 @@ export interface StorageProvider {
   /** 项目仓库（Task 3 扩展：列表聚合、重命名、删除级联） */
   createProject(input: CreateProjectInput): Promise<Project>;
   listProjects(sessionId: string): Promise<Project[]>;
+  /**
+   * 关闭底层连接（幂等；关闭后本实例不可再用，需重新走工厂）。
+   * 文件库实例按 dbFile 路径 memoize——业务侧在模块层调用一次 createStorage() 并持有即可，
+   * 切勿每请求新建（否则句柄泄漏、WAL 写者叠加，SQLite 单写者模型会互相阻塞）。
+   */
+  close(): void;
 }
