@@ -147,13 +147,15 @@ describe('Workspace 三栏布局', () => {
     expect(screen.getByRole('region', { name: '文件树' })).toBeInTheDocument();
     expect(screen.getByRole('region', { name: '查看器' })).toBeInTheDocument();
 
-    // 空态提示（T19/T20/T21 填充前的占位文案）
+    // 空态提示（聊天/查看器仍为占位；文件树自 T20 起挂真实 FileTree）
     expect(screen.getByText('团队消息与任务时间线会在这里实时展示')).toBeInTheDocument();
-    expect(screen.getByText('生成开始后，文件会在这里长出目录树')).toBeInTheDocument();
     expect(screen.getByText('在文件树中选择文件，在这里查看与编辑')).toBeInTheDocument();
 
-    // 文件树空态带真实统计（快照里有 2 个文件）
-    expect(screen.getByText('已生成 2 个文件')).toBeInTheDocument();
+    // 文件树渲染快照文件（docs/app 整棵子树默认展开可见）
+    expect(screen.getByRole('tree', { name: '项目文件' })).toBeInTheDocument();
+    expect(screen.getByText('index.html')).toBeInTheDocument();
+    expect(screen.getByText('prd.md')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '下载项目' })).toBeEnabled(); // 快照就绪 → 项目可导出
 
     unmount();
     expect(MockEventSource.instances[0]?.closed).toBe(true);
