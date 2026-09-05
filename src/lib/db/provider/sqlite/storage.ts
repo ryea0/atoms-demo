@@ -1,16 +1,17 @@
 /**
  * SQLite 版 StorageProvider 工厂（DESIGN §12 当前实现：drizzle sqlite + better-sqlite3 WAL）
- * 方法随 Task 3-5 逐组补齐；业务代码只依赖 StorageProvider 接口，不 import 本文件。
+ * 本文件只管连接生命周期与仓库装配；查询/写入在各 repo-*.ts 按仓库分组实现。
+ * 业务代码只依赖 StorageProvider 接口，不 import 本文件。
  */
-import { desc, eq } from 'drizzle-orm';
 import Database from 'better-sqlite3';
 import { drizzle, type BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { ensureSchema } from './ddl';
-import { projects } from './schema';
+import { createProjectsRepo } from './repo-projects';
+import { createMessagesRepo } from './repo-messages';
 import * as schema from './schema';
-import type { CreateProjectInput, Project, StorageProvider } from '../types';
+import type { StorageProvider } from '../types';
 
 /** drizzle sqlite 连接类型（带 schema 推断），后续仓库模块复用 */
 export type SqliteDb = BetterSQLite3Database<typeof schema>;
@@ -29,44 +30,24 @@ export function openSqlite(dbFile: string): Database.Database {
   return db;
 }
 
-/** SQLite 实现：方法按仓库分组，逐任务补齐 */
-class SqliteStorage implements StorageProvider {
-  private readonly db: SqliteDb;
-
-  constructor(
-    private readonly dbFile: string,
-    private readonly client: Database.Database,
-    db: SqliteDb,
-  ) {
-    this.db = db;
-  }
-
-  /** 建项目：status/created_at/updated_at 由库默认值兜底 */
-  async createProject(input: CreateProjectInput): Promise<Project> {
-    const rows = await this.db.insert(projects).values(input).returning();
-    const row = rows[0];
-    if (!row) throw new Error('项目写入失败：insert 未返回行');
-    return row;
-  }
-
-  /** 按 session 列项目：最小实现（列表聚合字段随 Task 3 的 repo-projects 扩展） */
-  async listProjects(sessionId: string): Promise<Project[]> {
-    return this.db
-      .select()
-      .from(projects)
-      .where(eq(projects.sessionId, sessionId))
-      .orderBy(desc(projects.updatedAt));
-  }
-
-  /** 关闭连接（幂等）：文件库实例同时移出缓存，之后需重新走工厂 */
-  close(): void {
-    fileStorages.delete(this.dbFile);
-    if (this.client.open) this.client.close();
-  }
-}
-
 /** 文件库实例缓存（按 dbFile 路径 memoize）：同进程同库只持一个连接，防句柄泄漏与 WAL 写者叠加 */
 const fileStorages = new Map<string, StorageProvider>();
+
+/**
+ * 装配：把各仓库方法 spread 进同一对象。
+ * 返回类型显式标注 StorageProvider——即契约完整性检查（漏实现/方法名打错都编译失败）。
+ */
+function assembleStorage(dbFile: string, client: Database.Database, db: SqliteDb): StorageProvider {
+  return {
+    ...createProjectsRepo(db),
+    ...createMessagesRepo(db),
+    /** 关闭连接（幂等）：文件库实例同时移出缓存，之后需重新走工厂 */
+    close(): void {
+      fileStorages.delete(dbFile);
+      if (client.open) client.close();
+    },
+  };
+}
 
 /**
  * 工厂：dbFile 传 ':memory:' 即内存库，否则为文件库路径。
@@ -79,7 +60,7 @@ export function createSqliteStorage(dbFile: string): StorageProvider {
   if (cached) return cached;
   const client = openSqlite(dbFile);
   ensureSchema(client);
-  const storage = new SqliteStorage(dbFile, client, drizzle(client, { schema }));
+  const storage = assembleStorage(dbFile, client, drizzle(client, { schema }));
   if (!isMemory) fileStorages.set(dbFile, storage);
   return storage;
 }

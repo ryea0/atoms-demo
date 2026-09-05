@@ -1,0 +1,103 @@
+import { describe, it, expect } from 'vitest';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { newTestStorage } from '@/lib/db/test-util';
+import { openSqlite } from '@/lib/db/provider/sqlite/storage';
+import { ensureSchema } from '@/lib/db/provider/sqlite/ddl';
+import { createProjectsRepo } from '@/lib/db/provider/sqlite/repo-projects';
+import { createMessagesRepo } from '@/lib/db/provider/sqlite/repo-messages';
+import { files, llmCalls } from '@/lib/db/provider/sqlite/schema';
+import * as schema from '@/lib/db/provider/sqlite/schema';
+
+describe('repo projects/messages', () => {
+  it('删除项目级联消息；干预队列取后标记', async () => {
+    const s = newTestStorage();
+    const p = await s.createProject({ sessionId:'s1', title:'t', requirement:'r', mode:'fast' });
+    await s.addMessage({ projectId:p.id, role:'intervention', content:'按钮改蓝色' });
+    const pend = await s.takePendingInterventions(p.id);
+    expect(pend.length).toBe(1);
+    // @ts-expect-error 测试样例按 brief 原文保留，未对 pend[0] 判空（noUncheckedIndexedAccess 语义）
+    await s.markDelivered([pend[0].id]);
+    expect((await s.takePendingInterventions(p.id)).length).toBe(0);
+    await s.deleteProject(p.id);
+    expect(await s.getProject(p.id)).toBeNull();
+    expect((await s.listMessages(p.id)).length).toBe(0);
+  });
+  it('跨 session 隔离', async () => {
+    const s = newTestStorage();
+    await s.createProject({ sessionId:'a', title:'t', requirement:'r', mode:'fast' });
+    expect((await s.listProjects('b')).length).toBe(0);
+  });
+});
+
+/**
+ * 补充回归（brief 两用例未覆盖的接口面）：聚合 DTO、重命名/状态、最近会话、meta JSON 回读。
+ * 直接装配仓库（与 storage.ts 的 assembleStorage 同构），并经同一连接造 files/llm_calls 数
+ * （测试夹具可摸 db；生产代码一律走仓库层——.claude/rules/05）。
+ */
+describe('repo projects 聚合与状态', () => {
+  function newRepos() {
+    const client = openSqlite(':memory:');
+    ensureSchema(client);
+    const db = drizzle(client, { schema });
+    return { db, ...createProjectsRepo(db), ...createMessagesRepo(db) };
+  }
+
+  function seedFile(projectId: number, path: string) {
+    return { projectId, path, content: 'export {}', producedBy: 'seed' as const, lastEditor: 'seed' as const };
+  }
+
+  function seedCall(projectId: number, promptTokens: number, completionTokens: number) {
+    return { projectId, agentRole: 'pm' as const, model: 'mock', promptTokens, completionTokens, latencyMs: 1 };
+  }
+
+  it('listProjects 一次查询聚合 文件数/token 汇总/最后消息（无 N+1）', async () => {
+    const r = newRepos();
+    const p = await r.createProject({ sessionId: 's', title: '卡片', requirement: '做个 TODO', mode: 'fast' });
+    const empty = await r.createProject({ sessionId: 's', title: '空项目', requirement: 'r', mode: 'full' });
+    await r.db.insert(files).values([seedFile(p.id, 'app/page.tsx'), seedFile(p.id, 'app/api.ts')]);
+    await r.db.insert(llmCalls).values([seedCall(p.id, 10, 5), seedCall(p.id, 7, 3)]);
+    await r.addMessage({ projectId: p.id, role: 'user', content: '第一条' });
+    await r.addMessage({ projectId: p.id, role: 'assistant', content: '最后一条' });
+
+    const rows = await r.listProjects('s');
+    expect(rows).toHaveLength(2);
+    const full = rows.find((row) => row.id === p.id);
+    expect(full?.fileCount).toBe(2);
+    expect(full?.totalTokens).toBe(25); // (10+5)+(7+3)，不被 join 笛卡尔积放大
+    expect(full?.lastMessage).toBe('最后一条');
+    const blank = rows.find((row) => row.id === empty.id);
+    expect(blank?.fileCount).toBe(0);
+    expect(blank?.totalTokens).toBe(0);
+    expect(blank?.lastMessage).toBeNull();
+  });
+
+  it('重命名/状态更新；getRecentSessions 按 updatedAt 倒序且默认 8 条', async () => {
+    const r = newRepos();
+    for (let i = 0; i < 10; i += 1) {
+      await r.createProject({ sessionId: 's', title: `p${i}`, requirement: 'r', mode: 'fast' });
+    }
+    const oldest = (await r.listProjects('s')).at(-1);
+    if (!oldest) throw new Error('应已创建 10 个项目');
+    await r.renameProject(oldest.id, '改名了');
+    await r.updateProjectStatus(oldest.id, 'running');
+
+    const after = await r.getProject(oldest.id);
+    expect(after?.title).toBe('改名了');
+    expect(after?.status).toBe('running');
+
+    const recent = await r.getRecentSessions('s');
+    expect(recent).toHaveLength(8); // 默认 limit=8
+    expect(recent[0]?.id).toBe(oldest.id); // 刚更新的项目排最前
+    expect(recent[0]?.updatedAt ?? 0).toBeGreaterThanOrEqual(recent[1]?.updatedAt ?? 0);
+    expect(await r.getRecentSessions('s', 3)).toHaveLength(3);
+  });
+
+  it('meta JSON 对象回读；非干预消息落库即视为已送达', async () => {
+    const r = newRepos();
+    const p = await r.createProject({ sessionId: 's', title: 't', requirement: 'r', mode: 'fast' });
+    await r.addMessage({ projectId: p.id, role: 'user', content: '找工程师改', meta: { mentions: ['engineer'] } });
+    const msgs = await r.listMessages(p.id);
+    expect(msgs[0]?.meta).toEqual({ mentions: ['engineer'] });
+    expect(msgs[0]?.deliveredAt).not.toBeNull();
+  });
+});

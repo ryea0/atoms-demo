@@ -31,15 +31,47 @@ export interface LlmCall { id:number; projectId:number; agentRole:AgentRole; mod
 /** createProject 入参（id/status/时间戳由存储层与库默认值生成） */
 export interface CreateProjectInput { sessionId:string; title:string; requirement:string; mode:'fast'|'full'; }
 
+/** addMessage 入参（id/deliveredAt/createdAt 由存储层生成） */
+export interface AddMessageInput { projectId:number; role:Message['role']; content:string;
+  meta?:Message['meta']; }
+
+/** 项目卡片 DTO（列表页一次查询聚合取齐，禁 N+1——.claude/rules/05） */
+export type ProjectListItem = Project & {
+  /** files 表行数 */
+  fileCount:number;
+  /** llm_calls 的 prompt+completion 之和（无调用=0） */
+  totalTokens:number;
+  /** 最后一条消息内容（无消息=null） */
+  lastMessage:string|null;
+};
+
+/** 项目仓库：全部查询强制 sessionId/projectId 过滤（CLAUDE.md 规则 9） */
+export interface ProjectsRepo {
+  createProject(input: CreateProjectInput): Promise<Project>;
+  listProjects(sessionId: string): Promise<ProjectListItem[]>;
+  getProject(projectId: number): Promise<Project|null>;
+  renameProject(projectId: number, title: string): Promise<void>;
+  /** 级联删除：files/messages/llm_calls/checkpoints 等随外键 onDelete cascade 一起删 */
+  deleteProject(projectId: number): Promise<void>;
+  updateProjectStatus(projectId: number, status: ProjectStatus): Promise<void>;
+  /** 最近会话（updatedAt 倒序），默认取 8 条 */
+  getRecentSessions(sessionId: string, limit?: number): Promise<Project[]>;
+}
+
+/** 消息/干预队列仓库：干预队列 = role='intervention' AND delivered_at IS NULL（CLAUDE.md 规则 9） */
+export interface MessagesRepo {
+  addMessage(input: AddMessageInput): Promise<Message>;
+  listMessages(projectId: number): Promise<Message[]>;
+  takePendingInterventions(projectId: number): Promise<Message[]>;
+  markDelivered(messageIds: number[]): Promise<void>;
+}
+
 /**
- * 存储抽象（DESIGN §12）：方法按仓库分组，随 Task 3-5 逐组补齐
- * （messages/agent_runs/files/file_versions/llm_calls/preferences/checkpoints…）。
+ * 存储抽象（DESIGN §12）：按仓库分组继承，随 Task 4-5 继续补齐
+ * （agent_runs/files/file_versions/llm_calls/preferences/checkpoints…）。
  * 实现侧约定：所有查询强制 project_id 过滤（CLAUDE.md 规则 9）、更新走乐观锁（规则 05）。
  */
-export interface StorageProvider {
-  /** 项目仓库（Task 3 扩展：列表聚合、重命名、删除级联） */
-  createProject(input: CreateProjectInput): Promise<Project>;
-  listProjects(sessionId: string): Promise<Project[]>;
+export interface StorageProvider extends ProjectsRepo, MessagesRepo {
   /**
    * 关闭底层连接（幂等；关闭后本实例不可再用，需重新走工厂）。
    * 文件库实例按 dbFile 路径 memoize——业务侧在模块层调用一次 createStorage() 并持有即可，
