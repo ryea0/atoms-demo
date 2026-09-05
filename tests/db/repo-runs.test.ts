@@ -43,7 +43,7 @@ describe('repo runs：brief 原文用例', () => {
     const p = await newProject(s);
     const a = await s.upsertFile({ projectId: p.id, path: 'app/a.js', content: 'A1', editor: 'engineer' });
     const b = await s.upsertFile({ projectId: p.id, path: 'app/b.js', content: 'B1', editor: 'engineer' });
-    const cpId = await s.createCheckpoint(p.id, 'pm 任务前基线', null);
+    const cpId = await s.createCheckpoint(p.id, 'pm 任务前基线', null, await s.latestRunId(p.id));
     expect(cpId).toBeGreaterThan(0);
 
     // 打点之后继续演进：改 a.js、改 b.js、新增 c.js
@@ -75,30 +75,33 @@ describe('repo runs：brief 原文用例', () => {
     expect((await s.getFile(p.id, 'app/a.js'))?.content).toBe('A2');
   });
 
-  it('markRunsRolledBack：id ≤ uptoRunId 的本项目任务全部标 rolled_back，其余不受影响', async () => {
+  it('markRunsRolledBack：id > sinceRunId（检查点之后）的任务标 rolled_back，边界及之前不动', async () => {
     const s = newTestStorage();
     const p = await newProject(s, 'a');
     const other = await newProject(s, 'b');
+    expect(await s.latestRunId(p.id)).toBe(0); // 空项目：回滚边界 = 0（restore 会标记全部）
     const r1 = await s.createAgentRun({ projectId: p.id, taskKey: 'pm:prd', agent: 'pm', task: '产出 PRD' });
     const r2 = await s.createAgentRun({ projectId: p.id, taskKey: 'arch:design', agent: 'architect', task: '出架构图' });
     const r3 = await s.createAgentRun({ projectId: p.id, taskKey: 'eng:app/a.js', agent: 'engineer', task: '写 app/a.js' });
     await s.createAgentRun({ projectId: other.id, taskKey: 'eng:app/b.js', agent: 'engineer', task: '写 app/b.js' });
+    expect(await s.latestRunId(p.id)).toBe(r3.id); // 打点时捕获回滚边界
 
-    // 先推进到中间态，验证回滚标记会覆盖既有状态
+    // 推进状态；生产形状：检查点在 r3 之前打（afterRunId=r2.id），r3 是检查点后的工作
     await s.updateAgentRun(r1.id, { status: 'done', summary: 'PRD 完成' });
-    await s.updateAgentRun(r2.id, { status: 'running', startedAt: Date.now() });
-    await s.updateAgentRun(r3.id, { status: 'done', endedAt: Date.now() });
+    await s.updateAgentRun(r2.id, { status: 'done', endedAt: Date.now() });
+    await s.updateAgentRun(r3.id, { status: 'done', summary: '页面完成', endedAt: Date.now() });
 
+    // fix 轮修正：方向从「≤ 边界」反转为「> 边界」——检查点之前的任务仍然成立，不标
     await s.markRunsRolledBack(p.id, r2.id);
 
     const runs = await s.listAgentRuns(p.id);
     expect(runs.map((r) => [r.id, r.status])).toEqual([
-      [r1.id, 'rolled_back'],
-      [r2.id, 'rolled_back'],
-      [r3.id, 'done'],
+      [r1.id, 'done'],
+      [r2.id, 'done'],
+      [r3.id, 'rolled_back'],
     ]);
     // 回滚只改状态：summary/交接摘要保留（时间线展示与续跑交接都要用）
-    expect(runs[0]?.summary).toBe('PRD 完成');
+    expect(runs[2]?.summary).toBe('页面完成');
     // 别项目的任务不受影响
     expect((await s.listAgentRuns(other.id)).map((r) => r.status)).toEqual(['pending']);
   });
@@ -171,19 +174,19 @@ describe('repo misc：检查点补充回归', () => {
     const p = await newProject(s, 'a');
     const other = await newProject(s, 'b');
 
-    const emptyCp = await s.createCheckpoint(p.id, '空项目基线', null);
+    const emptyCp = await s.createCheckpoint(p.id, '空项目基线', null, await s.latestRunId(p.id));
     expect(await s.restoreCheckpoint(p.id, emptyCp)).toEqual([]);
 
     const run = await s.createAgentRun({ projectId: p.id, taskKey: 'eng:a.js', agent: 'engineer', task: '写 a.js' });
-    const cp1 = await s.createCheckpoint(p.id, '任务前基线', run.id);
-    const cp2 = await s.createCheckpoint(p.id, '人工保存前', null);
-    await s.createCheckpoint(other.id, 'B 项目的打点', null);
+    const cp1 = await s.createCheckpoint(p.id, '任务前基线', run.id, await s.latestRunId(p.id));
+    const cp2 = await s.createCheckpoint(p.id, '人工保存前', null, await s.latestRunId(p.id));
+    await s.createCheckpoint(other.id, 'B 项目的打点', null, await s.latestRunId(other.id));
 
     const list = await s.listCheckpoints(p.id);
-    expect(list.map((c) => [c.id, c.label, c.agentRunId])).toEqual([
-      [cp2, '人工保存前', null],
-      [cp1, '任务前基线', run.id],
-      [emptyCp, '空项目基线', null],
+    expect(list.map((c) => [c.id, c.label, c.agentRunId, c.afterRunId])).toEqual([
+      [cp2, '人工保存前', null, run.id],
+      [cp1, '任务前基线', run.id, run.id],
+      [emptyCp, '空项目基线', null, 0],
     ]);
     expect(list.every((c) => c.projectId === p.id)).toBe(true);
 
@@ -224,7 +227,7 @@ describe('repo misc：检查点补充回归', () => {
     const p = await r.createProject({ sessionId: 's', title: 't', requirement: 'r', mode: 'fast' });
     const a = await r.upsertFile({ projectId: p.id, path: 'app/a.js', content: 'A1', editor: 'engineer' });
     const b = await r.upsertFile({ projectId: p.id, path: 'app/b.js', content: 'B1', editor: 'engineer' });
-    const cp = await r.createCheckpoint(p.id, '任务前', null);
+    const cp = await r.createCheckpoint(p.id, '任务前', null, await r.latestRunId(p.id));
 
     await r.db.delete(files).where(eq(files.id, b.fileId));
     expect(await r.getFileById(p.id, b.fileId)).toBeNull();

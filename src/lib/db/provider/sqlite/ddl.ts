@@ -5,7 +5,8 @@
  * 注意两条与 drizzle-kit 对齐的形态（否则 push 到已自举的库会冲突）：
  * 1. 命名唯一约束写成独立 `CREATE UNIQUE INDEX`（drizzle-kit 不用表内 CONSTRAINT 子句）
  * 2. 列默认值/外键写法与 drizzle-kit 生成文本一致（DEFAULT true / no action）
- * 已有库的 schema 演进（加列/改列）仍以 drizzle-kit（`npm run db:push`）为准。
+ * 已有库的加列演进在 migrateColumns 里做幂等兜底（形态与 drizzle-kit 产物同形）；
+ * 改列/删列等破坏性演进仍以 drizzle-kit（`npm run db:push`）为准。
  */
 import type Database from 'better-sqlite3';
 
@@ -120,6 +121,7 @@ CREATE TABLE IF NOT EXISTS \`checkpoints\` (
   \`project_id\` integer NOT NULL,
   \`label\` text NOT NULL,
   \`agent_run_id\` integer,
+  \`after_run_id\` integer DEFAULT 0 NOT NULL,
   \`created_at\` integer NOT NULL,
   FOREIGN KEY (\`project_id\`) REFERENCES \`projects\`(\`id\`) ON UPDATE no action ON DELETE cascade
 );
@@ -139,4 +141,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS \`agent_model_bindings_role\` ON \`agent_model
 /** 在连接上执行自举 DDL（幂等，可重复调用） */
 export function ensureSchema(db: Database.Database): void {
   db.exec(SCHEMA_DDL);
+  migrateColumns(db);
+}
+
+/**
+ * 已有库的加列迁移（SQLite 无 ADD COLUMN IF NOT EXISTS：先查 pragma 再 ALTER）。
+ * 列形态与 drizzle-kit `npm run db:push` 的产物同形（integer DEFAULT 0 NOT NULL），
+ * 新库建表已含列 → no-op；旧库（schema 演进前）在此补齐，无需先手跑 db:push。
+ */
+function migrateColumns(db: Database.Database): void {
+  const columns = db.pragma('table_info(checkpoints)') as unknown;
+  if (!Array.isArray(columns)) return;
+  const names = new Set(
+    columns.flatMap((row) => (typeof row === 'object' && row !== null && 'name' in row && typeof (row as { name: unknown }).name === 'string' ? [(row as { name: string }).name] : [])),
+  );
+  if (!names.has('after_run_id')) {
+    db.exec('ALTER TABLE `checkpoints` ADD COLUMN `after_run_id` integer DEFAULT 0 NOT NULL');
+  }
 }

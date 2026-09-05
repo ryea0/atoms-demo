@@ -26,7 +26,9 @@ export interface FileRow { id:number; projectId:number; path:string; content:str
   producedBy:FileEditor; lastEditor:AgentRole|'human'|'seed'; editingBy:string|null; editingExpiresAt:number|null;
   version:number; createdAt:number; updatedAt:number; }
 export interface FileVersion { id:number; fileId:number; version:number; content:string; editor:string; createdAt:number; }
-export interface Checkpoint { id:number; projectId:number; label:string; agentRunId:number|null; createdAt:number; }
+export interface Checkpoint { id:number; projectId:number; label:string; agentRunId:number|null;
+  /** 打点时刻本项目最大 agent_runs.id：restore 后 id > afterRunId 的任务标 rolled_back（回滚边界） */
+  afterRunId:number; createdAt:number; }
 export interface CheckpointFile { checkpointId:number; path:string; content:string; }
 export interface LlmCall { id:number; projectId:number; agentRole:AgentRole; model:string;
   promptTokens:number; completionTokens:number; estimated:number; cost:number; latencyMs:number; createdAt:number; }
@@ -141,8 +143,14 @@ export interface RunsRepo {
   updateAgentRun(id: number, patch: UpdateAgentRunPatch, projectId?: number): Promise<void>;
   /** 任务时间线（created_at 正序，并列按 id 稳定排序） */
   listAgentRuns(projectId: number): Promise<AgentRun[]>;
-  /** 检查点回滚配套：id ≤ uptoRunId 的本项目任务（含已 done/failed）全部改标 rolled_back */
-  markRunsRolledBack(projectId: number, uptoRunId: number): Promise<void>;
+  /**
+   * 检查点回滚配套：id > sinceRunId 的本项目任务（含已 done/failed/stopped）全部改标
+   * rolled_back——检查点之后的任务才是被回滚撤销的工作；≤ sinceRunId（仍然成立的工作）不动。
+   * sinceRunId 通常取检查点行上的 afterRunId（打点时刻的最大 run id）。
+   */
+  markRunsRolledBack(projectId: number, sinceRunId: number): Promise<void>;
+  /** 本项目当前最大 agent_runs.id（无任务返回 0）：打检查点时捕获回滚边界（afterRunId）用 */
+  latestRunId(projectId: number): Promise<number>;
 }
 
 /**
@@ -150,8 +158,9 @@ export interface RunsRepo {
  * 检查点快照/恢复必须在一个短事务内完成（事务里只有纯 DB 读写，无 await/IO/LLM 调用）。
  */
 export interface MiscRepo {
-  /** 打点：当前全部 files 全量快照入 checkpoint_files（读快照与落库同事务），返回 checkpoint id */
-  createCheckpoint(projectId: number, label: string, agentRunId: number|null): Promise<number>;
+  /** 打点：当前全部 files 全量快照入 checkpoint_files（读快照与落库同事务），返回 checkpoint id；
+   *  afterRunId = 打点时刻本项目最大 agent_runs.id（回滚标记边界，编排器用 latestRunId 取） */
+  createCheckpoint(projectId: number, label: string, agentRunId: number|null, afterRunId: number): Promise<number>;
   /**
    * 恢复：当前内容先各入 file_versions（回滚可撤销），再按快照 upsert 回 files——
    * 快照内已有文件行覆盖内容并 version+1、已消失的行重建；快照外的文件（打点后新增）一律不动。
