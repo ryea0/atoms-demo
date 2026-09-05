@@ -14,11 +14,12 @@
 import { assembleContext } from '@/lib/agents/context';
 import { runAgent } from '@/lib/agents/runner';
 import { AgentAbortError } from '@/lib/agents/types';
-import type { ToolContext } from '@/lib/agents/tools';
+import { MAX_CONTENT_BYTES, type ToolContext } from '@/lib/agents/tools';
 import { resolveModel } from '@/lib/llm/client';
 import { wrapMetered } from '@/lib/llm/metered-provider';
 import { validateFile } from '@/lib/validation';
 import type { AgentRole, StorageProvider } from '@/lib/db/provider/types';
+import type { LlmProvider } from '@/lib/llm/types';
 
 /** 专家角色子集（领导可分派的三个可选专家） */
 export type ExpertRole = Extract<AgentRole, 'analyst' | 'seo' | 'ads'>;
@@ -72,9 +73,6 @@ export const EXPERT_SYSTEM_PROMPTS: Record<ExpertRole, string> = {
   ].join('\n'),
 };
 
-/** 单文件内容上限 512KB（.claude/rules/07「数据库写入前二次约束」，与 fs 工具同一口径） */
-const MAX_CONTENT_BYTES = 512 * 1024;
-
 /** runExpert 入参（brief 契约：存储出口 + 项目 + 角色 + 任务指令） */
 export interface RunExpertInput {
   storage: StorageProvider;
@@ -83,6 +81,11 @@ export interface RunExpertInput {
   instruction: string;
   /** 停止信号：级联到 runAgent → provider 调用 */
   signal?: AbortSignal;
+  /**
+   * 注入 provider（测试桩 / 编排器统一装配）；缺省走 getLlmProvider()（读 env，默认 mock）。
+   * 注意：注入只替换底层模型出口，计量装饰器仍由本函数负责包一层（llm_calls 照常落库）。
+   */
+  provider?: LlmProvider;
 }
 
 /** runExpert 结果：任务记录 id + 产出文件路径 */
@@ -148,7 +151,7 @@ function assertContentSize(path: string, content: string): void {
  * 任务记录在本函数内创建并推进（done/failed/stopped + summary），summary 是下游交接物。
  */
 export async function runExpert(ctx: RunExpertInput): Promise<RunExpertResult> {
-  const { storage, projectId, role, instruction, signal } = ctx;
+  const { storage, projectId, role, instruction, signal, provider } = ctx;
   const path = EXPERT_REPORT_PATHS[role];
 
   const run = await storage.createAgentRun({
@@ -163,7 +166,7 @@ export async function runExpert(ctx: RunExpertInput): Promise<RunExpertResult> {
   const singleShot = async (extraFeedback?: string): Promise<string> => {
     const model = resolveModel(role);
     // 计量装饰器与内核共用同一 model：实际请求的 model 与 llm_calls 记账的 model 永远一致（CLAUDE.md 规则 10）
-    const provider = wrapMetered({ storage, projectId, agentRole: role, model });
+    const meteredProvider = wrapMetered({ storage, projectId, agentRole: role, model, provider });
     const assembled = await assembleContext({
       storage,
       projectId,
@@ -181,7 +184,7 @@ export async function runExpert(ctx: RunExpertInput): Promise<RunExpertResult> {
       tools: [],
       model,
       ctx: { storage, projectId, role } satisfies ToolContext,
-      provider,
+      provider: meteredProvider,
       signal,
     });
     return stripOuterFence(result.content);

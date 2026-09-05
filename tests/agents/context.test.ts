@@ -67,7 +67,7 @@ async function seedProject(storage: StorageProvider, options: SeedOptions = {}) 
   await write('app/backend/api.js', options.apiJs ?? API_JS);
   await write('app/frontend/index.html', INDEX_HTML);
   await write('app/other/report.md', NON_DEP_MD);
-  if (options.preferencesMd !== undefined) await write('.atoms/PREFERENCES.md', options.preferencesMd);
+  if (options.preferencesMd !== undefined) await write('.atoms/reports/PREFERENCES.md', options.preferencesMd);
   if (options.memoryMd !== undefined) await write('.atoms/reports/MEMORY.md', options.memoryMd);
   if (options.sessionPref !== undefined) {
     await storage.setPreference('session', sessionId, options.sessionPref ?? {});

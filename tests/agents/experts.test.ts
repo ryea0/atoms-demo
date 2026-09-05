@@ -14,16 +14,19 @@ import {
 } from '@/lib/agents/roles/experts';
 import {
   CLOSER_SYSTEM_PROMPT,
+  CLOSING_SECTION_HEADING,
   MEMORY_PATH,
   PROGRESS_PATH,
   composeMemoryDoc,
   runCloser,
   splitCloserOutput,
+  stripHumanListSection,
 } from '@/lib/agents/roles/closer';
 import { roleRegistry } from '@/lib/agents/registry';
 import { AgentAbortError } from '@/lib/agents/runner';
 import { newTestStorage } from '@/lib/db/test-util';
 import type { AgentRole, StorageProvider } from '@/lib/db/provider/types';
+import type { LlmProvider, LlmRequest, LlmResult } from '@/lib/llm/types';
 
 /* ------------------------------------------------------------------ */
 /* 测试工具                                                             */
@@ -79,6 +82,21 @@ async function fileOf(storage: StorageProvider, projectId: number, path: string)
   const row = await storage.getFile(projectId, path);
   if (row === null) throw new Error(`预期存在文件 ${path}，实际没有`);
   return row;
+}
+
+/** 恒空 provider：模拟模型连续两次（首发 + 带错重试）产出空内容 */
+class EmptyProvider implements LlmProvider {
+  readonly name = 'empty-stub';
+  readonly requests: LlmRequest[] = [];
+
+  async stream(req: LlmRequest): Promise<LlmResult> {
+    this.requests.push(req);
+    return { content: '   ', toolCalls: [], usage: null };
+  }
+
+  async complete(req: LlmRequest): Promise<LlmResult> {
+    return this.stream(req);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -316,6 +334,33 @@ describe('runCloser：MEMORY + PROGRESS 领导汇报段', () => {
     expect(CLOSER_SYSTEM_PROMPT).toContain('收尾');
     expect(CLOSER_SYSTEM_PROMPT).toContain('MEMORY');
     expect(CLOSER_SYSTEM_PROMPT).toContain('汇报');
+    // 人工修改清单由代码权威计算：prompt 不再要求模型自列（避免幻觉条目顶掉真实清单）
+    expect(CLOSER_SYSTEM_PROMPT).not.toContain('人工修改清单');
+  });
+
+  it('幂等：重复收尾覆盖既有「领导汇报」段（最新生效），进度行保留', async () => {
+    const { storage, projectId } = await newProject();
+    await storage.upsertFile({ projectId, path: 'app/frontend/index.html', content: '<p>v1</p>', editor: 'engineer' });
+
+    await runCloser({ storage, projectId });
+    // 模拟编排器在两轮之间的进度行：插在「领导汇报」段**之前**（进度行在段前是 progress 模块的契约，
+    // 段内内容收尾时会整体覆盖——最新汇报生效）
+    const afterFirst = await fileOf(storage, projectId, PROGRESS_PATH);
+    await storage.upsertFile({
+      projectId,
+      path: PROGRESS_PATH,
+      content: afterFirst.content.replace(CLOSING_SECTION_HEADING, `- ✅ eng-iterate\n\n${CLOSING_SECTION_HEADING}`),
+      editor: 'leader',
+    });
+
+    await runCloser({ storage, projectId });
+    const progress = await fileOf(storage, projectId, PROGRESS_PATH);
+
+    // 追加语义会出现两段（2 个标题/2 份汇报正文）；覆盖语义恒为一段
+    expect(progress.content.match(/## 领导汇报/g)).toHaveLength(1);
+    expect(progress.content.match(/# 领导汇报（mock 样例）/g)).toHaveLength(1);
+    expect(progress.content).toContain('✅ eng-iterate');
+    expect(progress.content.indexOf('✅ eng-iterate')).toBeLessThan(progress.content.indexOf('## 领导汇报'));
   });
 });
 
@@ -381,5 +426,63 @@ describe('composeMemoryDoc：确定性组装（人工修改清单恒在）', () 
   it('模型正文已含人工修改清单 → 不重复追加同一段', () => {
     const doc = composeMemoryDoc('## 人工修改清单\n- app/x.js', ['app/x.js']);
     expect(doc.match(/## 人工修改清单/g)).toHaveLength(1);
+  });
+
+  it('清单权威在代码：模型自列的（幻觉）清单被剥除，只保留代码算出的清单', () => {
+    const modelBody = [
+      '## 选型与关键决策',
+      '- 零依赖 + 内存态',
+      '',
+      '## 人工修改清单',
+      '- docs/模型编造的文件.md（模型幻觉的意图说明）',
+      '',
+      '## 偏好捕捉',
+      '- 界面清爽',
+    ].join('\n');
+
+    const doc = composeMemoryDoc(modelBody, ['app/frontend/index.html']);
+
+    // 模型的幻觉条目不出现；代码清单出现在专属段内
+    expect(doc).not.toContain('模型编造的文件');
+    expect(doc.match(/## 人工修改清单/g)).toHaveLength(1);
+    expect(doc.indexOf('- app/frontend/index.html')).toBeGreaterThan(doc.indexOf('## 人工修改清单'));
+    // 剥除不伤及清单段之外的模型内容
+    expect(doc).toContain('零依赖 + 内存态');
+    expect(doc).toContain('界面清爽');
+  });
+
+  it('stripHumanListSection：清单段在末尾（无后续标题）同样剥净', () => {
+    const stripped = stripHumanListSection('## 项目约束\n- 内存态\n\n## 人工修改清单\n- a.js\n- b.js\n');
+    expect(stripped).toContain('内存态');
+    expect(stripped).not.toContain('a.js');
+    expect(stripped).not.toContain('b.js');
+  });
+});
+
+describe('runExpert：失败路径（stub provider 两次空产出）', () => {
+  it('重试一次仍为空 → 任务 failed + error 落库，不落半成品文件', async () => {
+    const { storage, projectId } = await newProject();
+    const provider = new EmptyProvider();
+
+    const error = await runExpert({
+      storage,
+      projectId,
+      role: 'analyst',
+      instruction: '定义埋点',
+      provider,
+    }).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('空报告');
+    expect(provider.requests).toHaveLength(2); // 首发一次 + 带错重试一次
+
+    expect(await storage.getFile(projectId, EXPERT_REPORT_PATHS.analyst)).toBeNull();
+    const runs = await storage.listAgentRuns(projectId);
+    const run = runOf(runs, runs[0]?.id ?? -1);
+    expect(run.status).toBe('failed');
+    expect(run.error ?? '').toContain('空报告');
   });
 });

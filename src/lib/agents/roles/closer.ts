@@ -8,8 +8,8 @@
  * 产出物：
  * - `.atoms/reports/MEMORY.md`（路径与 src/lib/agents/context.ts 注入的长期记忆路径一致，
  *   下次迭代由上下文组装器自动注入）
- * - `.atoms/PROGRESS.md` 追加「## 领导汇报」段（文件缺失则创建带标题；每个任务边界的进度行由
- *   编排器的 progress 模块负责，本函数只追加收尾段，容忍文件不存在）
+ * - `.atoms/reports/PROGRESS.md` 维护「## 领导汇报」段（文件缺失则创建带标题；每个任务边界的进度行由
+ *   编排器的 progress 模块负责；重复收尾时该段整体覆盖——最新汇报生效，不无限增长）
  * - 返回汇报文本：调用方（编排器）负责作为 assistant message 落库并发 SSE message 事件
  *   （本函数不写 messages，避免与编排器双写）
  *
@@ -18,17 +18,21 @@
 import { assembleContext } from '@/lib/agents/context';
 import { runAgent } from '@/lib/agents/runner';
 import { AgentAbortError } from '@/lib/agents/types';
-import type { ToolContext } from '@/lib/agents/tools';
+import { MAX_CONTENT_BYTES, type ToolContext } from '@/lib/agents/tools';
 import { stripOuterFence } from '@/lib/agents/roles/experts';
 import { resolveModel } from '@/lib/llm/client';
 import { wrapMetered } from '@/lib/llm/metered-provider';
+import type { LlmProvider } from '@/lib/llm/types';
 import type { AgentRole, FileRow, StorageProvider } from '@/lib/db/provider/types';
 
 /** 长期记忆路径（必须与 context.ts 注入路径一致：MEMORY.md） */
 export const MEMORY_PATH = '.atoms/reports/MEMORY.md';
 
-/** 项目进度文件路径（编排器在各任务边界维护进度行；收尾只追加领导汇报段） */
-export const PROGRESS_PATH = '.atoms/PROGRESS.md';
+/**
+ * 项目进度文件路径（DESIGN §1 产出结构：.atoms/reports/ 下的 PROGRESS.md）。
+ * 编排器在各任务边界维护进度行；收尾只维护「领导汇报」段（最新一次覆盖，见 appendClosingSection）。
+ */
+export const PROGRESS_PATH = '.atoms/reports/PROGRESS.md';
 
 /** 收尾段标题（时间线/测试都认这段） */
 export const CLOSING_SECTION_HEADING = '## 领导汇报';
@@ -42,8 +46,7 @@ export const CLOSER_SYSTEM_PROMPT = [
   '',
   '输出契约（严格遵守，两部分都要有，用分隔行隔开，顺序如下）：',
   '===== .atoms/reports/MEMORY.md =====',
-  '（MEMORY.md 的完整 Markdown 内容，包含三节：## 选型与关键决策、## 项目约束、## 偏好捕捉；',
-  '用户手动改过的文件必须在「## 人工修改清单」逐条列出，并写明要保留的意图）',
+  '（MEMORY.md 的完整 Markdown 内容，包含三节：## 选型与关键决策、## 项目约束、## 偏好捕捉）',
   '===== 汇报 =====',
   '（面向用户的领导汇报正文：完成内容、产出概览、下一步建议；中文 Markdown 列表，可直接作为聊天回复）',
   '',
@@ -61,15 +64,14 @@ const PROGRESS_HEADER = [
   '> 每个任务边界由编排器追加状态行（✅/🔄/⏸/❌）；项目收尾时由团队领导追加领导汇报段。',
 ].join('\n');
 
-/** 单文件内容上限 512KB（.claude/rules/07「数据库写入前二次约束」，与 fs 工具同一口径） */
-const MAX_CONTENT_BYTES = 512 * 1024;
-
 /** runCloser 入参（brief 契约：存储出口 + 项目 + 停止信号） */
 export interface RunCloserInput {
   storage: StorageProvider;
   projectId: number;
   /** 停止信号：级联到 runAgent → provider 调用 */
   signal?: AbortSignal;
+  /** 注入 provider（测试桩 / 编排器统一装配）；缺省走 getLlmProvider()（读 env，默认 mock） */
+  provider?: LlmProvider;
 }
 
 /** runCloser 结果：任务记录 id + 记忆文件路径 + 汇报文本（由调用方作为 assistant message 落库） */
@@ -150,9 +152,39 @@ function joinTrimmed(lines: string[]): string | null {
   return text === '' ? null : text;
 }
 
+/** 标题行（1-6 级） */
+const HEADING_LINE = /^#{1,6}\s/;
+/** 模型可能自行写出的清单段标题（前缀匹配，容许带括注） */
+const HUMAN_LIST_HEADING = /^#{1,6}\s*人工修改清单/;
+
+/**
+ * 剥掉模型正文里自写的「人工修改清单」段（标题行到下一个标题行或文末）。
+ * 该清单是防语义冲突的权威数据，只认代码从 files 表算出来的那份（CLAUDE.md 规则 11）；
+ * 模型自己列的条目可能幻觉，一律不采信。
+ */
+export function stripHumanListSection(body: string): string {
+  const kept: string[] = [];
+  let skipping = false;
+  for (const line of body.split('\n')) {
+    const trimmed = line.trim();
+    const isHeading = HEADING_LINE.test(trimmed);
+    if (skipping) {
+      // 剥除中遇到下一个标题段 → 恢复正常收集（该标题行本身要保留）
+      if (isHeading) skipping = false;
+      else continue;
+    }
+    if (isHeading && HUMAN_LIST_HEADING.test(trimmed)) {
+      skipping = true;
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join('\n');
+}
+
 /**
  * 确定性组装 MEMORY.md：模型正文（选型/约束/偏好）在前，
- * 人工修改清单由代码补齐（模型没写、或写得含糊都兜底），无人工修改时明确写「无」。
+ * **人工修改清单恒由代码计算并追加**（模型写的一律剥除），无人工修改时明确写「无」。
  */
 export function composeMemoryDoc(memoryBody: string | null, humanEditedPaths: readonly string[]): string {
   const lines: string[] = [
@@ -161,18 +193,17 @@ export function composeMemoryDoc(memoryBody: string | null, humanEditedPaths: re
     '> 由团队领导在收尾阶段写入；下次迭代作为长期记忆注入上下文（DESIGN §4.2）。',
     '',
   ];
-  if (memoryBody !== null) lines.push(memoryBody, '');
+  const modelBody = (memoryBody === null ? '' : stripHumanListSection(memoryBody)).trim();
+  if (modelBody !== '') lines.push(modelBody, '');
 
-  if ((memoryBody ?? '').includes('人工修改清单') === false) {
-    lines.push(
-      '## 人工修改清单',
-      '',
-      humanEditedPaths.length > 0
-        ? humanEditedPaths.map((path) => `- ${path}`).join('\n')
-        : '- 无（本项目暂无人工修改）',
-      '',
-    );
-  }
+  lines.push(
+    '## 人工修改清单',
+    '',
+    humanEditedPaths.length > 0
+      ? humanEditedPaths.map((path) => `- ${path}`).join('\n')
+      : '- 无（本项目暂无人工修改）',
+    '',
+  );
   return lines.join('\n');
 }
 
@@ -185,12 +216,28 @@ function fallbackReport(fileCount: number, humanEditedPaths: readonly string[]):
   ].join('\n');
 }
 
-/** 在 PROGRESS.md 末尾追加领导汇报段（文件缺失则创建带标题） */
-async function appendClosingSection(storage: StorageProvider, projectId: number, report: string): Promise<void> {
-  const existing = await storage.getFile(projectId, PROGRESS_PATH);
+/**
+ * 维护 PROGRESS.md 的「领导汇报」段（幂等）：已有该段则从段首覆盖到文末——
+ * 最新一次汇报生效（编排器每轮完成都会收尾，追加语义会导致标题重复与无限增长）；
+ * 没有该段则追加在进度行之后；文件缺失则创建带标题。
+ */
+export async function appendClosingSection(
+  storage: StorageProvider,
+  projectId: number,
+  report: string,
+): Promise<void> {
   const section = `${CLOSING_SECTION_HEADING}\n\n${report}\n`;
-  const content =
-    existing === null ? `${PROGRESS_HEADER}\n\n${section}` : `${existing.content.trimEnd()}\n\n${section}`;
+  const existing = await storage.getFile(projectId, PROGRESS_PATH);
+
+  if (existing === null) {
+    await storage.upsertFile({ projectId, path: PROGRESS_PATH, content: `${PROGRESS_HEADER}\n\n${section}`, editor: 'leader' });
+    return;
+  }
+
+  const lines = existing.content.split('\n');
+  const headingIndex = lines.findIndex((line) => line.trim() === CLOSING_SECTION_HEADING);
+  const prefix = (headingIndex >= 0 ? lines.slice(0, headingIndex) : lines).join('\n').trimEnd();
+  const content = prefix === '' ? section : `${prefix}\n\n${section}`;
   await storage.upsertFile({ projectId, path: PROGRESS_PATH, content, editor: 'leader' });
 }
 
@@ -207,7 +254,7 @@ function assertContentSize(path: string, content: string): void {
  * 任务记录在本函数内创建并推进（done/failed/stopped + summary）。
  */
 export async function runCloser(ctx: RunCloserInput): Promise<RunCloserResult> {
-  const { storage, projectId, signal } = ctx;
+  const { storage, projectId, signal, provider } = ctx;
   const role: AgentRole = 'leader';
 
   const run = await storage.createAgentRun({
@@ -237,7 +284,8 @@ export async function runCloser(ctx: RunCloserInput): Promise<RunCloserResult> {
     ].join('\n');
 
     const model = resolveModel(role);
-    const provider = wrapMetered({ storage, projectId, agentRole: role, model });
+    // 计量装饰器与内核共用同一 model；注入的 provider 只替换底层模型出口（测试桩/编排器装配）
+    const meteredProvider = wrapMetered({ storage, projectId, agentRole: role, model, provider });
     const assembled = await assembleContext({
       storage,
       projectId,
@@ -254,7 +302,7 @@ export async function runCloser(ctx: RunCloserInput): Promise<RunCloserResult> {
       tools: [],
       model,
       ctx: { storage, projectId, role } satisfies ToolContext,
-      provider,
+      provider: meteredProvider,
       signal,
     });
 
