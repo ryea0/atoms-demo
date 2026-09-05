@@ -159,7 +159,7 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 
 人工可编辑代码（对标原版付费核心功能），冲突防线三层：
 
-1. **预防（声明式软锁）**：人开始编辑 → 文件标记 `editing_by=human`（TTL 10min）；agent 写同文件前在步骤边界检查——有未保存人工修改则该文件任务挂起，聊天区请求裁决（保留人工修改并迭代 / 覆盖 / 稍后）
+1. **预防（声明式软锁）**：人开始编辑 → 文件标记 `editing_by=human`（TTL 10min）；agent 写同文件前在步骤边界检查——有未保存人工修改则该文件任务挂起，聊天区请求裁决（保留人工修改并迭代 / 覆盖 / 稍后）。裁决等待无独立硬超时：锁 TTL 到期即按「稍后」收场（该文件本轮不动），用户停止可立即打断等待（2026-09-06 T23 评审裁定留档）
 2. **检测（乐观锁 CAS）**：人工保存带 `base_version`，`UPDATE...WHERE version=base_version` 失败 ⇒ 409 → 冲突对话框（用我的版本 / 用 agent 版本 / 并排 diff 后选）
 3. **溯源与语义防冲突**：`files.last_editor`（agent 角色/human）；M 角标双色（蓝=agent、绿=人）；MEMORY.md 记录人工修改清单，工程师迭代上下文注入「以下文件含用户手动修改，必须保留其意图」+ 永远读 DB 最新快照
 
@@ -211,7 +211,7 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 模型只发起调用，执行者是 AgentRunner 内核注册的服务端函数（schema+实现+策略）。工具集：`write_file/read_file`（必备）、`list_files/glob`（轻量）、`grep`（可选 LIKE）；**不做 bash**。沙箱两级：文件沙箱=虚拟文件系统（files 表 per project_id，路径校验拒绝 `../`/绝对路径）；执行沙箱=iframe sandbox（§3.7）。
 
 ### 4.6 防失控
-工具结果截断（大文件首尾 200 行+行数提示）、maxSteps、token 预算、单步超时重试（超时 90s）。
+工具结果截断（大文件首尾 200 行+行数提示）、maxSteps、token 预算、单步超时重试。超时语义按路径区分（2026-09-06 真机探针修订：ARK plan + seed 推理模型流式健康——均隔 0.04s、最大间隙 9.3s——但 PRD 总时长 >90s，原「总时长 90s」一刀切误杀健康流）：complete 非流式 = 总时长 90s；stream 流式 = 空闲超时 45s（无新 chunk 即判死，阈值须大于实测最大间隙）+ 总时长上限 300s。均 env 可调（`LLM_TIMEOUT_MS` / `LLM_STREAM_IDLE_TIMEOUT_MS` / `LLM_STREAM_TOTAL_TIMEOUT_MS`）；超时/中止的调用也须落 llm_calls 计量（completion 按已收部分估算并标 estimated）。
 
 ### 4.7 项目间上下文隔离（四层）
 数据层（全表 project_id + 仓库层强制过滤）／Agent 上下文（组装只取当前项目）／工具层（路径校验，闭包绑定 project_id）／运行层（每项目独立运行队列）。
