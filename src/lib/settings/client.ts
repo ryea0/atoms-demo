@@ -4,7 +4,16 @@
  * 额外返回 boolean（操作型）以区分「成功/失败」驱动本地 loading 态。
  */
 import { toast } from 'sonner';
-import type { BindingView, ImportResultView, ModelView, ProbeView, ProviderView } from './types';
+import {
+  normalizePreferences,
+  type BindingView,
+  type ImportResultView,
+  type ModelView,
+  type ProbeView,
+  type ProviderView,
+  type UserPreferences,
+  type UserPreferencesPatch,
+} from './types';
 
 /** 从结构化错误体里取 message（非结构化响应回退 HTTP 状态码文案） */
 function readErrorMessage(payload: unknown, status: number): string {
@@ -95,5 +104,20 @@ export function putBinding(input: {
 }): Promise<BindingView | null> {
   return request<{ binding: BindingView }>('/api/settings/bindings', jsonInit('PUT', input)).then(
     (payload) => payload?.binding ?? null,
+  );
+}
+
+/* ---------------- 个人偏好（session 级，DESIGN §3.9） ---------------- */
+
+/** 读偏好：normalize 做字段级收窄，服务端缺省/脏数据同样回默认值（前后端口径一致） */
+export async function fetchPreferences(): Promise<UserPreferences | null> {
+  const payload = await request<{ preferences: unknown }>('/api/settings');
+  return payload === null ? null : normalizePreferences(payload.preferences);
+}
+
+/** 保存偏好（局部补丁，服务端合并既有值）；失败已 toast 并返回 null */
+export function putPreferences(patch: UserPreferencesPatch): Promise<UserPreferences | null> {
+  return request<{ preferences: unknown }>('/api/settings', jsonInit('PUT', patch)).then((payload) =>
+    payload === null ? null : normalizePreferences(payload.preferences),
   );
 }

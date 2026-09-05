@@ -41,6 +41,12 @@ export const bindingPutSchema = z.object({
   modelId: z.number().int().positive().optional(),
 });
 
+/** 偏好 PUT（session 级）：所有键可选，缺省键 = 不改既有值（服务端合并后整体落库） */
+export const preferencesPutSchema = z.object({
+  editing_enabled: z.boolean().optional(),
+  default_mode: z.enum(['fast', 'full']).optional(),
+});
+
 export type ProviderCreateInputDto = z.infer<typeof providerCreateSchema>;
 export type ProviderPatchInputDto = z.infer<typeof providerPatchSchema>;
 export type ModelPatchInputDto = z.infer<typeof modelPatchSchema>;

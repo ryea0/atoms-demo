@@ -15,8 +15,15 @@ export type RunStatus = 'pending'|'running'|'done'|'failed'|'stopped'|'rolled_ba
 
 export interface Project { id:number; sessionId:string; title:string; requirement:string;
   mode:'fast'|'full'; status:ProjectStatus; createdAt:number; updatedAt:number; }
+
+/**
+ * 消息元数据：mentions=@ 指定成员；kind 标记特殊聊天卡片（softlock=软锁裁决 / restore=回滚通知）、
+ * path 为关联文件路径——随消息落库（T23），刷新后前端仍能还原裁决卡片。
+ */
+export interface MessageMeta { mentions?:AgentRole[]; kind?:string; path?:string; }
+
 export interface Message { id:number; projectId:number; role:'user'|'assistant'|'intervention'|'system';
-  content:string; meta?:{mentions?:AgentRole[]}|null; deliveredAt:number|null; createdAt:number; }
+  content:string; meta?:MessageMeta|null; deliveredAt:number|null; createdAt:number; }
 export interface AgentRun { id:number; projectId:number; taskKey:string; agent:AgentRole; task:string;
   status:RunStatus; summary:string|null; startedAt:number|null; endedAt:number|null; error:string|null; }
 /** 文件写入者域：agent 角色名 / human（人机共编）/ seed（预置演示） */

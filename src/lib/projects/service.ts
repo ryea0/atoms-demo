@@ -172,7 +172,8 @@ export class CheckpointNotFoundError extends Error {
  * 项目级回滚（DESIGN §3.10）：恢复 files（repo 层短事务，回滚可撤销）→
  * 检查点**之后**的 agent_runs 标 rolled_back（id > checkpoint.afterRunId——生产检查点
  * 全部由编排器在任务前打点，afterRunId 即打点时刻的最大 run id；打点之前的工作
- * 仍然成立，不动）→ SSE message 通知。返回受影响 fileId 列表（按快照路径升序，repo 契约）。
+ * 仍然成立，不动）→ 回滚通知落库为 assistant 消息并发 SSE message（回带 messageId，
+ * 前端按正数 id 去重，快照与重放叠加不重复）。返回受影响 fileId 列表（按快照路径升序，repo 契约）。
  */
 export async function restoreCheckpointAndNotify(storage: StorageProvider, projectId: number, cpId: number): Promise<number[]> {
   const checkpoints = await storage.listCheckpoints(projectId);
@@ -182,12 +183,19 @@ export async function restoreCheckpointAndNotify(storage: StorageProvider, proje
   const affected = await storage.restoreCheckpoint(projectId, cpId);
   await storage.markRunsRolledBack(projectId, checkpoint.afterRunId);
 
+  const content = `已回滚到检查点「${checkpoint.label}」：恢复 ${affected.length} 个文件（回滚前内容已入版本历史，可再撤销）。`;
+  const row = await storage.addMessage({
+    projectId,
+    role: 'assistant',
+    content,
+    meta: { kind: 'restore' },
+  });
   projectEventBus.emit(projectId, {
     runId: null,
     event: 'message',
     agent: 'leader',
-    content: `已回滚到检查点「${checkpoint.label}」：恢复 ${affected.length} 个文件（回滚前内容已入版本历史，可再撤销）。`,
-    meta: { kind: 'restore', checkpointId: cpId, files: affected.length },
+    content,
+    meta: { role: 'assistant', kind: 'restore', checkpointId: cpId, files: affected.length, messageId: row.id },
   });
   return affected;
 }
