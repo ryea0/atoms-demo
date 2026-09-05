@@ -530,3 +530,18 @@ export function useWorkspace(projectId: number): WorkspaceState {
 
   return state;
 }
+
+/** 文件尚不存在时的共享空占位（引用恒定，避免 getSnapshot 每次返回新对象） */
+const MISSING_FILE: WorkspaceFile = { content: '', version: 0, lastEditor: 'engineer', streaming: false };
+
+/**
+ * 单文件订阅（细粒度选择器，T19 打字机/查看器消费）：只在该 path 的内容变化时才重渲染。
+ * 实现：复用 store 级 subscribe（store 变化都会通知 React），但 getSnapshot 只取本 path 的
+ * WorkspaceFile 引用——引用不变（Object.is 相等）时 useSyncExternalStore 跳过重渲染，
+ * 因此其他路径的 delta 在打字机期间不会拖累整个文件树重渲染。
+ */
+export function useWorkspaceFile(projectId: number, path: string): WorkspaceFile {
+  const store = createWorkspaceStore(projectId);
+  const getFile = (): WorkspaceFile => store.getState().files.get(path) ?? MISSING_FILE;
+  return useSyncExternalStore(store.subscribe, getFile, getFile);
+}

@@ -95,7 +95,9 @@ export function AppSidebar() {
                   type="button"
                   aria-label={`删除项目 ${item.title}`}
                   onClick={() => removeRecent(item.id)}
-                  className="absolute right-1.5 top-2 hidden rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground group-hover:block"
+                  // 键盘可达：不用 hidden/group-hover:block（Tab 聚焦不到破坏性操作），
+                  // 改为透明度过渡，hover 或 focus-visible 时显现
+                  className="absolute right-1.5 top-2 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
                 >
                   <X className="size-3.5" aria-hidden />
                 </button>

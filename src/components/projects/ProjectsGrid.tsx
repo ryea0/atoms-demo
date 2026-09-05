@@ -43,14 +43,7 @@ export function ProjectsGrid({ onDeleted }: ProjectsGridProps) {
     [onDeleted],
   );
 
-  if (projects === null) {
-    return (
-      <p className="py-12 text-center text-sm text-muted-foreground">
-        {error === null ? '正在加载项目…' : error}
-      </p>
-    );
-  }
-
+  // 错误优先（首次加载失败与刷新失败同一出口）：错误文案 + 重试，projects 未就绪也能重试
   if (error !== null) {
     return (
       <div className="flex flex-col items-center gap-3 py-12 text-sm text-muted-foreground">
@@ -60,6 +53,10 @@ export function ProjectsGrid({ onDeleted }: ProjectsGridProps) {
         </Button>
       </div>
     );
+  }
+
+  if (projects === null) {
+    return <p className="py-12 text-center text-sm text-muted-foreground">正在加载项目…</p>;
   }
 
   if (projects.length === 0) {

@@ -116,6 +116,8 @@ export function HomeHero() {
           }}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
+              // IME 组词中的 Enter 只确认候选词（中文输入），不能当提交
+              if (event.nativeEvent.isComposing) return;
               event.preventDefault();
               submit();
             }

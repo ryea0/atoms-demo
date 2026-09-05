@@ -6,13 +6,14 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { StreamEvent } from '@/lib/agents/events';
 import { roleOrder, roleRegistry } from '@/lib/agents/registry';
 import type { AgentRun, Message, Project, ProjectListItem } from '@/lib/db/provider/types';
 import {
   clearWorkspaceStores,
   createWorkspaceStore,
+  useWorkspaceFile,
   type WorkspaceSnapshot,
 } from '@/lib/client/store';
 
@@ -65,10 +66,13 @@ function makeSnapshot(over: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot 
 }
 
 let seqCounter = 0;
-/** 合成事件：projectId 固定、seq 自增（与总线行为一致），其余字段按需选填 */
-function ev(e: Pick<StreamEvent, 'event'> & Partial<Omit<StreamEvent, 'seq' | 'projectId' | 'event'>>): StreamEvent {
+/** 合成事件：projectId 缺省用夹具值、seq 自增（与总线行为一致），其余字段按需选填 */
+function ev(
+  e: Pick<StreamEvent, 'event'> & Partial<Omit<StreamEvent, 'seq' | 'projectId' | 'event'>>,
+  projectId: number = PROJECT_ID,
+): StreamEvent {
   seqCounter += 1;
-  return { seq: seqCounter, projectId: PROJECT_ID, runId: null, ...e };
+  return { seq: seqCounter, projectId, runId: null, ...e };
 }
 
 beforeEach(() => {
@@ -314,6 +318,53 @@ describe('workspaceStore hydrate', () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* useWorkspaceFile 细粒度订阅（T19 打字机消费）                         */
+/* ------------------------------------------------------------------ */
+
+describe('useWorkspaceFile 细粒度订阅', () => {
+  it('只订阅指定 path：其他路径更新不触发本组件重渲染，本路径更新才重渲染', () => {
+    clearWorkspaceStores();
+    const store = createWorkspaceStore(3);
+    store.hydrate(makeSnapshot({ project: makeProject({ id: 3 }) }));
+
+    const renders: string[] = [];
+    function Probe(): ReturnType<typeof createElement> {
+      const file = useWorkspaceFile(3, 'app/main.js');
+      renders.push(file.content);
+      return createElement('div', null, file.content);
+    }
+    const { container } = render(createElement(Probe));
+    expect(renders).toEqual(['']); // 文件尚不存在 → 共享空占位，引用稳定
+
+    // 其他路径的 delta：不重渲染
+    act(() => {
+      store.applyEvent(ev({ event: 'delta', path: 'app/other.js', content: 'x' }, 3));
+    });
+    expect(renders).toEqual(['']);
+
+    // 本路径 file_start + delta：各重渲染一次，内容跟进（同一 act 内的多次通知会被 React 批处理合并）
+    act(() => {
+      store.applyEvent(ev({ event: 'file_start', agent: 'engineer', path: 'app/main.js' }, 3));
+    });
+    act(() => {
+      store.applyEvent(ev({ event: 'delta', path: 'app/main.js', content: 'a' }, 3));
+    });
+    expect(renders).toEqual(['', '', 'a']);
+    expect(container.textContent).toBe('a');
+
+    // file_end 定版（streaming/version 变化 → 新引用，重渲染一次）后再来一条其他路径事件：不再重渲染
+    act(() => {
+      store.applyEvent(ev({ event: 'file_end', agent: 'engineer', path: 'app/main.js', meta: { version: 2 } }, 3));
+    });
+    act(() => {
+      store.applyEvent(ev({ event: 'delta', path: 'app/other.js', content: 'y' }, 3));
+    });
+    expect(renders).toEqual(['', '', 'a', 'a']);
+    expect(store.getState().files.get('app/main.js')).toMatchObject({ content: 'a', version: 2, streaming: false });
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* store 单例与订阅                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -406,6 +457,28 @@ describe('组件渲染冒烟', () => {
     vi.unstubAllGlobals();
   });
 
+  it('HomeHero：IME 组词中的 Enter 不提交（中文输入确认不建项目）', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { HomeHero } = await import('@/components/home/HomeHero');
+    render(createElement(HomeHero));
+    const input = screen.getByPlaceholderText('描述你想要的应用，团队替你实现');
+
+    fireEvent.change(input, { target: { value: '做一个番茄钟' } });
+    // 组词（isComposing）中的 Enter：只确认候选词，不触发提交
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(pushMock).not.toHaveBeenCalled();
+
+    // 组词结束后的 Enter：正常提交
+    fetchMock.mockResolvedValue(jsonResponse({ project: makeProject({ id: 9 }) }));
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(pushMock).toHaveBeenCalledWith('/p/9'));
+
+    vi.unstubAllGlobals();
+  });
+
   it('AppSidebar：品牌/导航 active 态/最近项目/设置入口，最近项可删除', async () => {
     const fetchMock = vi.fn();
     fetchMock.mockResolvedValue(jsonResponse({ projects: [listItem] }));
@@ -424,7 +497,11 @@ describe('组件渲染冒烟', () => {
 
     // 最近项 hover 删除：DELETE 成功后从列表移除
     fetchMock.mockResolvedValue(jsonResponse({}, true, 200));
-    fireEvent.click(screen.getByRole('button', { name: '删除项目 番茄钟应用' }));
+    const deleteButton = screen.getByRole('button', { name: '删除项目 番茄钟应用' });
+    // 键盘可达：Tab 聚焦时按钮可见（不再依赖 hover 才出现）
+    expect(deleteButton.className).toContain('focus-visible:opacity-100');
+    expect(deleteButton.className).not.toContain('hidden');
+    fireEvent.click(deleteButton);
     await waitFor(() => expect(screen.queryByText('番茄钟应用')).not.toBeInTheDocument());
     expect(fetchMock).toHaveBeenCalledWith('/api/projects/7', expect.objectContaining({ method: 'DELETE' }));
 
@@ -452,6 +529,27 @@ describe('组件渲染冒烟', () => {
     fetchMock.mockResolvedValue(jsonResponse({ projects: [] }));
     render(createElement(ProjectsGrid, { onDeleted: onDeleteMock }));
     expect(await screen.findByText('还没有项目')).toBeInTheDocument();
+
+    vi.unstubAllGlobals();
+  });
+
+  it('ProjectsGrid：首次加载失败也提供重试，重试成功后渲染列表', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue(jsonResponse({ projects: [listItem] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { ProjectsGrid } = await import('@/components/projects/ProjectsGrid');
+    render(createElement(ProjectsGrid, { onDeleted: onDeleteMock }));
+
+    // 首次失败：错误文案 + 重试按钮（projects 尚未就绪也要能重试）
+    expect(await screen.findByRole('button', { name: '重试' })).toBeInTheDocument();
+    expect(screen.queryByText('番茄钟应用')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
 
     vi.unstubAllGlobals();
   });
