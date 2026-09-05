@@ -35,9 +35,15 @@ function clip(text: string, max = 300): string {
   return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max)}…（截断）`;
 }
 
-/** unknown → 可读错误文本（脱敏后），中止类单独归类为超时（探测无外部 signal，AbortError 只能来自超时） */
+/**
+ * unknown → 可读错误文本（脱敏后）。
+ * 超时归类：AbortSignal.timeout 实际抛 DOMException name='TimeoutError'（Node 18+/undici），
+ * 个别运行时/ polyfill 抛 name='AbortError'——两者同归「探测超时」（与 fallback.ts classifyLlmError 口径一致）。
+ */
 function describeFailure(error: unknown, timeoutMs: number, apiKey: string): string {
-  if (error instanceof Error && error.name === 'AbortError') return `探测超时（${timeoutMs}ms）`;
+  if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+    return `探测超时（${timeoutMs}ms）`;
+  }
   const message = error instanceof Error ? error.message : String(error);
   return `探测请求失败：${clip(sanitize(message, apiKey))}`;
 }

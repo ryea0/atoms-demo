@@ -98,21 +98,23 @@ describe('probeProvider', () => {
     expect(result.error).not.toContain(API_KEY);
   });
 
-  it('③ 超时（AbortError）→ ok:false，错误提示超时，latencyMs 实测墙钟', async () => {
-    stubFetch(async () => {
-      await tick();
-      const abort = new Error('This operation was aborted');
-      abort.name = 'AbortError';
-      throw abort;
-    });
+  it('③ 超时 → ok:false「探测超时」，latencyMs 实测墙钟（TimeoutError 为 AbortSignal.timeout 实抛名，AbortError 兼容个别运行时）', async () => {
+    for (const name of ['TimeoutError', 'AbortError'] as const) {
+      stubFetch(async () => {
+        await tick();
+        const aborted = new Error('The operation was aborted due to timeout');
+        aborted.name = name;
+        throw aborted;
+      });
 
-    const result = await probeProvider({ baseUrl: BASE_URL, apiKey: API_KEY });
+      const result = await probeProvider({ baseUrl: BASE_URL, apiKey: API_KEY });
 
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error('预期探测失败');
-    expect(result.error).toContain('超时');
-    expect(result.latencyMs).toBeGreaterThan(0);
-    expect(result.error).not.toContain(API_KEY);
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error('预期探测失败');
+      expect(result.error).toContain(`探测超时（${DEFAULT_PROBE_TIMEOUT_MS}ms）`);
+      expect(result.latencyMs).toBeGreaterThan(0);
+      expect(result.error).not.toContain(API_KEY);
+    }
   });
 
   it('④ 200 但响应非 JSON → ok:false（网关返回 HTML 等场景），响应体经脱敏', async () => {

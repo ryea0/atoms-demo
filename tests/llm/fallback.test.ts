@@ -20,8 +20,8 @@ import type { LlmProvider, LlmRequest, LlmResult } from '@/lib/llm/types';
 /* 夹具与工具                                                           */
 /* ------------------------------------------------------------------ */
 
-/** 脚本步骤：成功（返回 content）或失败（抛 error） */
-type Step = { ok: true; content: string } | { ok: false; error: unknown };
+/** 脚本步骤：成功（返回 content）或失败（抛 error）；deltas = 本次调用先吐出的增量序列 */
+type Step = { ok: true; content: string; deltas?: string[] } | { ok: false; error: unknown; deltas?: string[] };
 
 /** 取脚本下一步（耗尽后重复最后一步），空脚本显式失败 */
 function nextStep(steps: Step[]): Step {
@@ -36,9 +36,11 @@ function scriptedProvider(name: string, steps: Step[]): LlmProvider & { requests
   const respond = async (req: LlmRequest, onDelta?: (text: string) => void): Promise<LlmResult> => {
     requests.push(req);
     const step = nextStep(steps);
+    for (const part of step.deltas ?? []) onDelta?.(part); // 失败步骤也可先吐增量（流中段失败场景）
     if (!step.ok) throw step.error;
-    if (onDelta !== undefined) onDelta(step.content);
-    return { content: step.content, toolCalls: [], usage: null };
+    const content = step.deltas !== undefined ? step.deltas.join('') : step.content;
+    if (onDelta !== undefined && step.deltas === undefined) onDelta(content);
+    return { content, toolCalls: [], usage: null };
   };
   return {
     name,
@@ -163,7 +165,7 @@ describe('withFallback 降级链', () => {
     const result = await provider.complete(makeReq());
 
     expect(result.content).toBe('B1');
-    expect(log).toEqual([{ from: 'a', to: 'b', code: 'timeout' }]);
+    expect(log).toEqual([{ from: 'a#0', to: 'b#1', code: 'timeout' }]);
   });
 
   it('③ 主 auth（401）→ 换 provider 正当，同样降级', async () => {
@@ -175,7 +177,7 @@ describe('withFallback 降级链', () => {
     const result = await provider.complete(makeReq());
 
     expect(result.content).toBe('B1');
-    expect(log).toEqual([{ from: 'a', to: 'b', code: 'auth' }]);
+    expect(log).toEqual([{ from: 'a#0', to: 'b#1', code: 'auth' }]);
   });
 
   it('④ 全败 → 抛最后一次的错误（同一对象），逐级回调', async () => {
@@ -188,7 +190,7 @@ describe('withFallback 降级链', () => {
     const error = asError(await catchError(provider.complete(makeReq())));
 
     expect(error).toBe(last); // 原样上抛，不包装
-    expect(log).toEqual([{ from: 'a', to: 'b', code: 'timeout' }]);
+    expect(log).toEqual([{ from: 'a#0', to: 'b#1', code: 'timeout' }]);
   });
 
   it('⑤ aborted 永不降级：原样抛出且后续 provider 不被调用', async () => {
@@ -237,14 +239,15 @@ describe('withFallback 降级链', () => {
         },
         () => b,
       ],
-      { onFallback },
+      { keys: ['primary-1', 'secondary-2'], onFallback },
     );
 
     const result = await provider.complete(makeReq());
 
     expect(result.content).toBe('B1');
     expect(log).toHaveLength(1);
-    expect(log[0]?.to).toBe('b');
+    expect(log[0]?.to).toBe('secondary-2'); // opts.keys 提供时优先于序号占位
+    expect(log[0]?.from).toBe('primary-1'); // 构造失败也用调用方给的键，不退化为 provider#0
   });
 
   it('⑧ stream 与 complete 同一套降级语义（增量透传给成功者）', async () => {
@@ -258,7 +261,27 @@ describe('withFallback 降级链', () => {
 
     expect(deltas).toEqual(['B-流式']);
     expect(result.content).toBe('B-流式');
-    expect(log).toEqual([{ from: 'a', to: 'b', code: 'timeout' }]);
+    expect(log).toEqual([{ from: 'a#0', to: 'b#1', code: 'timeout' }]);
+  });
+
+  it('⑨ 已吐过增量后失败 → 不再降级（防 A 残句 + B 全文拼进同一条流），失败仍计入健康度', async () => {
+    const boom = new LlmError('network_error', '吐到一半断线');
+    const a = scriptedProvider('a', [
+      { ok: false, error: boom, deltas: ['A-前半', 'A-后半'] },
+      ok('不应被调用'),
+    ]);
+    const b = scriptedProvider('b', [ok('B-全文')]);
+    const { log, onFallback } = createFallbackLog();
+    const provider = withFallback([() => a, () => b], { onFallback });
+
+    const deltas: string[] = [];
+    const error = await catchError(provider.stream(makeReq(), (text) => deltas.push(text)));
+
+    expect(error).toBe(boom); // 原样上抛，不换备选
+    expect(b.requests).toHaveLength(0);
+    expect(deltas).toEqual(['A-前半', 'A-后半']); // 只有 A 的残句，没有拼接内容
+    expect(log).toHaveLength(0); // 没有发生降级
+    expect(getProviderHealth('a#0')?.failCount).toBe(1); // 半途失败同样算服务商健康问题
   });
 });
 
@@ -277,7 +300,7 @@ describe('withFallback 内存健康度（fail≥3 排后、成功清零）', () 
     await provider.complete(makeReq());
     await provider.complete(makeReq());
     expect(log).toHaveLength(3); // 前三次都从 flaky 开始（原序），逐次降级
-    expect(getProviderHealth('flaky')?.failCount).toBe(PROVIDER_FAIL_THRESHOLD);
+    expect(getProviderHealth('flaky#0')?.failCount).toBe(PROVIDER_FAIL_THRESHOLD);
 
     const fourth = await provider.complete(makeReq());
     expect(fourth.content).toBe('B4');
@@ -303,11 +326,11 @@ describe('withFallback 内存健康度（fail≥3 排后、成功清零）', () 
     expect(log).toHaveLength(3);
 
     // 第 4 次：链序 [stable, flaky]；stable 失败 → 降级到 flaky，flaky 成功 → failCount 清零
-    expect(getProviderHealth('flaky')?.failCount).toBe(PROVIDER_FAIL_THRESHOLD);
+    expect(getProviderHealth('flaky#0')?.failCount).toBe(PROVIDER_FAIL_THRESHOLD);
     const fourth = await provider.complete(makeReq());
     expect(fourth.content).toBe('A-恢复');
-    expect(log[3]).toMatchObject({ from: 'stable', to: 'flaky', code: 'timeout' });
-    expect(getProviderHealth('flaky')?.failCount).toBe(0);
+    expect(log[3]).toMatchObject({ from: 'stable#1', to: 'flaky#0', code: 'timeout' });
+    expect(getProviderHealth('flaky#0')?.failCount).toBe(0);
 
     // 第 5 次：flaky 已恢复 → 回到链首并成功，无降级
     const fifth = await provider.complete(makeReq());
@@ -322,9 +345,9 @@ describe('withFallback 内存健康度（fail≥3 排后、成功清零）', () 
 
     await provider.complete(makeReq());
 
-    expect(getProviderHealth('a')?.failCount).toBe(1);
-    expect(getProviderHealth('a')?.lastLatencyMs).toBeGreaterThanOrEqual(0);
-    expect(getProviderHealth('b')?.failCount).toBe(0);
+    expect(getProviderHealth('a#0')?.failCount).toBe(1);
+    expect(getProviderHealth('a#0')?.lastLatencyMs).toBeGreaterThanOrEqual(0);
+    expect(getProviderHealth('b#1')?.failCount).toBe(0);
   });
 
   it('④ aborted 不计入健康度（用户停止≠服务商不健康）', async () => {
@@ -334,6 +357,43 @@ describe('withFallback 内存健康度（fail≥3 排后、成功清零）', () 
     await expect(catchError(provider.complete(makeReq()))).resolves.toBeInstanceOf(LlmError);
     await provider.complete(makeReq());
 
-    expect(getProviderHealth('a')).toMatchObject({ failCount: 0 });
+    expect(getProviderHealth('a#0')).toMatchObject({ failCount: 0 });
+  });
+
+  it('⑤ 同名候选健康度互不污染（默认键 = name#<序号>，provider.name 不是身份）', async () => {
+    // 真实场景：llm_providers.name 无唯一约束、openai 工厂硬编码 name='openai'，两个 DB provider 同名
+    const bad = scriptedProvider('openai', [
+      fail(new LlmError('timeout', '超时')),
+      fail(new LlmError('timeout', '超时')),
+      fail(new LlmError('timeout', '超时')),
+    ]);
+    const good = scriptedProvider('openai', [ok('G1'), ok('G2'), ok('G3'), ok('G4')]);
+    const { log, onFallback } = createFallbackLog();
+    const provider = withFallback([() => bad, () => good], { onFallback });
+
+    await provider.complete(makeReq());
+    await provider.complete(makeReq());
+    await provider.complete(makeReq());
+
+    expect(getProviderHealth('openai#0')?.failCount).toBe(PROVIDER_FAIL_THRESHOLD);
+    expect(getProviderHealth('openai#1')?.failCount).toBe(0); // 同名第二候选没有被第一候选的失败冤枉
+
+    const fourth = await provider.complete(makeReq());
+    expect(fourth.content).toBe('G4');
+    expect(log).toHaveLength(3); // bad 已按身份排后：第 4 次直接命中 good，无新降级
+  });
+
+  it('⑥ opts.keys 提供身份键：onFallback 与健康度都按业务键归属（建议 `provider-<行id>`）', async () => {
+    const bad = scriptedProvider('openai', [fail(new LlmError('timeout', '超时'))]);
+    const good = scriptedProvider('openai', [ok('G1')]);
+    const { log, onFallback } = createFallbackLog();
+    const provider = withFallback([() => bad, () => good], { keys: ['provider-7', 'provider-9'], onFallback });
+
+    const result = await provider.complete(makeReq());
+
+    expect(result.content).toBe('G1');
+    expect(log).toEqual([{ from: 'provider-7', to: 'provider-9', code: 'timeout' }]);
+    expect(getProviderHealth('provider-7')?.failCount).toBe(1);
+    expect(getProviderHealth('provider-9')?.failCount).toBe(0);
   });
 });

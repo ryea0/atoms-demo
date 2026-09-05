@@ -9,10 +9,13 @@
  *   换一个 provider 也解决不了，立即失败比静默换链更可诊断
  * - 构造失败（工厂抛错）一律降级：此刻尚未发出任何请求，尝试下一个候选零成本
  * - 全败抛最后一次的错误（同一对象，绝不包装——上层依赖错误同一性判中止）
+ * - 流式已吐过增量即不再降级：中段换 provider 会把 A 的残句与 B 的全文拼进同一条流（内容损坏）
  * - 链空 = 显式 config_missing 错误（本包装必须显式 opt-in：默认链为空 = 现行为不变）
  *
  * 内存健康度：Map<providerKey, {failCount, lastLatencyMs}>，fail≥PROVIDER_FAIL_THRESHOLD 的 provider
  * 在链内排序靠后（仅重排链内顺序，不引入新依赖），成功一次即清零恢复原序。
+ * providerKey 是身份而非名字（provider.name 无唯一性保证，见 FallbackOptions.keys），
+ * 缺省退化为 `provider.name#<序号>`，同名候选的健康度互不污染。
  * 单实例内存态；多实例部署需外置健康状态（DESIGN §12 演进位）。
  * 服务端专用，不得进入客户端 bundle。
  */
@@ -106,8 +109,15 @@ function recordFailure(key: string, latencyMs: number): void {
 }
 
 export interface FallbackOptions {
-  /** 降级回调：from/to = provider.name（构造失败未知名时为 `provider#<序号>`），code = 分类码；供日志与 T24 用量展示 */
+  /** 降级回调：from/to = 候选身份键（opts.keys 提供，缺省 `provider.name#<序号>`），code = 分类码；供日志与 T24 用量展示 */
   onFallback?: (from: string, to: string, code: FallbackCode) => void;
+  /**
+   * 候选身份键（与 chain 平行）：健康度的归属主键。provider.name 不构成身份——
+   * llm_providers.name 无唯一约束、openai 工厂又硬编码 name='openai'，同名候选若共用一条
+   * 健康记录会互相冤枉（A 的失败把 B 排到链尾）。缺省退化为 `provider.name#<序号>`（天然隔离），
+   * 调用方建议传稳定业务键（如 `provider-<行id>`）；缺项/越界处同样退化。
+   */
+  keys?: string[];
 }
 
 /** 链内一个候选：provider=null 表示工厂构造失败（error 为原始异常） */
@@ -126,15 +136,17 @@ function rank(key: string): number {
 /**
  * 构造全部候选并按健康度稳定重排（fail≥阈值排后，其余保持声明顺序）。
  * 工厂约定为廉价纯构造（本仓库 createOpenAiProvider/createMockProvider 均如此），
- * 因此每次调用全部构造一遍：既拿到 provider.name 作健康键，也保留 env 晚绑定。
+ * 因此每次调用全部构造一遍：既拿到 provider.name 参与默认身份键，也保留 env 晚绑定。
  */
-function planAttempts(chain: ReadonlyArray<() => LlmProvider>): Attempt[] {
+function planAttempts(chain: ReadonlyArray<() => LlmProvider>, keys?: ReadonlyArray<string>): Attempt[] {
   const built: Attempt[] = chain.map((factory, index) => {
+    // 身份键：调用方提供者优先；否则 name#<序号>（构造失败拿不到 name 时退化为序号）
+    const fallbackKey = keys?.[index] ?? `provider#${index}`;
     try {
       const provider = factory();
-      return { key: provider.name, provider, error: undefined };
+      return { key: keys?.[index] ?? `${provider.name}#${index}`, provider, error: undefined };
     } catch (error) {
-      return { key: `provider#${index}`, provider: null, error };
+      return { key: fallbackKey, provider: null, error };
     }
   });
   return built
@@ -150,8 +162,17 @@ async function runChain(
   req: LlmRequest,
   onDelta?: (text: string) => void,
 ): Promise<LlmResult> {
-  const attempts = planAttempts(chain);
+  const attempts = planAttempts(chain, opts.keys);
   let lastError: unknown;
+  // 流式已向调用方吐过增量就不能再换 provider：中段降级会把 A 的残句与 B 的全文拼进同一条流（内容损坏）
+  let sawDelta = false;
+  const guardedOnDelta =
+    onDelta === undefined
+      ? undefined
+      : (text: string): void => {
+          sawDelta = true;
+          onDelta(text);
+        };
 
   for (let index = 0; index < attempts.length; index += 1) {
     const attempt = attempts[index];
@@ -170,13 +191,16 @@ async function runChain(
     const startedAt = Date.now();
     try {
       const result =
-        onDelta === undefined ? await provider.complete(req) : await provider.stream(req, onDelta);
+        guardedOnDelta === undefined
+          ? await provider.complete(req)
+          : await provider.stream(req, guardedOnDelta);
       recordSuccess(attempt.key, Date.now() - startedAt);
       return result;
     } catch (error) {
       const code = classifyLlmError(error);
       // aborted 是用户意图而非服务商健康问题，不计入失败（否则停止一次就冤枉好 provider）
       if (code !== 'aborted') recordFailure(attempt.key, Date.now() - startedAt);
+      if (sawDelta) throw error; // 已吐增量：流中段不再降级，原样上抛由上层决定重试/重生成
       if (next === undefined) throw error; // 全败：抛最后一次的错误（原对象）
       if (!DEGRADABLE_CODES.has(code)) throw error; // aborted 永不降级；unknown 立即失败
       opts.onFallback?.(attempt.key, next.key, code);
