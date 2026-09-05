@@ -71,7 +71,9 @@ export function createMiscRepo(db: SqliteDb): MiscRepo {
         .select({ path: checkpointFiles.path, content: checkpointFiles.content })
         .from(checkpointFiles)
         .where(eq(checkpointFiles.checkpointId, cp.id))
-        .orderBy(asc(checkpointFiles.id))
+        // 返回值契约「受影响 fileId 按快照路径升序」由这里显式排序保证；
+        // 打点时恰好按路径插入只是巧合，不能当成契约（否则换插入顺序即静默破坏契约）
+        .orderBy(asc(checkpointFiles.path))
         .all();
       const current = tx.select().from(files).where(eq(files.projectId, projectId)).all();
       const byPath = new Map(current.map((row) => [row.path, row]));
@@ -89,7 +91,8 @@ export function createMiscRepo(db: SqliteDb): MiscRepo {
               editor: existing.lastEditor,
             })
             .run();
-          tx.update(files)
+          const updated = tx
+            .update(files)
             .set({
               content: row.content,
               version: existing.version + 1,
@@ -105,6 +108,13 @@ export function createMiscRepo(db: SqliteDb): MiscRepo {
               ),
             )
             .run();
+          // 防御层收口：CAS 未命中必须炸出来（同连接事务内 version 已被读到，串行模型下不可达），
+          // 否则内容没恢复成却把 fileId 塞进返回值，调用方会拿到一份「假成功」清单
+          if (updated.changes === 0) {
+            throw new Error(
+              `检查点恢复覆盖未命中：projectId=${projectId} fileId=${existing.id} version=${existing.version}`,
+            );
+          }
           affected.push(existing.id);
         } else {
           // 文件行已消失（虚拟 FS 无删除 API，此处为兜底路径）：重建并沿用恢复动作主体记 human

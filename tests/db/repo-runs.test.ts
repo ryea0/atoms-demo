@@ -14,7 +14,7 @@ import { createProjectsRepo } from '@/lib/db/provider/sqlite/repo-projects';
 import { createFilesRepo } from '@/lib/db/provider/sqlite/repo-files';
 import { createRunsRepo } from '@/lib/db/provider/sqlite/repo-runs';
 import { createMiscRepo } from '@/lib/db/provider/sqlite/repo-misc';
-import { files, llmCalls } from '@/lib/db/provider/sqlite/schema';
+import { checkpointFiles, checkpoints, files, llmCalls } from '@/lib/db/provider/sqlite/schema';
 import * as schema from '@/lib/db/provider/sqlite/schema';
 import type { StorageProvider } from '@/lib/db/provider/types';
 
@@ -190,6 +190,33 @@ describe('repo misc：检查点补充回归', () => {
     // 跨项目 / 不存在的检查点 → 显式报错，不静默返回
     await expect(s.restoreCheckpoint(other.id, cp1)).rejects.toThrow();
     await expect(s.restoreCheckpoint(p.id, cp1 + 10_000)).rejects.toThrow();
+  });
+
+  it('恢复返回的 fileId 按快照路径升序，不受 checkpoint_files 插入顺序影响（夹具直造乱序快照）', async () => {
+    const r = newRepos();
+    const p = await r.createProject({ sessionId: 's', title: 't', requirement: 'r', mode: 'fast' });
+    // 故意按非字母序建文件：z.js 先建、a.js 后建
+    const z = await r.upsertFile({ projectId: p.id, path: 'app/z.js', content: 'Z1', editor: 'engineer' });
+    const a = await r.upsertFile({ projectId: p.id, path: 'app/a.js', content: 'A1', editor: 'engineer' });
+    await r.upsertFile({ projectId: p.id, path: 'app/z.js', content: 'Z2', editor: 'engineer' });
+
+    // 夹具直造检查点 + 乱序快照行（绕过打点时的路径排序，模拟未来插入顺序变更）：
+    // 快照行 id 序 = z.js 在前、a.js 在后，与路径序相反
+    const cpRows = await r.db
+      .insert(checkpoints)
+      .values({ projectId: p.id, label: '乱序快照', agentRunId: null })
+      .returning();
+    const cp = cpRows[0];
+    if (!cp) throw new Error('夹具检查点写入失败');
+    await r.db.insert(checkpointFiles).values([
+      { checkpointId: cp.id, path: 'app/z.js', content: 'Z1' },
+      { checkpointId: cp.id, path: 'app/a.js', content: 'A1' },
+    ]);
+
+    const affected = await r.restoreCheckpoint(p.id, cp.id);
+    expect(affected).toEqual([a.fileId, z.fileId]); // 按路径升序，而非快照行插入序
+    expect((await r.getFile(p.id, 'app/a.js'))?.content).toBe('A1');
+    expect((await r.getFile(p.id, 'app/z.js'))?.content).toBe('Z1');
   });
 
   it('快照中已不存在的文件行，恢复时重建（files 无删除 API，夹具直删模拟行消失）', async () => {
