@@ -30,6 +30,10 @@ import type { TaskAssignment } from '@/lib/agents/roles/leader';
 const pmRequirements: string[] = [];
 /** 这些路径的 runEngineerFile 直接返回 ok=false 结果（模拟 hard×2 重试耗尽） */
 const engineerFailPaths = new Set<string>();
+/** 记录写后自审被调用的文件路径（接线断言用） */
+const reviewPaths: string[] = [];
+/** 这些路径的写后自审直接抛错（自审失败不阻断的断言用） */
+const reviewFailPaths = new Set<string>();
 /** 非空则 routeLeader 返回这份 DAG（环依赖注入用） */
 let cycleTasks: TaskAssignment[] | null = null;
 
@@ -60,6 +64,11 @@ vi.mock('@/lib/agents/roles/engineer', async (importOriginal) => {
         });
       }
       return actual.runEngineerFile(ctx);
+    },
+    runEngineerReview: (ctx: import('@/lib/agents/roles/engineer').EngineerReviewContext) => {
+      reviewPaths.push(ctx.path);
+      if (reviewFailPaths.has(ctx.path)) return Promise.reject(new Error('自审 provider 炸了'));
+      return actual.runEngineerReview(ctx);
     },
   };
 });
@@ -110,6 +119,8 @@ beforeEach(() => {
   vi.stubEnv('LLM_MOCK_DELAY_MS', '0'); // 离线快速：mock 流式延迟置 0
   pmRequirements.length = 0;
   engineerFailPaths.clear();
+  reviewPaths.length = 0;
+  reviewFailPaths.clear();
   cycleTasks = null;
 });
 
@@ -181,6 +192,54 @@ describe('ProjectEventBus', () => {
     bus.subscribe(1, (e) => good.push(e.seq));
     expect(() => bus.emit(1, { runId: null, event: 'message', content: 'x' })).not.toThrow();
     expect(good).toEqual([1]);
+  });
+
+  it('重放路径同样隔离订阅者异常（不炸 SSE 路由的注册流程）', () => {
+    const bus = new ProjectEventBus();
+    bus.emit(1, { runId: null, event: 'message', content: 'a' });
+    bus.emit(1, { runId: null, event: 'message', content: 'b' });
+    const seen: string[] = [];
+    expect(() =>
+      bus.subscribe(
+        1,
+        (e) => {
+          if (e.content === 'a') throw new Error('坏订阅者');
+          seen.push(e.content ?? '');
+        },
+        0,
+      ),
+    ).not.toThrow();
+    expect(seen).toEqual(['b']);
+  });
+
+  it('error 事件清除该路径的 liveBuffer，其他路径不受影响', () => {
+    const bus = new ProjectEventBus();
+    bus.emit(1, { runId: null, event: 'file_start', path: 'a.js' });
+    bus.emit(1, { runId: null, event: 'delta', path: 'a.js', content: 'x' });
+    bus.emit(1, { runId: null, event: 'file_start', path: 'b.js' });
+    bus.emit(1, { runId: null, event: 'delta', path: 'b.js', content: 'y' });
+    bus.emit(1, { runId: null, event: 'error', agent: 'engineer', path: 'a.js', error: '校验失败' });
+    expect(bus.liveBuffer(1, 'a.js')).toBe('');
+    expect(bus.liveBuffer(1, 'b.js')).toBe('y');
+  });
+
+  it('release 显式清空缓冲/订阅者/在流文本；done 等正常收口不清', () => {
+    const bus = new ProjectEventBus();
+    const seen: number[] = [];
+    bus.subscribe(1, (e) => seen.push(e.seq));
+    bus.emit(1, { runId: null, event: 'file_start', path: 'a.js' });
+    bus.emit(1, { runId: null, event: 'delta', path: 'a.js', content: 'x' });
+    bus.emit(1, { runId: null, event: 'done' });
+    // 正常收口不清：重放窗口与在流文本保持原样
+    expect(bus.snapshotBuffer(1, 0).length).toBe(3);
+
+    bus.release(1);
+    expect(bus.snapshotBuffer(1, 0)).toEqual([]);
+    expect(bus.liveBuffer(1, 'a.js')).toBe('');
+    // release 后再使用 = 新桶（seq 从 1 重计），旧订阅者不再收到
+    bus.emit(1, { runId: null, event: 'message', content: 'after' });
+    expect(bus.snapshotBuffer(1, 0).length).toBe(1);
+    expect(seen).toEqual([1, 2, 3]);
   });
 });
 
@@ -446,4 +505,65 @@ describe('startGeneration（mock 全链路）', () => {
     expect(mustFind(events, (e) => e.event === 'message' && e.content === report?.content).agent).toBe('leader');
     expect((await storage.getProject(projectId))?.status).toBe('done');
   });
+
+  it('⑧ 写后自审接入：每个成功文件 review 一次（拓扑序）；自审失败不阻断文件与整轮', async () => {
+    reviewFailPaths.add('app/backend/api.js');
+    const { storage, projectId } = await newProject('full');
+    const { events, stop } = collectEvents(projectId);
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: REQUIREMENT,
+      mode: 'full',
+      mentions: [],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    // 三个工程师目标文件（docs 节点跳过）各 review 一次，顺序 = file_tree 拓扑序
+    expect(reviewPaths).toEqual(['app/backend/api.js', 'app/frontend/index.html', 'app/start_app.sh']);
+    // 自审失败被吞：不发 error 事件、文件照常成功（file_end ok=true）、整轮照常 done
+    expect(events.some((e) => e.event === 'error' && (e.error ?? '').includes('自审'))).toBe(false);
+    expect(mustFind(events, (e) => e.event === 'file_end' && e.path === 'app/backend/api.js').meta?.ok).toBe(true);
+    expect(events.at(-1)?.event).toBe('done');
+    const progress = await progressRow(storage, projectId);
+    expect(progress.content).toContain('写后自审失败');
+  }, 30000);
+
+  it('⑨ 排队轮的请求断开不越界：只停本轮，在跑轮照常完成到 done', async () => {
+    vi.stubEnv('LLM_MOCK_DELAY_MS', '20'); // 放慢在跑轮的流式，保证第二轮处于排队态时打断它
+    const { storage, projectId } = await newProject('fast');
+    const { events, stop } = collectEvents(projectId);
+    const round2Signal = new AbortController();
+
+    const first = startGeneration({
+      storage,
+      projectId,
+      userMessage: '做一次 SEO 分析',
+      mode: 'fast',
+      mentions: ['seo'],
+      signal: new AbortController().signal,
+    });
+    const second = startGeneration({
+      storage,
+      projectId,
+      userMessage: '再出一份广告投放方案',
+      mode: 'fast',
+      mentions: ['ads'],
+      signal: round2Signal.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150)); // 第一轮仍在流式（SEO 报告 ~1s）
+    round2Signal.abort(); // 第二轮的 HTTP 断开：不得越界打断第一轮
+    await Promise.all([first, second]);
+    stop();
+
+    const firstDone = events.findIndex((e) => e.event === 'done');
+    const stoppedAt = events.findIndex((e) => e.event === 'stopped');
+    expect(firstDone).toBeGreaterThanOrEqual(0); // 在跑轮完整走完
+    expect(stoppedAt).toBeGreaterThan(firstDone); // 停止只发生在第二轮开跑时
+    expect(events.some((e) => e.agent === 'seo')).toBe(true); // 第一轮工作完整
+    expect(events.some((e) => e.agent === 'ads')).toBe(false); // 第二轮未做任何工作
+    expect(await storage.getFile(projectId, 'docs/seo_report.md')).not.toBeNull();
+  }, 20000);
 });

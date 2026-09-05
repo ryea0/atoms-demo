@@ -89,6 +89,8 @@ export class ProjectEventBus {
       state.live.set(event.path, (state.live.get(event.path) ?? '') + (event.content ?? ''));
     } else if (event.event === 'file_end' && event.path !== undefined) {
       state.live.delete(event.path);
+    } else if (event.event === 'error' && event.path !== undefined) {
+      state.live.delete(event.path); // 文件级失败：清掉该路径的在流文本（避免快照读到残文）
     } else if (event.event === 'stopped') {
       state.live.clear(); // 停止后不再有「正在生成」的文件
     }
@@ -106,10 +108,17 @@ export class ProjectEventBus {
   /** 订阅实时事件；afterSeq 提供时先重放缓冲中 seq > afterSeq 的事件（Last-Event-ID 恢复）。返回退订函数 */
   subscribe(projectId: number, fn: (event: StreamEvent) => void, afterSeq?: number): () => void {
     const state = this.stateOf(projectId);
-    // 重放与订阅之间无 await：同步重放完毕才挂上实时订阅，不会漏事件也不会乱序
+    // 重放与订阅之间无 await：同步重放完毕才挂上实时订阅，不会漏事件也不会乱序；
+    // 重放同样隔离订阅者异常（坏消费者不能把 SSE 路由的注册流程炸掉）
     if (afterSeq !== undefined) {
       for (const event of state.ring) {
-        if (event.seq > afterSeq) fn(event);
+        if (event.seq > afterSeq) {
+          try {
+            fn(event);
+          } catch (error) {
+            console.error(`[events] 订阅者重放事件失败（seq=${event.seq}，event=${event.event}）：`, error);
+          }
+        }
       }
     }
     state.subscribers.add(fn);
@@ -126,6 +135,16 @@ export class ProjectEventBus {
   /** 正在流式生成文件的全文（打字机/刷新快照用）；无在流文件返回空串 */
   liveBuffer(projectId: number, path: string): string {
     return this.stateOf(projectId).live.get(path) ?? '';
+  }
+
+  /**
+   * 显式释放项目资源（项目删除路由调用）：清空环形缓冲/订阅者/在流文本。
+   * 正常收口（done/stopped）**不**清缓冲——重连重放窗口保持完整，只有显式释放才清。
+   */
+  release(projectId: number): void {
+    const state = this.projects.get(projectId);
+    if (state === undefined) return;
+    this.projects.delete(projectId);
   }
 }
 

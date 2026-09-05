@@ -28,7 +28,7 @@ import { isAbortError } from '@/lib/agents/roles/run-support';
 import { routeLeader, type TaskAssignment } from '@/lib/agents/roles/leader';
 import { PRD_PATH, runPm } from '@/lib/agents/roles/pm';
 import { FILE_TREE_PATH, parseFileTree, runArchitect } from '@/lib/agents/roles/architect';
-import { buildFastFileTree, runEngineerFile, type FileTree } from '@/lib/agents/roles/engineer';
+import { buildFastFileTree, runEngineerFile, runEngineerReview, type FileTree } from '@/lib/agents/roles/engineer';
 import { EXPERT_REPORT_PATHS, runExpert, type ExpertRole } from '@/lib/agents/roles/experts';
 import { runCloser } from '@/lib/agents/roles/closer';
 import { AgentAbortError } from '@/lib/agents/types';
@@ -136,18 +136,50 @@ export function orchestratorStatus(projectId: number): 'idle' | 'running' {
 
 /** 启动一轮生成：入项目互斥队列（并发调用同项目自动串行化），完成时 resolve */
 export async function startGeneration(input: StartGenerationInput): Promise<void> {
-  const controller = controllerFor(input.projectId);
-  if (input.signal.aborted) controller.abort();
-  const forwardAbort = (): void => controller.abort();
-  input.signal.addEventListener('abort', forwardAbort, { once: true });
-
+  const projectController = controllerFor(input.projectId);
   incrementPending(input.projectId);
   const job = (): Promise<void> =>
-    executeGeneration(input, controller).finally(() => {
-      input.signal.removeEventListener('abort', forwardAbort);
+    executeRound(input, projectController).finally(() => {
       decrementPending(input.projectId);
     });
   await enqueue(input.projectId, job);
+}
+
+/** 单轮控制器：外部信号（HTTP 断开）或项目级停止任一触发即中止 */
+interface RoundController {
+  signal: AbortSignal;
+  /** 解绑两侧监听（轮次结束时调用，防监听泄漏） */
+  dispose: () => void;
+}
+
+/**
+ * 每轮一个子控制器（作用域修复）：外部 input.signal 只中止**本轮**——
+ * 排队轮的请求断开不能越界打断在跑轮；stopProject 只中止项目级控制器，
+ * 在跑轮与排队轮（开跑时检测已中止）都会停，但互不牵连。
+ */
+function createRoundController(external: AbortSignal, projectController: AbortController): RoundController {
+  const round = new AbortController();
+  const forward = (): void => round.abort();
+  external.addEventListener('abort', forward, { once: true });
+  projectController.signal.addEventListener('abort', forward, { once: true });
+  if (external.aborted || projectController.signal.aborted) round.abort();
+  return {
+    signal: round.signal,
+    dispose: () => {
+      external.removeEventListener('abort', forward);
+      projectController.signal.removeEventListener('abort', forward);
+    },
+  };
+}
+
+/** 一轮的执行包装：建子控制器 → 跑主流程 → 无论成败解绑监听 */
+async function executeRound(input: StartGenerationInput, projectController: AbortController): Promise<void> {
+  const round = createRoundController(input.signal, projectController);
+  try {
+    await executeGeneration(input, round.signal);
+  } finally {
+    round.dispose();
+  }
 }
 
 /**
@@ -260,8 +292,8 @@ function pmRequirementText(project: Project, userMessage: string): string {
 /* 主流程                                                               */
 /* ------------------------------------------------------------------ */
 
-async function executeGeneration(input: StartGenerationInput, controller: AbortController): Promise<void> {
-  const { storage, projectId, signal } = { ...input, signal: controller.signal };
+async function executeGeneration(input: StartGenerationInput, signal: AbortSignal): Promise<void> {
+  const { storage, projectId } = input;
   const emit = (e: Omit<StreamEvent, 'seq' | 'projectId'>): StreamEvent => projectEventBus.emit(projectId, e);
   const note = (line: string): Promise<void> => appendProgressLine(storage, projectId, line);
 
@@ -482,9 +514,10 @@ async function resolveEngineerTree(c: TaskContext, round: RoundState): Promise<F
 }
 
 /**
- * 工程师（D1 混合模式）：按 file_tree 拓扑序逐文件派发单文件任务。
- * docs/ 是 PM/架构师交付物（file_tree 里的 docs 节点是依赖上下文，不是工程师工作项）；
- * 人工软锁文件跳过 + 聊天区请求裁决（裁决 UI 是 Task 23）；单文件失败发 error 后继续下一文件。
+ * 工程师（D1 混合模式）：按 file_tree 拓扑序逐文件派发单文件任务，成功后接写后自审
+ * （runEngineerReview，一次即止，失败不阻断）。docs/ 是 PM/架构师交付物（file_tree 里的
+ * docs 节点是依赖上下文，不是工程师工作项）；人工软锁文件跳过 + 聊天区请求裁决
+ * （裁决 UI 是 Task 23）；单文件失败发 error 后继续下一文件。
  */
 async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<TaskDispatchResult> {
   const { storage, projectId, task } = c;
@@ -540,6 +573,24 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
     if (result.ok) {
       okCount += 1;
       await appendProgressLine(storage, projectId, fileDoneLine(result.path, result.version));
+      // 写后自审（DESIGN §5⑤′，agent 版 lint）：同一单文件上下文再跑一次廉价 review；
+      // 失败不阻断该文件（自审是增强项），仅留痕 console + PROGRESS ⚠ 行
+      try {
+        await runEngineerReview({
+          storage,
+          projectId,
+          requirement: c.project.requirement,
+          target: node,
+          fileTree: tree,
+          designSummary,
+          path: result.path,
+          signal: c.signal,
+        });
+      } catch (error) {
+        if (isAbortError(error)) throw error; // 停止语义仍要冒泡
+        console.warn(`[orchestrator] ${result.path} 写后自审失败（不阻断）：${errorMessage(error)}`);
+        await appendProgressLine(storage, projectId, `- ⚠ ${result.path} 写后自审失败：${errorMessage(error)}`);
+      }
     } else {
       failedFiles.push(result.path);
       c.emit({ runId: result.runId, event: 'error', agent: 'engineer', path: result.path, error: (result.errors ?? []).join('；') });
