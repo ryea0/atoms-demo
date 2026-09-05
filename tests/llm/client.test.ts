@@ -4,6 +4,7 @@
  * 外部 HTTP 一律用 fetch 桩，不发真实请求。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ARCHITECT_DOC_PATHS } from '@/lib/agents/roles/architect';
 import { estimateTokens } from '@/lib/llm/estimate';
 import { DEFAULT_MODEL, getLlmProvider, LlmError, resolveModel } from '@/lib/llm/client';
 import { createMockProvider, readSample } from '@/lib/llm/mock';
@@ -253,8 +254,11 @@ describe('mock provider 角色路由', () => {
     );
     expect(result.content).toBe(readSample('design.md'));
     expect(result.content).toContain('```mermaid');
-    expect(result.content).toContain('===== app/frontend/index.html =====');
     expect(result.content).toContain('===== docs/file_tree.md =====');
+    // 样例分段 = 架构师交付物清单（Task 12 控制器裁决：8 个 docs 文件，含机读 file_tree.json）
+    for (const path of ARCHITECT_DOC_PATHS) {
+      expect(result.content).toContain(`===== ${path} =====`);
+    }
   });
 
   it('design.md 内嵌 file_tree 与 filetree.json 完全一致（防止两份样例漂移）', () => {
