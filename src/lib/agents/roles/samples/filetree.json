@@ -1,0 +1,27 @@
+[
+  {
+    "path": "docs/prd.md",
+    "desc": "产品需求文档（PRD：功能清单/用户故事/验收标准）",
+    "depends": []
+  },
+  {
+    "path": "docs/system_design.md",
+    "desc": "系统设计说明（含 mermaid 架构与接口契约）",
+    "depends": ["docs/prd.md"]
+  },
+  {
+    "path": "app/backend/api.js",
+    "desc": "内存态后端 handle(method,path,body)，资源 /api/todos",
+    "depends": ["docs/system_design.md"]
+  },
+  {
+    "path": "app/frontend/index.html",
+    "desc": "待办单页（Tailwind CDN + fetch 调用 /api/todos）",
+    "depends": ["app/backend/api.js"]
+  },
+  {
+    "path": "start_app.sh",
+    "desc": "预览启动说明（浏览器内全栈，无需安装依赖）",
+    "depends": ["app/frontend/index.html"]
+  }
+]
