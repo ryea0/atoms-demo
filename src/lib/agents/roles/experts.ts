@@ -86,6 +86,8 @@ export interface RunExpertInput {
    * 注意：注入只替换底层模型出口，计量装饰器仍由本函数负责包一层（llm_calls 照常落库）。
    */
   provider?: LlmProvider;
+  /** 流式增量透传（编排器接打字机 SSE delta 用）；缺省不透传，行为不变 */
+  onDelta?: (text: string) => void;
 }
 
 /** runExpert 结果：任务记录 id + 产出文件路径 */
@@ -185,6 +187,7 @@ export async function runExpert(ctx: RunExpertInput): Promise<RunExpertResult> {
       model,
       ctx: { storage, projectId, role } satisfies ToolContext,
       provider: meteredProvider,
+      callbacks: ctx.onDelta === undefined ? undefined : { onDelta: ctx.onDelta },
       signal,
     });
     return stripOuterFence(result.content);

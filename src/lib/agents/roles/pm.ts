@@ -40,6 +40,8 @@ export interface PmContext {
   signal?: AbortSignal;
   /** 可注入 provider（测试桩 / 编排器统一入口）；缺省 getLlmProvider()，恒经 wrapMetered 计量包裹 */
   provider?: LlmProvider;
+  /** 流式增量透传（编排器接打字机 SSE delta 用）；缺省不透传，行为不变 */
+  onDelta?: (text: string) => void;
 }
 
 /** runPm 结果：任务 id + 实际落库的文件清单 */
@@ -146,6 +148,7 @@ export async function runPm(ctx: PmContext): Promise<PmResult> {
       model,
       ctx: { storage, projectId, role: 'pm' },
       provider,
+      callbacks: ctx.onDelta === undefined ? undefined : { onDelta: ctx.onDelta },
       signal: ctx.signal,
     });
 

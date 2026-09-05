@@ -57,8 +57,8 @@ export const CLOSER_SYSTEM_PROMPT = [
   '',
 ].join('\n');
 
-/** PROGRESS.md 缺失时创建的文件头 */
-const PROGRESS_HEADER = [
+/** PROGRESS.md 缺失时创建的文件头（导出供编排器 progress 模块复用，避免两处模板漂移） */
+export const PROGRESS_HEADER = [
   '# 项目进度（PROGRESS）',
   '',
   '> 每个任务边界由编排器追加状态行（✅/🔄/⏸/❌）；项目收尾时由团队领导追加领导汇报段。',
