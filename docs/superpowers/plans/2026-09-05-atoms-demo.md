@@ -749,6 +749,30 @@ export function orchestratorStatus(projectId:number):'idle'|'running';
 
 ---
 
+---
+
+### Task 27: Provider 增强 — 模型探测 / 角色路由 / Fallback 链（用户追加，参考 hify-provider 设计）
+
+**Files:**
+- Create: `src/lib/llm/probe.ts`、`fallback.ts`、`resolve.ts`
+- Test: `tests/llm/probe.test.ts`、`tests/llm/fallback.test.ts`
+
+**背景**（hify-provider 移植蓝图）：Java 侧的三层实体 provider→model_config→消费者外键、`/v1/models` 发现导入、test-connection 计时、60s 健康探测状态机（fail≥3→DOWN/DEGRADED）可直接借鉴；fallback 链 hify 缺失，由本任务自建（类型化错误 + 顺序降级 + 内存健康度排序）。
+
+**Interfaces:**
+- `probeProvider({baseUrl, apiKey, timeoutMs=10_000}): Promise<ProbeResult>`——GET `{baseUrl去尾斜杠}/models`（OpenAI 兼容 `data[].id`），墙钟计时；`ProbeResult = {ok:true, latencyMs:number, models:string[]} | {ok:false, latencyMs:number, error:string}`（密钥不进 error）
+- `classifyLlmError(e:unknown): 'aborted'|'auth'|'rate_limited'|'timeout'|'network'|'bad_response'|'unknown'`——abort 永不 fallback；auth 在同 provider 内不重试但**换 provider 正当**；rate_limited/timeout/network/bad_response 可降级
+- `withFallback(chain: Array<() => LlmProvider>, opts?): LlmProvider`——按序尝试，可降级错误换下一个，全败抛最后错误；`onFallback?: (from:string, to:string, code) => void`（落 console + 供 T24 用量展示）
+- `resolveRoleModel(role:AgentRole, env, storage?): Promise<{model:string; providerConfig?:{baseUrl,apiKey}}>`——优先级：agent_model_bindings（DB，storage 提供时）→ `LLM_MODEL_<ROLE>` → `LLM_MODEL`；DB 路径返回 providerConfig（绑定供应商的连接信息），env 路径 providerConfig 为空（走全局 env）
+- 内存健康度：`fallback.ts` 内 `Map<providerKey, {failCount, lastLatencyMs}>`，降级排序参考（fail≥3 的排后）——单实例内存态，多实例外置列为演进（DESIGN §12）
+
+**Steps:**
+- [ ] **Step 1: 失败测试**——probe（stub fetch：200 带 data[].id / 401 / 超时；latencyMs>0）、classify（六类各一）、withFallback（①主成功不降级 ②主 timeout→备成功 ③主 auth→备成功（换 provider 正当）④全败抛最后 ⑤aborted 不降级 ⑥链空=原样）、resolveRoleModel（env 三级 + DB 绑定优先，fake storage）
+- [ ] **Step 2-4: 红绿**（不改 getLlmProvider 现有行为——fallback 是显式包装，默认链为空）
+- [ ] **Step 5: Commit** `feat(llm): provider probe + role model resolution + fallback chain`
+
+**与 T24 的边界**：T27 提供核心层（probe/resolve/fallback）；T24 的设置页 UI 与 providers CRUD API 消费它们（「测试连接」按钮=probeProvider，「模型导入」=probe.models 落 llm_models，绑定下拉=resolveRoleModel 数据源）。
+
 ## Self-Review 结论
 
 - **Spec 覆盖**：DESIGN §1-§12 逐节核对——编排(§3.1-3.4→T11/15)、干预停止(§3.5→T15/16/19)、SSE(§3.6→T15/16/17)、预览(§3.7→T16/22)、快速模式+seed(§3.8→T11/13/25)、人机共编(§3.9→T4/21/23)、检查点(§3.10→T5/25)、Harness(§4→T8/9)、质量+校验(§5⑤⑤′→T10/13)、模型管理/计量(§5①③→T6/24)、隔离(§4.7→T3/7)、检索(§4.1→T9)、布局(§2→T17-22)、@指定(§3.1→T11/19)。Race Mode(E3)/Publish(E4) 按 DESIGN §8 降级阶梯为"时间富余"项，未入计划（如需追加为 T27）。

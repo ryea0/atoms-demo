@@ -142,7 +142,7 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 - Next.js 注意：stream 路由 `force-dynamic`、响应禁用缓冲；反代（nginx/Zeabur 网关）需关 proxy buffering
 
 ### 3.7 全栈可运行预览契约（D2）
-- **工程师约束**：`app/backend/api.js` 为**无框架同构 JS 模块**——导出 `handle(method, path, body) -> {status, body}`，数据存内存 Map/数组，禁止 fs/net/进程/timer API；`app/frontend/index.html` 一律通过 `fetch('/api/...')` 调后端（标准契约）；纯前端应用（无后端需求）可不产 api.js
+- **工程师约束**：`app/backend/api.js` 为**无框架同构 JS 模块**——导出 `handle(method, path, body) -> {code, data?, message?}`（`code` 携带 HTTP 状态语义，预览垫片映射为 Response.status；T13 评审裁决 6(b)，2026-09-06 修订），数据存内存 Map/数组，禁止 fs/net/进程/timer API；`app/frontend/index.html` 一律通过 `fetch('/api/...')` 调后端（标准契约）；纯前端应用（无后端需求）可不产 api.js
 - **预览装配（服务端拼接）**：`GET /api/projects/[id]/preview` 取 index.html，在 `<head>` 顶部注入运行时垫片：① api.js 源码（内联）② fetch 拦截器把 `/api/*` 路由到内存 handler ③ 再执行应用代码。模型无法"忘记"垫片（注入是服务端行为）
 - 效果：CRUD 全流程在预览中真实可用（内存态，刷新重置）；api.js 是真交付物（同构模块，未来可直接挂 Node 服务）
 - 取舍（写进 README）：服务端真执行需容器沙箱（Docker/Firecracker），列为演进方向；浏览器内全栈零基础设施、零安全风险、演示效果等价
@@ -184,7 +184,7 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 ```
 [SystemPrompt（角色+输出契约）]
 [个人偏好 preferences（session 级）]
-[项目偏好 .atoms/PREFERENCES.md + 长期记忆 .atoms/reports/MEMORY.md]
+[项目偏好 .atoms/reports/PREFERENCES.md + 长期记忆 .atoms/reports/MEMORY.md]（路径以 §1 结构定义为准，2026-09-06 统一）
 [文件上下文：file_tree + 依赖声明文件全文（按 token 预算裁剪）]
 [任务指令 + 上游交接摘要 + 待注入干预指令]
 ```
@@ -197,7 +197,7 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 
 ### 4.2 记忆与偏好
 - 短期=当前 run；长期=`MEMORY.md`（领导收尾写入，下次迭代注入）
-- 两级偏好：项目级 `.atoms/PREFERENCES.md`（设置页或领导 update_memory 捕捉）；个人级 `preferences` 表（scope=session）。demo 做项目级+session 级
+- 两级偏好：项目级 `.atoms/reports/PREFERENCES.md`（设置页或领导 update_memory 捕捉）；个人级 `preferences` 表（scope=session）。demo 做项目级+session 级
 
 ### 4.3 子任务交接协议（防漂移）
 每个任务结束产出结构化交接摘要（`agent_runs.summary`：完成内容/产出文件/关键决策/下游注意事项）；下一任务**全新上下文**（零历史共享），只注入 需求+交接摘要+按需重读文件。中断无 summary 时用文件清单拼装降级摘要。
@@ -218,7 +218,7 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 
 ## 5. 关键设计决策与取舍
 
-**① 模型提供商切换（agent 粒度）**：设置页管理 Provider（预设豆包/ARK、DeepSeek、GLM、Kimi、OpenAI + 自定义）+ 模型列表（含 `price_input/price_output` 单价字段，默认 0）+ 全局默认；绑定=agent 级（`agent_model_bindings`）。不做 leader 动态选模型；静态绑定为 Race Mode 预留。
+**① 模型提供商切换（agent 粒度 + 探测/fallback，2026-09-06 增强）**：设置页管理 Provider（预设豆包/ARK、DeepSeek、GLM、Kimi、OpenAI + 自定义）+ 模型列表（含 `price_input/price_output` 单价字段，默认 0）+ 全局默认；绑定=agent 级（`agent_model_bindings`）。不做 leader 动态选模型；静态绑定为 Race Mode 预留。**增强（参考 hify-provider 设计）**：`probeProvider` 探测 base_url 下可用模型（OpenAI 兼容 `/models`）+ 响应速度（墙钟），设置页「测试连接/导入模型」直接消费；`resolveRoleModel` 三级路由（DB 绑定 → `LLM_MODEL_<ROLE>` → `LLM_MODEL`）；`withFallback` 显式降级链（类型化错误分类：aborted 永不降级、auth 同 provider 不重试但换 provider 正当、timeout/rate_limited/network/bad_response 可降级；内存健康度 fail≥3 排后——单实例内存态，多实例外置为 §12 演进位）。默认无 fallback（链为空=现行为），显式 opt-in。
 
 **② 并发控制**：V1 纯串行执行（无并发写）；文件写锁保留为防御层（per-path mutex，防未来引入并行）；files 乐观锁 version。多实例/并行演进路径写入 README。
 
