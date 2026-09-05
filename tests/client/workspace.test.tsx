@@ -200,8 +200,25 @@ describe('Workspace 三栏布局', () => {
     // 分享 / 设置：桌面 36px 视觉，<lg 44px
     expect(screen.getByRole('button', { name: '复制分享链接' }).className).toContain('max-lg:size-11');
     expect(screen.getByRole('link', { name: '打开设置' }).className).toContain('max-lg:size-11');
-    // 视图切换：列表 <lg 48px，触发器随其 h-[calc(100%-1px)] 达 47px
-    expect(screen.getByRole('tablist', { name: '视图切换' }).className).toContain('max-lg:h-12');
+    // 视图切换：列表 48px 且去掉内边距；触发器必须显式 44px——只抬列表高度
+    // 会掉进 p-[3px] + h-[calc(100%-1px)] 的坑（48-6-1=41px，不达标）
+    const tablist = screen.getByRole('tablist', { name: '视图切换' });
+    expect(tablist.className).toContain('max-lg:h-12');
+    expect(tablist.className).toContain('max-lg:p-0');
+    expect(screen.getByRole('tab', { name: '编辑器' }).className).toContain('max-lg:h-11');
+    expect(screen.getByRole('tab', { name: '预览' }).className).toContain('max-lg:h-11');
+  });
+
+  it('底部栏目 tab 激活态：扁平栏不漏出原语阴影（同特异性覆盖）', async () => {
+    mountWorkspace();
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+
+    const className = screen.getByRole('tab', { name: '聊天' }).className;
+    expect(className).toContain(
+      'group-data-[variant=default]/tabs-list:data-[state=active]:shadow-none',
+    );
+    // 裸 data-[state=active]:shadow-none 只有 (0,2,0)，压不住原语 (0,3,0) 的阴影——不允许回退
+    expect(className).not.toMatch(/(?:^| )data-\[state=active\]:shadow-none/);
   });
 });
 

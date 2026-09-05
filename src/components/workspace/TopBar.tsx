@@ -174,11 +174,17 @@ export function TopBar({ project, runningRoles, connected, view, onViewChange }:
       )}
 
       <div className="ml-auto flex min-w-0 items-center gap-1.5 sm:gap-2">
-        {/* 视图切换：编辑器（T21）/ 预览（T22）；<lg 提到 48px 高，触控目标 ≥44px（规则 04） */}
+        {/* 视图切换：编辑器（T21）/ 预览（T22）。
+            <lg 触控目标 ≥44px（规则 04）：列表 48px 且去掉 3px 内边距，触发器显式 44px——
+            只抬列表高度不够（触发器是 h-[calc(100%-1px)]，48-6-1=41px） */}
         <Tabs value={view} onValueChange={handleViewChange}>
-          <TabsList aria-label="视图切换" className="shrink-0 max-lg:h-12">
-            <TabsTrigger value="editor">编辑器</TabsTrigger>
-            <TabsTrigger value="preview">预览</TabsTrigger>
+          <TabsList aria-label="视图切换" className="shrink-0 max-lg:h-12 max-lg:p-0">
+            <TabsTrigger value="editor" className="max-lg:h-11">
+              编辑器
+            </TabsTrigger>
+            <TabsTrigger value="preview" className="max-lg:h-11">
+              预览
+            </TabsTrigger>
           </TabsList>
         </Tabs>
 

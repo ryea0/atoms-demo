@@ -118,7 +118,10 @@ export function Workspace({ projectId }: { projectId: number }) {
               <TabsTrigger
                 key={item.value}
                 value={item.value}
-                className="h-full flex-1 rounded-none border-b-2 border-transparent px-2 text-xs text-muted-foreground data-[state=active]:border-brand data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none"
+                // shadow 覆盖必须与原语的 compound 规则同特异性
+                // （group-data-[variant=default]/tabs-list:data-[state=active]:shadow-sm 为 (0,3,0)，
+                //   裸 data-[state=active]:shadow-none 只有 (0,2,0)，压不住会漏出淡阴影）
+                className="h-full flex-1 rounded-none border-b-2 border-transparent px-2 text-xs text-muted-foreground data-[state=active]:border-brand data-[state=active]:bg-transparent data-[state=active]:text-foreground group-data-[variant=default]/tabs-list:data-[state=active]:shadow-none"
               >
                 {item.label}
               </TabsTrigger>
