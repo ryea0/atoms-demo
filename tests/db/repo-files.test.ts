@@ -3,9 +3,9 @@
  * brief 原文用例在前（CAS 冲突 + 软锁过期），补充回归在后（版本递进入档/恢复往返/跨项目隔离）。
  * 直连 db 只出现在"把软锁过期时间拨到过去"这类夹具操作上——测试可摸 db，生产代码一律走仓库层（.claude/rules/05）。
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { newTestStorage } from '@/lib/db/test-util';
 import { openSqlite } from '@/lib/db/provider/sqlite/storage';
 import { ensureSchema } from '@/lib/db/provider/sqlite/ddl';
@@ -166,5 +166,51 @@ describe('repo files：版本历史与作用域补充回归', () => {
     expect(all[0]).toMatchObject({ path:'app/a.js', content:'A-human', version:2, lastEditor:'human', producedBy:'engineer' });
     // 人工保存与 agent 写同一入口、同样落 file_versions（DESIGN §3.9）
     expect((await s.listFileVersions(p.id, fa.fileId)).map((v) => v.editor)).toEqual(['engineer']);
+  });
+});
+
+describe('repo files：冲突/并发不得污染历史（fix round 1）', () => {
+  it('CAS 冲突不写 file_versions：历史长度与内容原样保留', async () => {
+    const s = newTestStorage();
+    const p = await newProject(s);
+    const f = await s.upsertFile({ projectId:p.id, path:'app/conflict.js', content:'v1', editor:'engineer' });
+    await s.upsertFile({ projectId:p.id, path:'app/conflict.js', content:'v2', editor:'engineer' });
+
+    const before = await s.listFileVersions(p.id, f.fileId);
+    const stale = await s.saveHuman({ projectId:p.id, fileId:f.fileId, content:'基于 v1 的过期保存', baseVersion:1 });
+    expect(stale).toEqual({ ok:false, conflict:true, current:'v2' });
+
+    // 关键守卫：失败的写不能留下任何"从未存在过的版本"
+    expect(await s.listFileVersions(p.id, f.fileId)).toEqual(before);
+    expect(before.map((v) => [v.version, v.content])).toEqual([[1, 'v1']]);
+    const row = await s.getFile(p.id, 'app/conflict.js');
+    expect(row?.content).toBe('v2');
+    expect(row?.version).toBe(2);
+  });
+
+  it('CAS 未命中（并发抢先）抛错且 file_versions 不留任何归档行', async () => {
+    const r = newRepos();
+    const p = await r.createProject({ sessionId:'s', title:'t', requirement:'r', mode:'fast' });
+    const f = await r.upsertFile({ projectId:p.id, path:'app/race.js', content:'v1', editor:'engineer' });
+
+    // 注入并发：repo 已读到 version=1，事务开跑前另一写者把 version 推进到 2。
+    // 同步事务回调内不能 await，这里用同连接同步写模拟"版本已被抢跑"这一前提。
+    const rawTx = r.db.transaction.bind(r.db);
+    const spy = vi.spyOn(r.db, 'transaction').mockImplementation((fn, config) => {
+      r.db.update(files).set({ version: sql`${files.version} + 1` }).where(eq(files.id, f.fileId)).run();
+      return rawTx(fn, config);
+    });
+    try {
+      await expect(
+        r.upsertFile({ projectId:p.id, path:'app/race.js', content:'v2', editor:'engineer' }),
+      ).rejects.toThrow('并发修改冲突');
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(await r.listFileVersions(p.id, f.fileId)).toHaveLength(0);
+    const row = await r.getFile(p.id, 'app/race.js');
+    expect(row?.content).toBe('v1'); // 内容仍是抢跑写者的版本，未被本次覆盖
+    expect(row?.version).toBe(2);
   });
 });

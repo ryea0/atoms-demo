@@ -72,8 +72,12 @@ export function createFilesRepo(db: SqliteDb): FilesRepo {
   }
 
   /**
-   * 覆盖写核心（CAS）：一个短事务内先归档旧版本，再以 version=baseVersion 为条件推进当前版本。
-   * 返回新版本号；null = 版本已被并发修改（影响行数 0），由调用方决定是抛错还是按冲突返回。
+   * 覆盖写核心（CAS）：一个短事务内先以 version=baseVersion 为条件推进当前版本，
+   * **命中后才归档旧版本**。顺序不能反——better-sqlite3 的事务回调正常返回即 COMMIT，
+   * 若先插归档行再发现 CAS 未命中，`return null` 会把这条"从未存在过的版本"提交进
+   * file_versions，每次冲突都污染历史。
+   * 返回新版本号；null = 版本已被并发修改（影响行数 0，事务里没有任何写入），由调用方
+   * 决定是抛错还是按冲突返回。
    * 同步事务（见文件头注释）：回调内不允许 await。
    */
   function overwriteWithArchive(
@@ -84,9 +88,6 @@ export function createFilesRepo(db: SqliteDb): FilesRepo {
     next: { content: string; lastEditor: FileEditor },
   ): number | null {
     return db.transaction((tx) => {
-      tx.insert(fileVersions)
-        .values({ fileId, version: baseVersion, content: previous.content, editor: previous.lastEditor })
-        .run();
       const rows = tx
         .update(files)
         .set({
@@ -101,7 +102,11 @@ export function createFilesRepo(db: SqliteDb): FilesRepo {
         .returning({ version: files.version })
         .all();
       const row = rows[0];
-      return row ? row.version : null;
+      if (!row) return null;
+      tx.insert(fileVersions)
+        .values({ fileId, version: baseVersion, content: previous.content, editor: previous.lastEditor })
+        .run();
+      return row.version;
     });
   }
 
@@ -209,6 +214,8 @@ export function createFilesRepo(db: SqliteDb): FilesRepo {
         .select()
         .from(fileVersions)
         .where(and(eq(fileVersions.fileId, fileId), eq(fileVersions.version, version)))
+        // 防御性排序：即使历史上出现过重复 version 行（异常数据），恢复目标也确定可复现
+        .orderBy(desc(fileVersions.version), desc(fileVersions.id))
         .limit(1);
       const history = historyRows[0];
       if (!history) {
