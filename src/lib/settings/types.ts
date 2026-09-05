@@ -72,6 +72,41 @@ export interface SettingsSnapshot {
   usage: UsageCardRow[];
 }
 
+/**
+ * 个人偏好（DESIGN §3.9/§4.2，session 级）。字段名即持久化/HTTP 契约
+ * （`preferences.editing_enabled`，与设计文档逐字一致，故用 snake_case）。
+ */
+export interface UserPreferences {
+  /** 人工编辑能力开关（默认开）：关 = 纯只读查看器，agent 永不遇软锁 */
+  editing_enabled: boolean;
+  /** 默认生成模式（默认 fast）：新建项目表单/快速链路的缺省值 */
+  default_mode: 'fast' | 'full';
+}
+
+/** 偏好局部补丁（HTTP PUT 入参；缺省键 = 不改既有值） */
+export interface UserPreferencesPatch {
+  editing_enabled?: boolean;
+  default_mode?: 'fast' | 'full';
+}
+
+/** 默认偏好：编辑能力默认开（DESIGN §3.9「开=完整人机共编」） */
+export const DEFAULT_USER_PREFERENCES: UserPreferences = { editing_enabled: true, default_mode: 'fast' };
+
+/**
+ * unknown → 偏好（存储层 json 反序列化结果是 unknown，字段级收窄；缺失/类型不符回默认值）。
+ * 纯函数：客户端拿不到偏好或拿到脏数据时也走这里兜底，前后端口径一致。
+ */
+export function normalizePreferences(data: unknown): UserPreferences {
+  if (typeof data !== 'object' || data === null) return { ...DEFAULT_USER_PREFERENCES };
+  const raw = data as Record<string, unknown>;
+  return {
+    editing_enabled: typeof raw['editing_enabled'] === 'boolean' ? raw['editing_enabled'] : DEFAULT_USER_PREFERENCES.editing_enabled,
+    default_mode: raw['default_mode'] === 'full' || raw['default_mode'] === 'fast'
+      ? raw['default_mode']
+      : DEFAULT_USER_PREFERENCES.default_mode,
+  };
+}
+
 /** api key 脱敏：保留尾 4 位（过短的 key 全遮，避免泄露比例过高） */
 export function maskApiKey(apiKey: string): string {
   const trimmed = apiKey.trim();

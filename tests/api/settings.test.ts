@@ -15,18 +15,20 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createElement } from 'react';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createStorage } from '@/lib/db';
 import type { StorageProvider } from '@/lib/db/provider/types';
 import { resolveRoleModel } from '@/lib/llm/resolve';
 import { loadSettingsSnapshot } from '@/lib/settings/service';
-import type { BindingView, ModelView, ProviderView } from '@/lib/settings/types';
+import type { BindingView, ModelView, ProviderView, UserPreferences } from '@/lib/settings/types';
 import * as providersRoute from '@/app/api/settings/providers/route';
 import * as providerRoute from '@/app/api/settings/providers/[id]/route';
 import * as probeRoute from '@/app/api/settings/providers/[id]/probe/route';
 import * as importRoute from '@/app/api/settings/providers/[id]/models/import/route';
 import * as modelRoute from '@/app/api/settings/models/[id]/route';
 import * as bindingsRoute from '@/app/api/settings/bindings/route';
+import * as settingsRoute from '@/app/api/settings/route';
+import { EditSwitch } from '@/components/common/EditSwitch';
 import { ProvidersPanel } from '@/components/settings/ProvidersPanel';
 import { ModelBindPanel } from '@/components/settings/ModelBindPanel';
 
@@ -588,5 +590,89 @@ describe('UI render smoke', () => {
     expect(screen.getByText('工程师')).toBeInTheDocument();
     const engineerSelect = screen.getByRole('combobox', { name: '工程师使用模型' }) as HTMLSelectElement;
     expect(engineerSelect.value).toBe('1:11'); // 已绑定 → 选中 providerId:modelId
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 个人偏好（session 级）+ EditSwitch（Task 23 人机共编开关）                */
+/* ------------------------------------------------------------------ */
+describe('GET/PUT /api/settings 偏好', () => {
+  /** 固定 cookie 的请求（会话作用域往返断言用） */
+  function cookieRequest(method: string, path: string, body?: unknown, cookie?: string): Request {
+    return new Request(`http://test.local${path}`, {
+      method,
+      headers: {
+        ...(cookie === undefined ? {} : { cookie }),
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  }
+
+  it('GET 默认偏好（编辑开 / 快速模式），新访客随响应下发 session cookie', async () => {
+    const res = await settingsRoute.GET(cookieRequest('GET', '/api/settings'));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(res.headers.get('set-cookie') ?? '').toContain('atoms_session=');
+    expect((await bodyOf(res))['preferences']).toEqual({ editing_enabled: true, default_mode: 'fast' });
+  });
+
+  it('PUT 局部补丁合并既有值；同会话往返一致，他会话互不影响', async () => {
+    const first = await settingsRoute.PUT(cookieRequest('PUT', '/api/settings', { editing_enabled: false }));
+    expect(first.status).toBe(200);
+    const cookie = (first.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+    expect(cookie).toContain('atoms_session=');
+
+    const second = await settingsRoute.PUT(cookieRequest('PUT', '/api/settings', { default_mode: 'full' }, cookie));
+    expect(second.status).toBe(200);
+    expect((await bodyOf(second))['preferences']).toEqual({ editing_enabled: false, default_mode: 'full' });
+
+    const reread = await settingsRoute.GET(cookieRequest('GET', '/api/settings', undefined, cookie));
+    expect((await bodyOf(reread))['preferences']).toEqual({ editing_enabled: false, default_mode: 'full' });
+
+    // 另一个会话（无 cookie）仍是默认值：session 级作用域
+    const other = await settingsRoute.GET(cookieRequest('GET', '/api/settings'));
+    expect((await bodyOf(other))['preferences']).toEqual({ editing_enabled: true, default_mode: 'fast' });
+  });
+
+  it('PUT 非法入参 → 400 invalid_input（结构化错误）', async () => {
+    const badType = await settingsRoute.PUT(cookieRequest('PUT', '/api/settings', { editing_enabled: 'yes' }));
+    expect(badType.status).toBe(400);
+    expect(errorOf(await bodyOf(badType)).code).toBe('invalid_input');
+
+    const badMode = await settingsRoute.PUT(cookieRequest('PUT', '/api/settings', { default_mode: 'turbo' }));
+    expect(badMode.status).toBe(400);
+  });
+});
+
+describe('EditSwitch 组件', () => {
+  it('挂载读取偏好 → 渲染开关状态；切换即 PUT editing_enabled 并更新 UI', async () => {
+    let stored: UserPreferences = { editing_enabled: true, default_mode: 'fast' };
+    const calls: { method: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const method = init?.method ?? 'GET';
+        const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as unknown) : null;
+        calls.push({ method, body });
+        if (method === 'PUT' && typeof body === 'object' && body !== null) {
+          stored = { ...stored, ...(body as Partial<UserPreferences>) };
+        }
+        return new Response(JSON.stringify({ preferences: stored }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }),
+    );
+
+    render(createElement(EditSwitch));
+    const toggle = screen.getByRole('switch', { name: '人工编辑能力开关' });
+    await waitFor(() => expect(toggle).toBeEnabled()); // 挂载读取完成后才可交互
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(calls.some((call) => call.method === 'PUT')).toBe(true));
+    expect(calls.find((call) => call.method === 'PUT')?.body).toEqual({ editing_enabled: false });
+    expect(toggle).not.toBeChecked();
   });
 });

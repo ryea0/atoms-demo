@@ -15,9 +15,10 @@ import type {
   LlmProviderRow,
   PatchLlmModelInput,
   PatchLlmProviderInput,
+  PreferenceScope,
   StorageProvider,
 } from '@/lib/db/provider/types';
-import { agentRoles, maskApiKey } from './types';
+import { agentRoles, maskApiKey, normalizePreferences, type UserPreferences, type UserPreferencesPatch } from './types';
 import type {
   BindingView,
   ImportResultView,
@@ -219,6 +220,27 @@ export async function putBinding(input: {
   const binding = bindings.find((row) => row.role === input.role);
   if (binding === undefined) throw new Error('绑定视图缺失角色：' + input.role);
   return { ok: true, binding };
+}
+
+/* ---------------- 个人偏好（session 级，DESIGN §3.9/§4.2） ---------------- */
+
+/** 偏好作用域：demo 只用 session 级（DESIGN §4.2），user 级为 schema 预留 */
+const PREFERENCE_SCOPE: PreferenceScope = 'session';
+
+/** 读取偏好：无记录/脏数据一律回默认值（normalize 集中收窄，前后端口径一致） */
+export async function getPreferences(sessionId: string): Promise<UserPreferences> {
+  return normalizePreferences(await storage().getPreference(PREFERENCE_SCOPE, sessionId));
+}
+
+/** 保存偏好：patch 缺省键保持既有值（显式判 undefined，避免 undefined 覆盖成脏数据） */
+export async function savePreferences(sessionId: string, patch: UserPreferencesPatch): Promise<UserPreferences> {
+  const current = await getPreferences(sessionId);
+  const next: UserPreferences = {
+    editing_enabled: patch.editing_enabled ?? current.editing_enabled,
+    default_mode: patch.default_mode ?? current.default_mode,
+  };
+  await storage().setPreference(PREFERENCE_SCOPE, sessionId, { ...next });
+  return next;
 }
 
 /* ---------------- 页面快照 ---------------- */

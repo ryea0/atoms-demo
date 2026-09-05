@@ -19,12 +19,15 @@ import {
   fileDoneLine,
   fileFailedLine,
   filePausedLine,
+  fileResumedLine,
+  fileSkippedLine,
   taskDoneLine,
   taskFailedLine,
   taskSkippedLine,
   taskStartLine,
 } from '@/lib/agents/progress';
 import { isAbortError } from '@/lib/agents/roles/run-support';
+import { normalizePreferences } from '@/lib/settings/types';
 import { routeLeader, type TaskAssignment } from '@/lib/agents/roles/leader';
 import { PRD_PATH, runPm } from '@/lib/agents/roles/pm';
 import { FILE_TREE_PATH, parseFileTree, runArchitect } from '@/lib/agents/roles/architect';
@@ -32,7 +35,7 @@ import { buildFastFileTree, runEngineerFile, runEngineerReview, type FileTree } 
 import { EXPERT_REPORT_PATHS, runExpert, type ExpertRole } from '@/lib/agents/roles/experts';
 import { runCloser } from '@/lib/agents/roles/closer';
 import { AgentAbortError } from '@/lib/agents/types';
-import type { AgentRole, Message, Project, StorageProvider } from '@/lib/db/provider/types';
+import type { AgentRole, Message, MessageMeta, Project, StorageProvider } from '@/lib/db/provider/types';
 
 /** startGeneration 入参（brief 契约） */
 export interface StartGenerationInput {
@@ -282,10 +285,187 @@ function appendInterventions(base: string, interventions: readonly Message[]): s
   return `${base}${interventionBlock(interventions)}`;
 }
 
+/**
+ * 步骤边界取走待注入干预（DESIGN §3.5 两级边界共用的确定性通道）：
+ * 先事件留痕再打戳（带项目作用域，CLAUDE.md 规则 9）；空列表不打戳不发作。
+ * 任务边界（必检级）与工程师文件边界（每文件完成间）都走这里。
+ */
+async function takeInterventions(
+  storage: StorageProvider,
+  projectId: number,
+  targetTaskKey: string,
+  emit: (e: Omit<StreamEvent, 'seq' | 'projectId'>) => StreamEvent,
+): Promise<Message[]> {
+  const items = await storage.takePendingInterventions(projectId);
+  if (items.length === 0) return [];
+  for (const item of items) {
+    emit({
+      runId: null,
+      event: 'intervention_injected',
+      content: item.content,
+      meta: { messageId: item.id, targetTask: targetTaskKey },
+    });
+  }
+  await storage.markDelivered(items.map((item) => item.id), projectId);
+  return items;
+}
+
+/* ------------------------------------------------------------------ */
+/* 软锁裁决（DESIGN §3.9 预防层：文件任务挂起 + 聊天区请求裁决）            */
+/* ------------------------------------------------------------------ */
+
+/** 用户对软锁裁决的三选一：覆盖生成 / 跳过保留修改 / 稍后再说 */
+type SoftLockRuling = 'override' | 'skip' | 'later';
+
+/** 裁决等待轮询间隔默认值（ms）——裁决靠用户回复驱动，轮询只负责察觉 */
+const DEFAULT_SOFT_LOCK_POLL_MS = 250;
+
+/** 轮询间隔（env 可调；测试置小值加速，默认值即生产语义） */
+function softLockPollMs(): number {
+  const raw = process.env['SOFT_LOCK_POLL_MS'];
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SOFT_LOCK_POLL_MS;
+}
+
+/** 可中止睡眠：停止信号一到立即返回（循环内再查 aborted 走停止语义） */
+function abortableSleep(signal: AbortSignal, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** 干预回复 → 裁决选项；匹配不到返回 null（普通运行中指令不由裁决消费，留给下一个文件边界注入） */
+function rulingOf(content: string): SoftLockRuling | null {
+  if (content.includes('覆盖')) return 'override';
+  if (content.includes('跳过') || content.includes('保留')) return 'skip';
+  if (content.includes('稍后') || content.includes('继续')) return 'later';
+  return null;
+}
+
+/**
+ * 编辑能力开关（session 级偏好，DESIGN §3.9）：关 = 纯只读查看器，agent 永不遇软锁。
+ * 缺失/脏数据回默认值「开」（normalize 集中收窄，与设置页同一口径）。
+ */
+async function editingEnabledFor(c: TaskContext): Promise<boolean> {
+  return normalizePreferences(await c.storage.getPreference('session', c.project.sessionId)).editing_enabled;
+}
+
+/**
+ * 挂起等待裁决：轮询干预队列（用户回复=三选一）与软锁状态。
+ * - 用户回复三选一 → 消费该条干预（打戳带项目作用域）并返回裁决
+ * - 软锁消失（人退出编辑 / TTL 到期）→ 按「稍后」处理：不代用户做「覆盖」决定，
+ *   人工未保存的本地改动仍以库中最新版为准，本轮先跳过
+ * - 停止信号 → 抛 AgentAbortError（顶层统一收口 stopped/paused）
+ */
+async function awaitSoftLockRuling(c: TaskContext, path: string): Promise<SoftLockRuling> {
+  while (!c.signal.aborted) {
+    const pending = await c.storage.takePendingInterventions(c.projectId);
+    const hit = pending.find((item) => rulingOf(item.content) !== null);
+    if (hit !== undefined) {
+      const ruling = rulingOf(hit.content);
+      if (ruling === null) break; // 不可达（find 谓词已收窄）
+      await c.storage.markDelivered([hit.id], c.projectId);
+      return ruling;
+    }
+    const stillLocked = (await c.storage.getSoftLockedFiles(c.projectId)).some((row) => row.path === path);
+    if (!stillLocked) return 'later';
+    await abortableSleep(c.signal, softLockPollMs());
+  }
+  throw new AgentAbortError(`生成在等待 ${path} 的软锁裁决期间被停止`);
+}
+
+/**
+ * 软锁裁决入口：发裁决消息（落库 assistant 行 → SSE 回带 messageId，刷新后卡片仍在）
+ * → 挂起等待裁决。返回该文件本轮是否照常生成（仅「覆盖」为 true）。
+ */
+async function negotiateSoftLock(c: TaskContext, path: string): Promise<boolean> {
+  const { storage, projectId } = c;
+  const question = await storage.addMessage({
+    projectId,
+    role: 'assistant',
+    content: `检测到你正在编辑 ${path}：保留你的修改并跳过 / 覆盖生成 / 完成编辑后继续`,
+    meta: { kind: 'softlock', path },
+  });
+  c.emit({
+    runId: null,
+    event: 'message',
+    agent: 'leader',
+    path,
+    content: question.content,
+    meta: { role: 'assistant', kind: 'softlock', path, messageId: question.id },
+  });
+  await appendProgressLine(storage, projectId, filePausedLine(path));
+
+  const ruling = await awaitSoftLockRuling(c, path);
+  if (ruling === 'later') return false; // 不动：文件任务保持挂起状态收场
+  if (ruling === 'skip') {
+    // 「跳过」也留时间线痕迹：该单文件任务落一条 rolled_back run（DESIGN §3.10 口径）
+    const run = await storage.createAgentRun({
+      projectId,
+      taskKey: `engineer:${path}`,
+      agent: 'engineer',
+      task: `实现 ${path}（人工软锁，等待裁决）`,
+    });
+    await storage.updateAgentRun(
+      run.id,
+      {
+        status: 'rolled_back',
+        startedAt: Date.now(),
+        endedAt: Date.now(),
+        summary: `人工裁决跳过：保留人工修改，本轮未生成 ${path}`,
+      },
+      projectId,
+    );
+    await appendProgressLine(storage, projectId, fileSkippedLine(path));
+    return false;
+  }
+
+  // 「覆盖」：释放软锁后重跑该单文件任务（D1：单文件重试=重跑该单文件任务）。
+  // 释放是裁决的一部分——用户已选择放弃未保存修改，锁留着只会让下一文件边界再问一遍。
+  const row = await storage.getFile(projectId, path);
+  if (row !== null) await storage.setSoftLock(projectId, row.id, false);
+  await appendProgressLine(storage, projectId, fileResumedLine(path));
+  return true;
+}
+
 /** PM 的需求文本：项目需求为底，本轮消息不同则补充（PM 不走 assembleContext，需求需显式传） */
 function pmRequirementText(project: Project, userMessage: string): string {
   const base = project.requirement.trim() === '' ? userMessage.trim() : project.requirement.trim();
   return base === userMessage.trim() ? base : `${base}\n（本轮补充：${userMessage.trim()}）`;
+}
+
+/**
+ * 领导聊天消息统一出口：先落库拿行 id，再发 message 事件回带 meta.messageId
+ * （T17 前端按正数 messageId 去重——快照与 Last-Event-ID 重放叠加时不会出现重复气泡）。
+ * extraMeta 携带卡片语义（softlock 裁决 / restore 通知），一并落库让刷新后的聊天区可还原。
+ */
+async function emitLeaderMessage(
+  storage: StorageProvider,
+  projectId: number,
+  emit: (e: Omit<StreamEvent, 'seq' | 'projectId'>) => StreamEvent,
+  content: string,
+  extraMeta?: MessageMeta,
+): Promise<void> {
+  const row = await storage.addMessage({ projectId, role: 'assistant', content, meta: extraMeta });
+  emit({
+    runId: null,
+    event: 'message',
+    agent: 'leader',
+    content,
+    meta: { role: 'assistant', messageId: row.id, ...extraMeta },
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -334,15 +514,13 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
 
     // 咨询问答：不派任务、不跑收尾，直接回答并收口
     if (decision.kind === 'reply') {
-      await storage.addMessage({ projectId, role: 'assistant', content: decision.reply });
-      emit({ runId: null, event: 'message', agent: 'leader', content: decision.reply, meta: { role: 'assistant' } });
+      await emitLeaderMessage(storage, projectId, emit, decision.reply);
       await storage.updateProjectStatus(projectId, 'done');
       emit({ runId: null, event: 'done' });
       return;
     }
     if (decision.reply !== undefined) {
-      await storage.addMessage({ projectId, role: 'assistant', content: decision.reply });
-      emit({ runId: null, event: 'message', agent: 'leader', content: decision.reply, meta: { role: 'assistant' } });
+      await emitLeaderMessage(storage, projectId, emit, decision.reply);
     }
 
     const topo = topoSortTasks(decision.tasks);
@@ -377,13 +555,8 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
       // 检查点：任务前基线（DESIGN §3.10；短事务在 repo 层保证）
       await checkpointBefore(storage, projectId, `任务前:${taskKey}`);
 
-      // 干预队列：步骤边界取待注入消息（DESIGN §3.5）→ 事件 → 打戳 → 拼进任务文本
-      const interventions = await storage.takePendingInterventions(projectId);
-      for (const item of interventions) {
-        emit({ runId: null, event: 'intervention_injected', content: item.content, meta: { messageId: item.id, targetTask: taskKey } });
-      }
-      if (interventions.length > 0) await storage.markDelivered(interventions.map((item) => item.id), projectId);
-      c.interventions = interventions;
+      // 干预队列：任务边界取待注入消息（DESIGN §3.5 必检级）→ 事件 → 打戳 → 拼进任务文本
+      c.interventions = await takeInterventions(storage, projectId, taskKey, emit);
 
       await note(taskStartLine(task.agent, taskKey, task.instruction));
       try {
@@ -525,8 +698,12 @@ async function resolveEngineerTree(c: TaskContext, round: RoundState): Promise<F
 /**
  * 工程师（D1 混合模式）：按 file_tree 拓扑序逐文件派发单文件任务，成功后接写后自审
  * （runEngineerReview，一次即止，失败不阻断）。docs/ 是 PM/架构师交付物（file_tree 里的
- * docs 节点是依赖上下文，不是工程师工作项）；人工软锁文件跳过 + 聊天区请求裁决
- * （裁决 UI 是 Task 23）；单文件失败发 error 后继续下一文件。
+ * docs 节点是依赖上下文，不是工程师工作项）；单文件失败发 error 后继续下一文件。
+ *
+ * 每个文件边界（DESIGN §3.5 两级边界的文件级）依次做两件确定性检查：
+ * ① 干预注入——待注入指令只进下一个文件任务的上下文；
+ * ② 人工软锁（DESIGN §3.9 预防层，仓库不拦截写入）——锁中文件挂起并请求裁决，
+ *   「覆盖」= 释放锁并重跑该单文件任务，「跳过」= run 标 rolled_back，「稍后」= 不动。
  */
 async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<TaskDispatchResult> {
   const { storage, projectId, task } = c;
@@ -537,10 +714,10 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
     throw new Error('工程师任务没有可用 file_tree（架构师未产出且非快速模式），无法逐文件派发');
   }
 
-  // 软锁检查在工程师任务边界做（DESIGN §3.9 预防层；仓库不拦截写入）
-  const lockedPaths = new Set((await storage.getSoftLockedFiles(projectId)).map((row) => row.path));
-  // 交接摘要：PM/架构师 run.summary + 干预指令（规则 7：summary 是唯一交接物）
-  const designSummary = appendInterventions(await latestSummaries(storage, projectId, ['pm', 'architect']), c.interventions);
+  // 交接摘要基线：PM/架构师 run.summary + 任务边界干预指令（规则 7：summary 是唯一交接物）
+  const baseSummary = appendInterventions(await latestSummaries(storage, projectId, ['pm', 'architect']), c.interventions);
+  // 编辑能力开关（DESIGN §3.9）：关 = 只读查看器，持锁文件也照常生成（开关乎人工侧，不关 agent 写入）
+  const editingEnabled = await editingEnabledFor(c);
 
   let okCount = 0;
   let lastRunId: number | null = null;
@@ -550,17 +727,16 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
     if (node.path === 'docs' || node.path.startsWith('docs/')) continue;
     if (round.producedThisRound.has(node.path)) continue;
 
-    if (lockedPaths.has(node.path)) {
-      c.emit({
-        runId: null,
-        event: 'message',
-        agent: 'engineer',
-        content: `文件 ${node.path} 正在被人工编辑（软锁生效），本轮已跳过该文件。请在聊天区裁决：保留人工修改并基于它迭代 / 覆盖生成 / 稍后再试。`,
-        meta: { kind: 'softlock', path: node.path },
-      });
-      await appendProgressLine(storage, projectId, filePausedLine(node.path));
-      continue;
-    }
+    // ① 人工软锁：每个文件边界重读（锁可能在轮内被裁决/释放/过期，不能只在任务边界看一次）。
+    //    必须先于干预注入：若该文件任务因裁决「跳过/稍后」而不跑，此边界不能消费干预——
+    //    否则指令会被打戳「已注入」进一个从未运行的任务，从 agent 上下文静默消失（T23 R1）。
+    const isLocked =
+      editingEnabled && (await storage.getSoftLockedFiles(projectId)).some((row) => row.path === node.path);
+    if (isLocked && !(await negotiateSoftLock(c, node.path))) continue;
+
+    // ② 文件边界干预注入（裁决等待期间到达的指令也在这里收口）
+    const fileInterventions = await takeInterventions(storage, projectId, `engineer:${node.path}`, c.emit);
+    const designSummary = appendInterventions(baseSummary, fileInterventions);
 
     c.emit({ runId: null, event: 'file_start', agent: 'engineer', path: node.path });
     const result = await runEngineerFile({

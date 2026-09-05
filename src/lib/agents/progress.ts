@@ -88,3 +88,13 @@ export function fileFailedLine(path: string, errors: string[]): string {
 export function filePausedLine(path: string): string {
   return `- ⏸ ${path}：人工编辑软锁生效，已挂起并请求裁决`;
 }
+
+/** 工程师单文件恢复（▶️：人工裁决「覆盖生成」，软锁已释放并重跑该单文件任务） */
+export function fileResumedLine(path: string): string {
+  return `- ▶️ ${path}：人工选择覆盖生成，已释放软锁并重跑`;
+}
+
+/** 工程师单文件跳过（⏭：人工裁决「保留修改」，本轮不生成，run 标 rolled_back） */
+export function fileSkippedLine(path: string): string {
+  return `- ⏭ ${path}：人工选择保留修改并跳过，本轮不生成`;
+}
