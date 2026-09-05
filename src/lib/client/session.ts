@@ -100,6 +100,16 @@ export function openProjectExport(projectId: number): void {
   window.open(`/api/projects/${projectId}/export`, '_blank');
 }
 
+/** 全栈预览装配 HTML 的同源地址（iframe src 与新窗口共用，装配/CSP 都在服务端） */
+export function projectPreviewPath(projectId: number): string {
+  return `/api/projects/${projectId}/preview`;
+}
+
+/** 新窗口全屏打开预览：noopener/noreferrer 断开 opener（生成页不可反向操控平台页） */
+export function openProjectPreview(projectId: number): void {
+  window.open(projectPreviewPath(projectId), '_blank', 'noopener,noreferrer');
+}
+
 /* ------------------------------------------------------------------ */
 /* 会话级本地偏好（公告条）                                              */
 /* ------------------------------------------------------------------ */
