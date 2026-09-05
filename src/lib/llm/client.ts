@@ -63,8 +63,8 @@ export function getLlmProvider(env: NodeJS.ProcessEnv = process.env): LlmProvide
 /* OpenAI 兼容实现                                                      */
 /* ------------------------------------------------------------------ */
 
-/** 响应脱敏：剔除 bearer 头与配置的 api key（防错误信息泄密） */
-function sanitize(text: string, apiKey: string): string {
+/** 响应脱敏：剔除 bearer 头与配置的 api key（防错误信息泄密）；probe.ts 复用同一规则 */
+export function sanitize(text: string, apiKey: string): string {
   const withoutKey = apiKey === '' ? text : text.split(apiKey).join('***');
   return withoutKey.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer ***');
 }
