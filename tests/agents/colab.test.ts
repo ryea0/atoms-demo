@@ -247,6 +247,57 @@ describe('软锁裁决', () => {
     expect((await storage.getFile(projectId, LOCKED_PATH))?.lastEditor).toBe('engineer');
     expect(events.at(-1)?.event).toBe('done');
   }, 30000);
+
+  it('⑥ 锁定文件裁决为「稍后」时，已排队的干预不被吞：下一文件边界照常注入（T23 R1 回归）', async () => {
+    const { storage, projectId } = await newProjectWithLock();
+    storageRef = storage;
+    const { events, stop } = collectEvents(projectId);
+
+    // 工程师任务开跑（任务边界已收口完毕）才排队干预 → 只会到达文件边界
+    const offIntake = projectEventBus.subscribe(projectId, (event) => {
+      if (event.event === 'agent_start' && event.agent === 'engineer') {
+        void storageRef.addMessage({ projectId, role: 'intervention', content: '下一个文件必须包含空态提示' });
+      }
+    });
+
+    // 裁决消息发出的瞬间读库：该时刻干预必须仍是待注入（delivered_at IS NULL）——
+    // 若边界顺序反了（先取干预后查软锁），此刻它已被打戳「注入」进从未运行的锁定文件任务
+    let resolvePending: (value: boolean) => void = () => undefined;
+    const pendingCheck = new Promise<boolean>((resolve) => {
+      resolvePending = resolve;
+    });
+    const offProbe = projectEventBus.subscribe(projectId, (event) => {
+      if (event.event === 'message' && event.meta?.kind === 'softlock') {
+        void storageRef.listMessages(projectId).then((rows) => {
+          const row = rows.find((m) => m.role === 'intervention' && m.content.includes('空态提示'));
+          resolvePending(row?.deliveredAt === null);
+        });
+      }
+    });
+
+    const offRuling = replyOnRuling(projectId, '稍后');
+    await runRound(storage, projectId);
+    offRuling();
+    offIntake();
+    offProbe();
+    stop();
+
+    expect(await pendingCheck).toBe(true); // 未在锁定文件边界被吞
+    expect(events.some((e) => e.event === 'intervention_injected' && e.meta?.targetTask === `engineer:${LOCKED_PATH}`)).toBe(false);
+
+    // 下一文件边界正常注入：事件指向 index.html、指令进入其任务上下文
+    const injected = mustFind(events, (e) => e.event === 'intervention_injected' && (e.content ?? '').includes('空态提示'));
+    expect(injected.meta?.targetTask).toBe('engineer:app/frontend/index.html');
+    const htmlCall = engineerSummaries.find((item) => item.path === 'app/frontend/index.html');
+    expect(htmlCall?.designSummary ?? '').toContain('空态提示');
+
+    // 锁定文件本身仍按「稍后」处置：人工内容保留
+    expect((await storage.getFile(projectId, LOCKED_PATH))?.content).toBe(HUMAN_CONTENT);
+    // 干预最终在 index.html 边界被消费（打戳），没有滞留队列也没有消失
+    const messages = await storage.listMessages(projectId);
+    expect(messages.find((m) => m.role === 'intervention' && m.content.includes('空态提示'))?.deliveredAt).not.toBeNull();
+    expect(events.at(-1)?.event).toBe('done');
+  }, 30000);
 });
 
 /* ------------------------------------------------------------------ */

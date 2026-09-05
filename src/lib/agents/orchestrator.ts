@@ -727,14 +727,16 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
     if (node.path === 'docs' || node.path.startsWith('docs/')) continue;
     if (round.producedThisRound.has(node.path)) continue;
 
-    // ① 文件边界干预注入（锁裁决等待期间到达的指令也在这里收口）
-    const fileInterventions = await takeInterventions(storage, projectId, `engineer:${node.path}`, c.emit);
-    const designSummary = appendInterventions(baseSummary, fileInterventions);
-
-    // ② 人工软锁：每个文件边界重读（锁可能在轮内被裁决/释放/过期，不能只在任务边界看一次）
+    // ① 人工软锁：每个文件边界重读（锁可能在轮内被裁决/释放/过期，不能只在任务边界看一次）。
+    //    必须先于干预注入：若该文件任务因裁决「跳过/稍后」而不跑，此边界不能消费干预——
+    //    否则指令会被打戳「已注入」进一个从未运行的任务，从 agent 上下文静默消失（T23 R1）。
     const isLocked =
       editingEnabled && (await storage.getSoftLockedFiles(projectId)).some((row) => row.path === node.path);
     if (isLocked && !(await negotiateSoftLock(c, node.path))) continue;
+
+    // ② 文件边界干预注入（裁决等待期间到达的指令也在这里收口）
+    const fileInterventions = await takeInterventions(storage, projectId, `engineer:${node.path}`, c.emit);
+    const designSummary = appendInterventions(baseSummary, fileInterventions);
 
     c.emit({ runId: null, event: 'file_start', agent: 'engineer', path: node.path });
     const result = await runEngineerFile({
