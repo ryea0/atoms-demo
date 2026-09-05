@@ -185,10 +185,14 @@ export function detectScene(req: LlmRequest): MockScene {
   return bestScore > 0 ? best : 'engineer';
 }
 
-/** 从消息中提取需求一句话（首条用户消息首行，截断到 60 字符） */
+/** 从消息中提取需求一句话（首条用户消息首行，截断到 60 字符；
+ *  assembleContext 组装的首行是【需求】小节标题，此时取小节正文首行） */
 function requirementOf(messages: LlmMessage[]): string {
   const firstUser = messages.find((m) => m.role === 'user');
-  const raw = (firstUser?.content ?? '').split('\n')[0] ?? '';
+  const lines = (firstUser?.content ?? '').split('\n');
+  const headerIndex = lines.findIndex((line) => line.trim() === '【需求】');
+  const body = headerIndex >= 0 ? lines[headerIndex + 1] : lines[0];
+  const raw = body ?? '';
   return raw.replace(/^(需求|任务|请)[:：]?\s*/, '').trim().slice(0, 60);
 }
 
@@ -228,6 +232,27 @@ function renderEngineerFile(path: string, messages: LlmMessage[]): string {
     return [`# ${path}`, '', `- 需求：${requirement || '（未提供）'}`, '- 说明：mock 样例占位文档。', ''].join('\n');
   }
   return [`/* ${path} —— mock 兜底占位（需求：${requirement || '未提供'}） */`, ''].join('\n');
+}
+
+/**
+ * 工程师场景响应（Task 13 契约：模型必须用 write_file 写目标文件）：
+ * - 请求带 write_file 工具且历史尚无工具结果（首轮）→ 渲染文件全文，并同时以
+ *   write_file 工具调用发出（content 携带全文，流式 delta 即打字机效果）
+ * - 历史已有工具结果（write_file 已执行）→ 一句收尾结论，循环 2 步收敛
+ * - 请求未带工具（裸 complete 调用/测试桩）→ 兼容旧行为：content 即文件全文
+ */
+function renderEngineer(req: LlmRequest): { content: string; toolCalls: ToolCall[] } {
+  const target = targetPathOf(req.messages);
+  const content = renderEngineerFile(target, req.messages);
+  const hasWriteTool = req.tools?.some((tool) => tool.name === 'write_file') === true;
+  if (!hasWriteTool) return { content, toolCalls: [] };
+  if (req.messages.some((message) => message.role === 'tool')) {
+    return { content: `已完成：${target} 已通过 write_file 写入，任务结束。`, toolCalls: [] };
+  }
+  return {
+    content,
+    toolCalls: [{ id: 'call_mock_write_file', name: 'write_file', args: { path: target, content } }],
+  };
 }
 
 /** 专家角色固定报告模板 */
@@ -303,7 +328,7 @@ function render(req: LlmRequest): { content: string; toolCalls: ToolCall[] } {
     case 'architect':
       return { content: readSample('design.md'), toolCalls: [] };
     case 'engineer':
-      return { content: renderEngineerFile(targetPathOf(req.messages), req.messages), toolCalls: [] };
+      return renderEngineer(req);
     case 'analyst':
     case 'seo':
     case 'ads':
