@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { getTableName } from 'drizzle-orm';
 import { getTableConfig, type AnySQLiteColumn, type ForeignKey } from 'drizzle-orm/sqlite-core';
 import { rmSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -25,6 +26,20 @@ const ALL_TABLES = [
   'preferences',
   'checkpoints',
   'checkpoint_files',
+] as const;
+
+/**
+ * FTS5 检索扩展点（Task 28，DESIGN §12）：虚表 + 其 5 张 shadow 表。
+ * drizzle-kit 不管虚表（schema.ts 无对应声明），只由 ddl.ts 自举——这里显式钉住
+ * 对象清单，避免「以为 push 会建/删它」或 shadow 表漏建导致检索静默失效。
+ */
+const FTS_TABLES = [
+  'files_fts',
+  'files_fts_config',
+  'files_fts_content',
+  'files_fts_data',
+  'files_fts_docsize',
+  'files_fts_idx',
 ] as const;
 
 /** 表级元组：name + type + notnull + dflt_value + pk */
@@ -112,7 +127,7 @@ describe('schema', () => {
     expect((await s.listProjects('sx')).length).toBe(1);
   });
 
-  it('ensureSchema 幂等建出 DESIGN §7 全部 12 张表', () => {
+  it('ensureSchema 幂等建出 DESIGN §7 全部 12 张表 + FTS5 虚表（T28）', () => {
     const db = openSqlite(':memory:');
     try {
       ensureSchema(db);
@@ -120,13 +135,66 @@ describe('schema', () => {
       const rows = nameRows.parse(
         db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all(),
       );
-      expect(rows.map((r) => r.name).sort()).toEqual([...ALL_TABLES].sort());
+      expect(rows.map((r) => r.name).sort()).toEqual([...ALL_TABLES, ...FTS_TABLES].sort());
       // 命名唯一约束必须落成独立 UNIQUE INDEX（与 drizzle-kit 形态一致，否则 db:push 撞名）
       const idx = nameRows
         .parse(db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").all())
         .map((r) => r.name)
         .sort();
       expect(idx).toEqual(['agent_model_bindings_role', 'files_project_path', 'preferences_scope_target']);
+    } finally {
+      db.close();
+    }
+  });
+
+  /**
+   * T2 对齐守卫扩展（T28）：FTS5 虚表形态与触发器清单钉死。
+   * 虚表不进 drizzle schema（drizzle-kit 不管虚表），漂移只能在这里拦：
+   * - files_fts 必须 trigram 分词（子串检索语义依赖它）
+   * - 触发器三件套名字固定（ai/ad/au），files 写路径零改动即可保持索引同步
+   */
+  it('FTS5 虚表 trigram 分词 + files 触发器三件套（防漂移）', () => {
+    const db = openSqlite(':memory:');
+    try {
+      ensureSchema(db);
+      ensureSchema(db); // IF NOT EXISTS 二次执行不得重复建/报错
+      const objects = z
+        .array(z.object({ name: z.string(), type: z.string(), sql: z.string().nullable() }))
+        .parse(db.prepare("SELECT name, type, sql FROM sqlite_master WHERE name LIKE 'files_fts%'").all());
+      const virtualTable = objects.find((o) => o.name === 'files_fts');
+      expect(virtualTable?.type).toBe('table');
+      expect(virtualTable?.sql ?? '').toContain('CREATE VIRTUAL TABLE');
+      expect(virtualTable?.sql ?? '').toContain("tokenize='trigram'");
+      const triggers = objects.filter((o) => o.type === 'trigger').map((o) => o.name).sort();
+      expect(triggers).toEqual(['files_fts_ad', 'files_fts_ai', 'files_fts_au']);
+      for (const trigger of objects.filter((o) => o.type === 'trigger')) {
+        expect(trigger.sql ?? '').toContain('files_fts');
+        expect(trigger.sql ?? '').toContain('ON `files`');
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  /** 触发器同步冒烟（行为面）：写 files → 索引立即可搜；删 files → 索引同步删除 */
+  it('FTS5 触发器随 files 写/删同步索引', () => {
+    const db = openSqlite(':memory:');
+    try {
+      ensureSchema(db);
+      db.exec("INSERT INTO `projects` (`id`, `session_id`, `title`, `requirement`, `mode`, `status`, `created_at`, `updated_at`) VALUES (1, 's', 't', 'r', 'fast', 'draft', 0, 0)");
+      const insert = db.prepare(
+        'INSERT INTO `files` (`project_id`, `path`, `content`, `produced_by`, `last_editor`, `version`, `created_at`, `updated_at`) VALUES (1, ?, ?, ?, ?, 1, 0, 0)',
+      );
+      insert.run('src/api.js', 'export const api = 1\n', 'seed', 'seed');
+      const search = db.prepare("SELECT rowid, `path` FROM `files_fts` WHERE `files_fts` MATCH ?");
+      expect(search.all('content: "const api"')).toEqual([{ rowid: 1, path: 'src/api.js' }]);
+      // 覆盖写：旧词消失、新词可搜（新内容不得包含旧查询串，否则 trigram 子串语义仍会命中）
+      db.prepare('UPDATE `files` SET `content` = ? WHERE `id` = 1').run('export const widget = 2\n');
+      expect(search.all('content: "const api"')).toEqual([]);
+      expect(search.all('content: "const widget"')).toEqual([{ rowid: 1, path: 'src/api.js' }]);
+      // 删除：索引同步清空
+      db.prepare('DELETE FROM `files` WHERE `id` = 1').run();
+      expect(search.all('content: "const widget"')).toEqual([]);
     } finally {
       db.close();
     }
@@ -180,6 +248,16 @@ describe('schema', () => {
     } finally {
       db.close();
     }
+  });
+
+  /**
+   * db:push 守卫（T28 实测发现的坑）：drizzle-kit 会把不在 schema 里的 files_fts 及其 shadow 表
+   * 当「未知表」清掉（且因 shadow 表依赖顺序中途报错），留下悬空触发器让 files 写路径直接报
+   * no such table。唯一防线是 drizzle.config.ts 的 tablesFilter 排除——这里用文本断言钉住它。
+   */
+  it('drizzle-kit push 排除 FTS5 虚表（否则 push 清掉索引并留悬空触发器）', async () => {
+    const config = await readFile(join(process.cwd(), 'drizzle.config.ts'), 'utf8');
+    expect(config).toMatch(/tablesFilter:\s*\[[^\]]*'!\s*files_fts\*'/);
   });
 
   /** 文件库连接生命周期：同路径 memoize 复用同一实例，close 幂等，close 后可重开且数据仍在（WAL 落盘） */

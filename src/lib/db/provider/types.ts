@@ -251,11 +251,27 @@ export interface LlmAdminRepo {
   usageAll(): Promise<LlmUsageGlobalRow[]>;
 }
 
+/* ------------------------------------------------------------------ */
+/* 检索扩展点（DESIGN §12「检索」行，Task 28）：方言专属全文索引能力        */
+/* ------------------------------------------------------------------ */
+
+/** FTS5 检索行：score = -bm25（越大越相关），同分按 path 升序；content 供检索层投影出行级命中 */
+export interface FtsRankedFile { fileId:number; path:string; content:string; score:number; }
+
 /**
- * 存储抽象（DESIGN §12）：按仓库分组继承（Task 5 已补齐全部仓库组）。
+ * 全文索引检索仓库（可选能力）：只由具备 FTS 的实现提供（当前是 SQLite 的 files_fts 虚表）。
+ * 查询按字面短语解释（转义由实现负责），limit=null 取全量；必须强制 project_id 过滤（规则 9）。
+ * 检索层（src/lib/retrieval）按能力探测选择实现——没有该方法的实现自动回退 grep。
+ */
+export interface FtsSearchRepo {
+  searchFtsFiles(projectId:number, query:string, limit:number|null):Promise<FtsRankedFile[]>;
+}
+
+/**
+ * 存储抽象（DESIGN §12）：按仓库分组继承（Task 5 已补齐全部仓库组，Task 28 补检索能力组）。
  * 实现侧约定：所有查询强制 project_id 过滤（CLAUDE.md 规则 9）、更新走乐观锁（规则 05）。
  */
-export interface StorageProvider extends ProjectsRepo, MessagesRepo, FilesRepo, RunsRepo, MiscRepo, LlmReadRepo, LlmAdminRepo {
+export interface StorageProvider extends ProjectsRepo, MessagesRepo, FilesRepo, RunsRepo, MiscRepo, LlmReadRepo, LlmAdminRepo, FtsSearchRepo {
   /**
    * 关闭底层连接（幂等；关闭后本实例不可再用，需重新走工厂）。
    * 文件库实例按 dbFile 路径 memoize——业务侧在模块层调用一次 createStorage() 并持有即可，

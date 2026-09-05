@@ -14,6 +14,7 @@ import { createFilesRepo } from './repo-files';
 import { createRunsRepo } from './repo-runs';
 import { createMiscRepo } from './repo-misc';
 import { createLlmAdminRepo, createLlmReadRepo } from './repo-llm';
+import { createFilesFtsRepo } from './repo-files-fts';
 import * as schema from './schema';
 import type { StorageProvider } from '../types';
 
@@ -50,6 +51,8 @@ function assembleStorage(dbFile: string, client: Database.Database, db: SqliteDb
     ...createMiscRepo(db),
     ...createLlmReadRepo(db),
     ...createLlmAdminRepo(db),
+    // FTS5 全文索引（DESIGN §12「检索」）：SQLite 专属能力，FTS5 MATCH 无法用 drizzle 表达，故吃原生连接
+    ...createFilesFtsRepo(client),
     /** 关闭连接（幂等）：文件库实例同时移出缓存，之后需重新走工厂 */
     close(): void {
       fileStorages.delete(dbFile);

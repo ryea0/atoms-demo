@@ -5,6 +5,9 @@
  * 注意两条与 drizzle-kit 对齐的形态（否则 push 到已自举的库会冲突）：
  * 1. 命名唯一约束写成独立 `CREATE UNIQUE INDEX`（drizzle-kit 不用表内 CONSTRAINT 子句）
  * 2. 列默认值/外键写法与 drizzle-kit 生成文本一致（DEFAULT true / no action）
+ * 唯一例外是末尾的 FTS5 虚表 files_fts（DESIGN §12 检索扩展点）：drizzle-kit 表达不了
+ * CREATE VIRTUAL TABLE，故不进 ./schema.ts，只在此自举；drizzle.config.ts 已用 tablesFilter
+ * 把它排除，否则 push 会把它连同 shadow 表一起清掉（T28 实测）。
  * 已有库的加列演进在 migrateColumns 里做幂等兜底（形态与 drizzle-kit 产物同形）；
  * 改列/删列等破坏性演进仍以 drizzle-kit（`npm run db:push`）为准。
  */
@@ -136,11 +139,35 @@ CREATE TABLE IF NOT EXISTS \`checkpoint_files\` (
 CREATE UNIQUE INDEX IF NOT EXISTS \`files_project_path\` ON \`files\` (\`project_id\`,\`path\`);
 CREATE UNIQUE INDEX IF NOT EXISTS \`preferences_scope_target\` ON \`preferences\` (\`scope\`,\`target_id\`);
 CREATE UNIQUE INDEX IF NOT EXISTS \`agent_model_bindings_role\` ON \`agent_model_bindings\` (\`role\`);
+
+/* ---- FTS5 全文检索（DESIGN §12「检索」扩展点，RETRIEVAL_PROVIDER=fts5 时消费）----
+   虚表与其 shadow 表不进 drizzle schema（drizzle-kit 不管虚表），只在此自举：
+   - rowid = files.id，触发器三件套随 files 写路径同步索引（agent/人工/恢复零改动）
+   - files_fts 是存内容的普通 fts5 表：同步用普通 DML 即可（'delete'/'replace' 特殊命令仅外部内容表可用）
+   - 全部 IF NOT EXISTS，重复执行无害 */
+CREATE VIRTUAL TABLE IF NOT EXISTS \`files_fts\` USING fts5(\`path\`, \`content\`, tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS files_fts_ai AFTER INSERT ON \`files\` BEGIN
+  INSERT INTO \`files_fts\`(\`rowid\`, \`path\`, \`content\`) VALUES (new.\`id\`, new.\`path\`, new.\`content\`);
+END;
+CREATE TRIGGER IF NOT EXISTS files_fts_ad AFTER DELETE ON \`files\` BEGIN
+  DELETE FROM \`files_fts\` WHERE rowid = old.\`id\`;
+END;
+CREATE TRIGGER IF NOT EXISTS files_fts_au AFTER UPDATE ON \`files\` BEGIN
+  UPDATE \`files_fts\` SET \`path\` = new.\`path\`, \`content\` = new.\`content\` WHERE rowid = new.\`id\`;
+END;
+`;
+
+/** fts 索引补齐兜底：FTS 上线前已存在的 files 行没有索引条目，连接自举时按 files.id 补齐（幂等，demo 量级 O(N) 可接受） */
+const FTS_BACKFILL_SQL = `
+INSERT INTO \`files_fts\`(\`rowid\`, \`path\`, \`content\`)
+SELECT \`id\`, \`path\`, \`content\` FROM \`files\`
+WHERE \`id\` NOT IN (SELECT \`rowid\` FROM \`files_fts\`);
 `;
 
 /** 在连接上执行自举 DDL（幂等，可重复调用） */
 export function ensureSchema(db: Database.Database): void {
   db.exec(SCHEMA_DDL);
+  db.exec(FTS_BACKFILL_SQL);
   migrateColumns(db);
 }
 
