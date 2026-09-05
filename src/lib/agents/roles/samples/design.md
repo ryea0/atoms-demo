@@ -32,7 +32,7 @@ flowchart LR
 | 方法 | 路径 | 入参 | 返回 |
 | --- | --- | --- | --- |
 | GET | /api/todos | - | `{code:200, data:[{id,title,done}]}` |
-| POST | /api/todos | `{title}` | `{code:200, data:{id,title,done}}` |
+| POST | /api/todos | `{title}` | `{code:201, data:{id,title,done}}` |
 | PUT/PATCH | /api/todos/:id | `{done?,title?}` | `{code:200, data:更新后条目}` |
 | DELETE | /api/todos/:id | - | `{code:200, data:{ok:true}}` |
 
@@ -91,7 +91,7 @@ sequenceDiagram
   V->>P: 输入标题并回车
   P->>P: 去空白 + 非空校验（AC1）
   P->>A: POST /api/todos {title}
-  A-->>P: {code:200, data:todo}
+  A-->>P: {code:201, data:todo}
   P->>V: 顶部插入条目 + 清空输入框 + 计数刷新
   V->>P: 勾选/取消勾选
   P->>A: PUT /api/todos/:id {done}
