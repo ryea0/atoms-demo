@@ -35,8 +35,11 @@ export interface Tool {
   execute(args:unknown, ctx:ToolContext):Promise<{ok:boolean;output:string}>;
 }
 
-/** write_file 内容上限 512KB（.claude/rules/07：数据库写入前二次约束，按 UTF-8 字节数计） */
-const MAX_CONTENT_BYTES = 512 * 1024;
+/**
+ * 内容上限 512KB（.claude/rules/07「数据库写入前二次约束」，按 UTF-8 字节数计）。
+ * 单一事实来源：fs 工具（write_file）与角色层的直写落库（专家报告 / MEMORY）共用同一口径。
+ */
+export const MAX_CONTENT_BYTES = 512 * 1024;
 /** read_file 截断保护（DESIGN §4.6）：超过 400 行只回首尾各 200 行 */
 const READ_TRUNCATE_LINES = 400;
 const READ_HEAD_LINES = 200;

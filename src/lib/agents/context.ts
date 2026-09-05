@@ -25,7 +25,7 @@ const DOC_KEEP_CHARS = 2000;
 const TRIMMED_NOTICE = '（上下文已裁剪）';
 
 /** 两级偏好/记忆的固定注入路径（DESIGN §4.2） */
-const PREFERENCES_PATH = '.atoms/PREFERENCES.md';
+const PREFERENCES_PATH = '.atoms/reports/PREFERENCES.md';
 const MEMORY_PATH = '.atoms/reports/MEMORY.md';
 
 /** CJK 汉字区间（与 src/lib/llm/estimate.ts 同一口径，规避 target ES2017 的 \p{Script=Han}）；
