@@ -12,8 +12,8 @@
  * - 连接跨轮次常驻：done/stopped 不关流（客户端留在页面等待下一轮）
  *
  * 重连对齐策略（T17 客户端职责，此处只提供机制）：先 GET /api/projects/[id]
- * 快照对齐状态，再带 Last-Event-ID=<快照 lastSeq> 重放增量——纯重放窗口上限
- * 500 条（RING_CAP），超出部分只能靠快照补齐。
+ * 快照对齐状态，再以 ?lastEventId=<快照 lastSeq>（首连）或 Last-Event-ID 头（重连）
+ * 重放增量——纯重放窗口上限 500 条（RING_CAP），超出部分只能靠快照补齐。
  */
 import { projectEventBus } from '@/lib/agents/events';
 import { badRequest, idParamsSchema, parseRouteParams, requireProject } from '@/lib/api/route-support';
@@ -30,8 +30,10 @@ export async function GET(request: Request, ctx: { params: Promise<{ id: string 
   if (owned instanceof Response) return owned;
   const projectId = owned.project.id;
 
-  // Last-Event-ID：浏览器断线重连自动带上（http.dev/last-event-id）；非法值按全新订阅
-  const lastEventId = request.headers.get('Last-Event-ID');
+  // Last-Event-ID：浏览器断线重连自动带上（http.dev/last-event-id）；非法值按全新订阅。
+  // 原生 EventSource 首连带不了自定义头，客户端把快照 lastSeq 放进 ?lastEventId= query
+  //（首连重放入口，T17）；头缺失时回退读 query，头优先（重连原生行为不受 URL 旧值影响）。
+  const lastEventId = request.headers.get('Last-Event-ID') ?? new URL(request.url).searchParams.get('lastEventId');
   const afterSeq = lastEventId !== null && /^\d{1,9}$/.test(lastEventId) ? Number(lastEventId) : undefined;
 
   const encoder = new TextEncoder();

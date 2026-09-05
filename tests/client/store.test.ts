@@ -10,9 +10,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import type { StreamEvent } from '@/lib/agents/events';
 import { roleOrder, roleRegistry } from '@/lib/agents/registry';
 import type { AgentRun, Message, Project, ProjectListItem } from '@/lib/db/provider/types';
+import type { SnapshotFile } from '@/lib/projects/service';
 import {
   clearWorkspaceStores,
   createWorkspaceStore,
+  useWorkspace,
   useWorkspaceFile,
   type WorkspaceSnapshot,
 } from '@/lib/client/store';
@@ -50,17 +52,31 @@ function makeMessage(over: Partial<Message> = {}): Message {
   };
 }
 
-/** 空白快照（hydrate 起点用，按需覆盖字段） */
+/** 快照文件行（对齐服务层 SnapshotFile：id/updatedAt 也带上，形状以实际契约为准） */
+function snapFile(over: Partial<SnapshotFile> = {}): SnapshotFile {
+  return {
+    id: 101,
+    path: 'index.html',
+    content: '',
+    version: 1,
+    lastEditor: 'engineer',
+    updatedAt: 1_700_000_000_000,
+    ...over,
+  };
+}
+
+/** 空白快照（hydrate 起点用，按需覆盖字段；契约 = GET /api/projects/[id] 的 ProjectSnapshot） */
 function makeSnapshot(over: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
   return {
     project: makeProject(),
+    lastSeq: 0,
     messages: [],
     files: [],
     agentRuns: [],
     checkpoints: [],
     usage: [],
-    live: [],
-    softLocked: [],
+    streamingFiles: [],
+    softLockedFiles: [],
     ...over,
   };
 }
@@ -254,14 +270,16 @@ describe('workspaceStore hydrate', () => {
       makeSnapshot({
         messages: [makeMessage({ id: 5 })],
         files: [
-          { path: 'index.html', content: '<!doctype html>', version: 2, lastEditor: 'architect' },
-          { path: 'app/main.js', content: 'const a = 1;', version: 1, lastEditor: 'engineer' },
+          snapFile({ id: 11, path: 'index.html', content: '<!doctype html>', version: 2, lastEditor: 'architect' }),
+          snapFile({ id: 12, path: 'app/main.js', content: 'const a = 1;', version: 1, lastEditor: 'engineer' }),
         ],
         agentRuns: [run],
-        checkpoints: [{ id: 3, projectId: PROJECT_ID, label: 'eng-app-main 前', agentRunId: null, createdAt: 9 }],
+        checkpoints: [
+          { id: 3, projectId: PROJECT_ID, label: 'eng-app-main 前', agentRunId: null, afterRunId: 42, createdAt: 9 },
+        ],
         usage: [{ agentRole: 'pm', model: 'mock', tokens: 120, calls: 1 }],
-        live: [{ path: 'app/live.js', content: 'const live = 1;' }],
-        softLocked: ['app/main.js'],
+        streamingFiles: [{ path: 'app/live.js', content: 'const live = 1;' }],
+        softLockedFiles: [{ fileId: 12, path: 'app/main.js', editingBy: 'user-1', editingExpiresAt: 1_800_000_000_000 }],
       }),
     );
 
@@ -281,7 +299,7 @@ describe('workspaceStore hydrate', () => {
   it('幂等：同一快照二次 hydrate 状态引用不变（不触发多余渲染）', () => {
     const snapshot = makeSnapshot({
       messages: [makeMessage({ id: 5 })],
-      files: [{ path: 'index.html', content: '<!doctype html>', version: 2, lastEditor: 'architect' }],
+      files: [snapFile({ path: 'index.html', content: '<!doctype html>', version: 2, lastEditor: 'architect' })],
     });
     const store = createWorkspaceStore();
     store.hydrate(snapshot);
@@ -292,7 +310,7 @@ describe('workspaceStore hydrate', () => {
     // 换成内容相同但对象不同的快照：仍然幂等（值等价即可，不比引用）
     store.hydrate(makeSnapshot({
       messages: [makeMessage({ id: 5 })],
-      files: [{ path: 'index.html', content: '<!doctype html>', version: 2, lastEditor: 'architect' }],
+      files: [snapFile({ path: 'index.html', content: '<!doctype html>', version: 2, lastEditor: 'architect' })],
     }));
     expect(store.getState()).toBe(first);
   });
@@ -300,8 +318,8 @@ describe('workspaceStore hydrate', () => {
   it('hydrate 后续接 delta：在流文件继续追加，定版文件从快照内容起算', () => {
     const store = createWorkspaceStore();
     store.hydrate(makeSnapshot({
-      files: [{ path: 'index.html', content: '<!doctype html>', version: 2, lastEditor: 'architect' }],
-      live: [{ path: 'app/live.js', content: 'const live' }],
+      files: [snapFile({ path: 'index.html', content: '<!doctype html>', version: 2, lastEditor: 'architect' })],
+      streamingFiles: [{ path: 'app/live.js', content: 'const live' }],
     }));
 
     store.applyEvent(ev({ event: 'delta', agent: 'engineer', path: 'app/live.js', content: ' = 1;' }));
@@ -391,6 +409,63 @@ describe('workspaceStore 单例', () => {
     unsubscribe();
     store.applyEvent(ev({ event: 'delta', path: 'a.js', content: 'x' }));
     expect(listener).toHaveBeenCalledTimes(1);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* useWorkspace 连接管道（EventSource stub；T17 R2 首连重放入口）         */
+/* ------------------------------------------------------------------ */
+
+/** jsdom 无 EventSource：用可观察 stub 捕获连接 URL / onmessage / close */
+class MockEventSource {
+  static readonly instances: MockEventSource[] = [];
+
+  closed = false;
+  onopen: ((event: MessageEvent) => void) | null = null;
+  onmessage: ((event: MessageEvent<string>) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+
+  constructor(public readonly url: string) {
+    MockEventSource.instances.push(this);
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
+describe('useWorkspace 连接管道', () => {
+  it('快照 lastSeq 进首连 URL（?lastEventId=），重放事件经 onmessage 入 store，卸载关闭连接', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(makeSnapshot({ lastSeq: 12 })));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
+    MockEventSource.instances.length = 0;
+
+    function Probe(): ReturnType<typeof createElement> {
+      const state = useWorkspace(7);
+      return createElement('div', null, state.project?.title ?? '');
+    }
+    const { unmount } = render(createElement(Probe));
+
+    // 快照到达 → hydrate → 打开 EventSource，首连 URL 携带快照 lastSeq
+    await waitFor(() => expect(MockEventSource.instances).toHaveLength(1));
+    expect(fetchMock).toHaveBeenCalledWith('/api/projects/7', expect.anything());
+    expect(MockEventSource.instances[0]?.url).toBe('/api/projects/7/stream?lastEventId=12');
+
+    // 重放的 delta 事件经 onmessage 进 store（首连重放不依赖 Last-Event-ID 头）
+    const source = MockEventSource.instances[0];
+    expect(source).toBeDefined();
+    if (source === undefined) return;
+    act(() => {
+      source.onmessage?.(new MessageEvent('message', { data: JSON.stringify(ev({ event: 'delta', path: 'app/x.js', content: 'hi' })) }));
+    });
+    expect(createWorkspaceStore(7).getState().files.get('app/x.js')?.content).toBe('hi');
+
+    // 卸载：不留悬挂连接
+    unmount();
+    expect(source.closed).toBe(true);
+
+    vi.unstubAllGlobals();
   });
 });
 

@@ -277,6 +277,45 @@ describe('GET stream：Last-Event-ID 重放', () => {
     expect(dataOf(frames[0]!).content).toBe('二');
   });
 
+  it('②b 首连无自定义头：?lastEventId= query 重放缺失事件；非法值按全新订阅（不重放）；头优先于 query', async () => {
+    const { id } = await seedProject();
+    projectEventBus.emit(id, { runId: null, event: 'message', content: '一' });
+    projectEventBus.emit(id, { runId: null, event: 'message', content: '二' });
+    projectEventBus.emit(id, { runId: null, event: 'message', content: '三' });
+
+    // query 参数入口（原生 EventSource 首连带不了头，客户端把快照 lastSeq 放这里）：只补 seq 2、3
+    const viaQuery = await STREAM_GET(
+      makeRequest(`http://localhost/api/projects/${id}/stream?lastEventId=1`, {}, SESSION_A),
+      idCtx(id),
+    );
+    const frames = await readFrames(viaQuery, (list) => list.length >= 2);
+    expect(frames.map((frame) => frame.id)).toEqual(['2', '3']);
+
+    // 非法 query：按全新订阅（与非法头同语义：不重放、只等实时），不 500 不拒连
+    const invalid = await STREAM_GET(
+      makeRequest(`http://localhost/api/projects/${id}/stream?lastEventId=abc`, {}, SESSION_A),
+      idCtx(id),
+    );
+    expect(invalid.status).toBe(200);
+    const invalidBody = invalid.body;
+    if (invalidBody === null) throw new Error('SSE 响应缺少 body');
+    const invalidReader = invalidBody.getReader();
+    const firstChunk = await Promise.race([
+      invalidReader.read(),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 300)),
+    ]);
+    expect(firstChunk).toBe('timeout'); // 全新订阅：缓冲里的 1、2、3 不重放
+    await invalidReader.cancel().catch(() => undefined);
+
+    // 头优先于 query：断线重连时浏览器原生 Last-Event-ID 必须压过 URL 里的旧值
+    const headerWins = await STREAM_GET(
+      makeRequest(`http://localhost/api/projects/${id}/stream?lastEventId=1`, { headers: { 'Last-Event-ID': '2' } }, SESSION_A),
+      idCtx(id),
+    );
+    const tail = await readFrames(headerWins, (list) => list.length >= 1);
+    expect(tail.map((frame) => frame.id)).toEqual(['3']);
+  }, 10000);
+
   it('心跳 20s 发 `: ping` 注释帧；客户端 abort 后流关闭', async () => {
     vi.useFakeTimers();
     try {

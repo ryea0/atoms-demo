@@ -8,8 +8,9 @@
  *   与「当前打开 path」的判断交给组件层）/ file_end 定版并清 streaming / agent_* 推进任务
  *   时间线 / message、intervention_injected 追加聊天 / done、stopped 收尾 / error 记录。
  * - `hydrate` 用 GET /api/projects/[id] 快照整体重建，**幂等**：等价快照二次 hydrate 保持
- *   同一 state 引用（不触发多余渲染）。页面级恢复走快照；同一连接内的断线重连走
- *   Last-Event-ID 重放——两者不叠加，因此不会出现 delta 双份累积。
+ *   同一 state 引用（不触发多余渲染）。页面级恢复 = 快照 + 首连 ?lastEventId=<快照 lastSeq>
+ *   重放增量（事件 seq > lastSeq，不在快照内）；断线重连走浏览器原生 Last-Event-ID 头——
+ *   两条重放路径各自只覆盖快照之后的事件，不会 delta 双份累积。
  *
  * store 为 per-project 单例（Map 缓存）；所有更新都生成新对象/新 Map（不可变更新），
  * 保证 getSnapshot 引用稳定。合成节点用负数 id，绝不与库里的自增 id 冲突。
@@ -22,11 +23,12 @@ import type {
   AgentRun,
   Checkpoint,
   FileEditor,
-  FileRow,
   LlmUsageRow,
   Message,
   Project,
 } from '@/lib/db/provider/types';
+// type-only import：编译期完全擦除，不把服务端模块带进客户端 bundle
+import type { ProjectSnapshot } from '@/lib/projects/service';
 import { fetchWorkspaceSnapshot } from '@/lib/client/session';
 
 /** 单个文件的客户端态（快照行 / 在流占位共用） */
@@ -38,23 +40,11 @@ export interface WorkspaceFile {
   streaming: boolean;
 }
 
-/** 快照里的在流文件（服务端事件总线 liveBuffer 的全文） */
-export interface WorkspaceLiveFile {
-  path: string;
-  content: string;
-}
-
-/** GET /api/projects/[id] 快照（T16 契约；files 带全量 content） */
-export interface WorkspaceSnapshot {
-  project: Project;
-  messages: Message[];
-  files: Array<Pick<FileRow, 'path' | 'content' | 'version' | 'lastEditor'>>;
-  agentRuns: AgentRun[];
-  checkpoints: Checkpoint[];
-  usage: LlmUsageRow[];
-  live: WorkspaceLiveFile[];
-  softLocked: string[];
-}
+/**
+ * GET /api/projects/[id] 快照——直接采用服务层 ProjectSnapshot 契约
+ * （含 lastSeq / streamingFiles / softLockedFiles；type-only import 防漂移）。
+ */
+export type WorkspaceSnapshot = ProjectSnapshot;
 
 /** 工作台聚合状态（组件层通过 useWorkspace 订阅） */
 export interface WorkspaceState {
@@ -411,7 +401,8 @@ export class WorkspaceStore {
 
   /**
    * 快照整体重建（幂等）：等价快照保持原 state 引用。
-   * live 数组转 streaming 占位，让「刷新页面时正在生成的文件」直接可读可续写。
+   * streamingFiles 转在流占位，让「刷新页面时正在生成的文件」直接可读可续写；
+   * softLockedFiles 只取 path 列表（UI 提示用），其余字段留在快照层。
    */
   hydrate(snapshot: WorkspaceSnapshot): void {
     const files = new Map<string, WorkspaceFile>();
@@ -424,7 +415,7 @@ export class WorkspaceStore {
       });
     }
     const livePaths: string[] = [];
-    for (const item of snapshot.live) {
+    for (const item of snapshot.streamingFiles) {
       const existing = files.get(item.path);
       files.set(item.path, {
         content: item.content,
@@ -445,7 +436,7 @@ export class WorkspaceStore {
       runs: [...snapshot.agentRuns],
       checkpoints: [...snapshot.checkpoints],
       usage: [...snapshot.usage],
-      softLocked: [...new Set(snapshot.softLocked)],
+      softLocked: [...new Set(snapshot.softLockedFiles.map((file) => file.path))],
       connected: this.state.connected,
       finished: status === 'done' || status === 'failed',
       error: null,
@@ -494,8 +485,11 @@ export function useWorkspace(projectId: number): WorkspaceState {
     let source: EventSource | null = null;
     let cancelled = false;
 
-    const connect = (): void => {
-      source = new EventSource(`/api/projects/${projectId}/stream`);
+    const connect = (lastSeq: number): void => {
+      // 首连重放入口：快照 lastSeq 进 query（原生 EventSource 首连带不了自定义头，DESIGN §3.6
+      // 「先快照对齐、再从快照 seq 重放增量」靠它闭合）；断线重连由浏览器原生 Last-Event-ID
+      // 头接管（route 侧头优先于 query，重连不受 URL 里的旧值影响）
+      source = new EventSource(`/api/projects/${projectId}/stream?lastEventId=${lastSeq}`);
       source.onopen = () => store.setConnected(true);
       source.onmessage = (messageEvent: MessageEvent<string>) => {
         try {
@@ -512,7 +506,7 @@ export function useWorkspace(projectId: number): WorkspaceState {
       .then((snapshot) => {
         if (cancelled) return;
         store.hydrate(snapshot);
-        connect();
+        connect(snapshot.lastSeq);
       })
       .catch((error: unknown) => {
         if (cancelled || controller.signal.aborted) return;
