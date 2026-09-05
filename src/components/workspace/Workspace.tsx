@@ -13,6 +13,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Toaster } from '@/components/ui/sonner';
+import { FRONTEND_INDEX_PATH, PreviewPane } from '@/components/preview/PreviewPane';
 import { useWorkspace } from '@/lib/client/store';
 import type { AgentRole } from '@/lib/db/provider/types';
 import { PaneEmpty, PaneShell } from './PaneShell';
@@ -100,7 +101,7 @@ export function Workspace({ projectId }: { projectId: number }) {
           className="min-w-0 flex-1 lg:w-1/2"
         >
           {view === 'preview' ? (
-            <PaneEmpty hint="应用预览将在这里呈现" sub="生成完成后，可在浏览器内直接操作全栈应用" />
+            <PreviewPane projectId={projectId} hasFrontend={state.files.has(FRONTEND_INDEX_PATH)} />
           ) : (
             <PaneEmpty
               hint="在文件树中选择文件，在这里查看与编辑"

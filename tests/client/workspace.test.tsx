@@ -266,15 +266,38 @@ describe('TopBar 顶栏', () => {
     expect(document.querySelector('[data-topbar-actions]')).not.toBeNull();
   });
 
-  it('视图切换到预览后，查看器空态随之切换', async () => {
+  it('视图切换到预览：PreviewPane 接管主区（frontend 未产出→占位；产出→装配 iframe）', async () => {
     mountWorkspace();
     expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
 
     // Radix Tabs 在 mousedown 时切换选中（click 不触发）
     fireEvent.mouseDown(screen.getByRole('tab', { name: '预览' }));
     expect(screen.getByRole('tab', { name: '预览' })).toHaveAttribute('aria-selected', 'true');
-    expect(screen.getByText('应用预览将在这里呈现')).toBeInTheDocument();
+    // 夹具只有 index.html / docs/prd.md，没有 app/frontend/index.html → 预览占位
+    expect(screen.getByText('工程师完成 frontend 后可预览')).toBeInTheDocument();
     expect(screen.queryByText('在文件树中选择文件，在这里查看与编辑')).not.toBeInTheDocument();
+
+    // 工程师产出前端入口后，同一视图直接呈现服务端装配 iframe（T22 接线）
+    const withFrontend = makeSnapshot({
+      files: [
+        ...makeSnapshot().files,
+        {
+          id: 103,
+          path: 'app/frontend/index.html',
+          content: '<!doctype html><title>Todo</title>',
+          version: 1,
+          lastEditor: 'engineer',
+          updatedAt: 1_700_000_000_000,
+        },
+      ],
+    });
+    cleanup();
+    mountWorkspace(withFrontend);
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole('tab', { name: '预览' }));
+    const iframe = screen.getByTitle('应用预览');
+    expect(iframe).toHaveAttribute('src', `/api/projects/${PROJECT_ID}/preview`);
+    expect(iframe).toHaveAttribute('sandbox', 'allow-scripts');
   });
 
   it('分享按钮：复制当前地址并提示成功', async () => {
