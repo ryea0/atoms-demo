@@ -6,7 +6,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ARCHITECT_DOC_PATHS } from '@/lib/agents/roles/architect';
 import { estimateTokens } from '@/lib/llm/estimate';
-import { DEFAULT_MODEL, getLlmProvider, LlmError, resolveModel } from '@/lib/llm/client';
+import {
+  DEFAULT_COMPLETE_TIMEOUT_MS,
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  DEFAULT_STREAM_TOTAL_TIMEOUT_MS,
+  DEFAULT_MODEL,
+  getLlmProvider,
+  LlmError,
+  readPositiveIntMs,
+  resolveModel,
+} from '@/lib/llm/client';
 import { createMockProvider, readSample } from '@/lib/llm/mock';
 import { meteredCall, meteredCallWith, type MeteringSink } from '@/lib/llm/usage';
 import type { LlmProvider, LlmRequest, LlmResult, ToolCall } from '@/lib/llm/types';
@@ -52,6 +61,14 @@ function firstCall(calls: RecordedCall[]): RecordedCall {
  */
 function testEnv(partial: Record<string, string> = {}): NodeJS.ProcessEnv {
   return { NODE_ENV: 'test', ...partial };
+}
+
+/** OpenAI 兼容环境桩（超时语义/openai 客户端两组用例共用） */
+function stubOpenAiEnv(): void {
+  vi.stubEnv('LLM_PROVIDER', 'openai');
+  vi.stubEnv('LLM_BASE_URL', 'https://api.example.com/v1/'); // 故意带尾斜杠，断言 trim
+  vi.stubEnv('LLM_API_KEY', 'sk-unit-test-key');
+  vi.stubEnv('LLM_MODEL', 'qwen-test');
 }
 
 /** usage=null 的桩 provider：触发估算降级分支 */
@@ -370,13 +387,6 @@ describe('getLlmProvider 工厂', () => {
 /* 4. OpenAI 兼容客户端（fetch 桩，不发真实请求）                          */
 /* ------------------------------------------------------------------ */
 describe('openai 兼容客户端', () => {
-  function stubOpenAiEnv(): void {
-    vi.stubEnv('LLM_PROVIDER', 'openai');
-    vi.stubEnv('LLM_BASE_URL', 'https://api.example.com/v1/'); // 故意带尾斜杠，断言 trim
-    vi.stubEnv('LLM_API_KEY', 'sk-unit-test-key');
-    vi.stubEnv('LLM_MODEL', 'qwen-test');
-  }
-
   it('stream：解析 data: 行，聚合 content/tool_calls 增量，usage 取自最后 chunk', async () => {
     stubOpenAiEnv();
     const fetchMock = vi.fn(() =>
@@ -568,6 +578,208 @@ describe('openai 兼容客户端', () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* 4′ 超时语义（T29）：complete 总时长 / stream 空闲+总时长               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 可控节奏的 SSE 流 fetch 桩：chunks 逐片输出、每片间隔 gapMs。
+ * close 模式发完即关流；stall 模式发完后永久静默（模拟上游挂死，不关流）。
+ * 节奏由 setTimeout 驱动——在 fake clock 上可精确控制 chunk 间隙；
+ * 收到的 signal 中止时清掉挂起 sleep 并 error 流（模拟真实 fetch 的中止传播）。
+ */
+function stubPacedFetch(chunks: string[], gapMs: number, mode: 'close' | 'stall'): ReturnType<typeof vi.fn> {
+  return vi.fn((_url: string, init?: { signal?: AbortSignal }) => {
+    const encoder = new TextEncoder();
+    const signal = init?.signal;
+    let index = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller): Promise<void> | void {
+        if (signal?.aborted === true) {
+          controller.error(signal.reason);
+          return;
+        }
+        if (index >= chunks.length) {
+          if (mode === 'close') controller.close();
+          else return new Promise<void>(() => {}); // 永久静默：不产出也不关闭
+          return;
+        }
+        const payload = chunks[index];
+        return new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            index += 1;
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: payload } }] })}\n\n`),
+            );
+            resolve();
+          }, gapMs);
+          // 真实 fetch 在中止时会立刻断流；桩里同步清掉挂起的 sleep 并 error 流，避免残留计时器
+          signal?.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              controller.error(signal.reason);
+              resolve();
+            },
+            { once: true },
+          );
+        });
+      },
+    });
+    return Promise.resolve(new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }));
+  });
+}
+
+/** 挂起不返回的 fetch 桩：仅在 signal 中止时以 signal.reason 拒绝（模拟真实 fetch 的中止传播） */
+function hangingFetch(): ReturnType<typeof vi.fn> {
+  return vi.fn((_url: string, init?: { signal?: AbortSignal }) => {
+    const signal = init?.signal;
+    return new Promise<Response>((_resolve, reject) => {
+      if (signal?.aborted === true) {
+        reject(signal.reason);
+        return;
+      }
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  });
+}
+
+/** fake clock 驱动：按步长推进直到 promise 决议；超过步数上限视为失败（防误推进 total timer 后误判通过） */
+async function advanceUntilSettled<T>(promise: Promise<T>, stepMs: number, maxSteps: number): Promise<T> {
+  let settled = false;
+  void promise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  for (let step = 0; step < maxSteps && !settled; step += 1) {
+    await vi.advanceTimersByTimeAsync(stepMs);
+  }
+  if (!settled) throw new Error('流未在限定步数内决议（fake clock 推进上限）');
+  return await promise;
+}
+
+describe('超时配置解析（非法值回退默认）', () => {
+  it('缺省/非法（空串、非数字、0、负数、小数）→ 回退默认；合法正整数原样', () => {
+    expect(readPositiveIntMs(undefined, 90_000)).toBe(90_000);
+    expect(readPositiveIntMs('', 90_000)).toBe(90_000);
+    expect(readPositiveIntMs('abc', 90_000)).toBe(90_000);
+    expect(readPositiveIntMs('0', 90_000)).toBe(90_000);
+    expect(readPositiveIntMs('-5', 90_000)).toBe(90_000);
+    expect(readPositiveIntMs('12.5', 90_000)).toBe(90_000);
+    expect(readPositiveIntMs('45000', 90_000)).toBe(45_000);
+    expect(readPositiveIntMs(' 45000 ', 90_000)).toBe(45_000);
+  });
+
+  it('默认值：complete 90000 / stream idle 45000 / stream total 300000', () => {
+    expect(DEFAULT_COMPLETE_TIMEOUT_MS).toBe(90_000);
+    expect(DEFAULT_STREAM_IDLE_TIMEOUT_MS).toBe(45_000);
+    expect(DEFAULT_STREAM_TOTAL_TIMEOUT_MS).toBe(300_000);
+  });
+});
+
+describe('complete 超时（总时长语义保持，env 可调）', () => {
+  it('LLM_TIMEOUT_MS 生效 → code=timeout，消息带 complete 类别与实际生效值（不硬编码 90000ms）', async () => {
+    stubOpenAiEnv();
+    vi.stubEnv('LLM_TIMEOUT_MS', '30');
+    vi.stubGlobal('fetch', hangingFetch());
+    const err = asError(await getLlmProvider().complete(makeReq()).catch((e: unknown) => e));
+    expect(err).toBeInstanceOf(LlmError);
+    expect((err as LlmError).code).toBe('timeout');
+    expect(err.message).toContain('complete');
+    expect(err.message).toContain('30');
+    expect(err.message).not.toContain('90000');
+  });
+
+  it('caller signal 中止 → code=aborted（总时长配置不改变中止归因）', async () => {
+    stubOpenAiEnv();
+    vi.stubEnv('LLM_TIMEOUT_MS', '30000');
+    const controller = new AbortController();
+    controller.abort();
+    vi.stubGlobal('fetch', hangingFetch());
+    const err = asError(await getLlmProvider().complete(makeReq({ signal: controller.signal })).catch((e: unknown) => e));
+    expect((err as LlmError).code).toBe('aborted');
+  });
+});
+
+describe('stream 超时（idle 每 chunk 重置 + total 一次性）', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('慢流不误杀：chunk 间隙 60ms、空闲阈值 100ms（连续重置）→ 总时长 300ms 仍正常完成', async () => {
+    stubOpenAiEnv();
+    vi.stubEnv('LLM_STREAM_IDLE_TIMEOUT_MS', '100');
+    vi.stubEnv('LLM_STREAM_TOTAL_TIMEOUT_MS', '10000');
+    vi.stubGlobal('fetch', stubPacedFetch(['你', '好', '呀', '世', '界'], 60, 'close'));
+
+    const deltas: string[] = [];
+    const pending = getLlmProvider().stream(makeReq(), (t: string) => deltas.push(t));
+    const result = await advanceUntilSettled(pending, 70, 100);
+
+    expect(deltas.join('')).toBe('你好呀世界');
+    expect(result.content).toBe('你好呀世界');
+    expect(vi.getTimerCount()).toBe(0); // 计时器在 finally 清理，不泄漏
+  });
+
+  it('连续空闲超过阈值 → code=timeout，消息带 idle 类别与实际生效值', async () => {
+    stubOpenAiEnv();
+    vi.stubEnv('LLM_STREAM_IDLE_TIMEOUT_MS', '100');
+    vi.stubEnv('LLM_STREAM_TOTAL_TIMEOUT_MS', '10000');
+    vi.stubGlobal('fetch', stubPacedFetch(['首片'], 10, 'stall'));
+
+    const pending = getLlmProvider().stream(makeReq(), () => {});
+    const err = asError(await advanceUntilSettled(pending.catch((e: unknown) => e), 60, 100));
+
+    expect(err).toBeInstanceOf(LlmError);
+    expect((err as LlmError).code).toBe('timeout');
+    expect(err.message).toContain('idle');
+    expect(err.message).toContain('100');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('总时长上限触发 → code=timeout，消息带 total 类别与实际生效值（空闲未超时也会判死）', async () => {
+    stubOpenAiEnv();
+    vi.stubEnv('LLM_STREAM_IDLE_TIMEOUT_MS', '10000');
+    vi.stubEnv('LLM_STREAM_TOTAL_TIMEOUT_MS', '250');
+    // 每 100ms 一片、持续 4s：空闲计时被不断重置，只有 total 能拦
+    const chunks = Array.from({ length: 40 }, (_, i) => `第${i}片`);
+    vi.stubGlobal('fetch', stubPacedFetch(chunks, 100, 'stall'));
+
+    const pending = getLlmProvider().stream(makeReq(), () => {});
+    const err = asError(await advanceUntilSettled(pending.catch((e: unknown) => e), 100, 100));
+
+    expect(err).toBeInstanceOf(LlmError);
+    expect((err as LlmError).code).toBe('timeout');
+    expect(err.message).toContain('total');
+    expect(err.message).toContain('250');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('caller signal 中止 → code=aborted（不误报为超时），计时器清理', async () => {
+    stubOpenAiEnv();
+    vi.stubEnv('LLM_STREAM_IDLE_TIMEOUT_MS', '10000');
+    vi.stubEnv('LLM_STREAM_TOTAL_TIMEOUT_MS', '10000');
+    vi.stubGlobal('fetch', stubPacedFetch(['首片'], 10, 'stall'));
+
+    const controller = new AbortController();
+    const captured = getLlmProvider().stream(makeReq({ signal: controller.signal }), () => {}).catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(500);
+    controller.abort();
+    const err = asError(await captured);
+
+    expect(err).toBeInstanceOf(LlmError);
+    expect((err as LlmError).code).toBe('aborted');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* 5. 计量（meteredCall）                                                */
 /* ------------------------------------------------------------------ */
 describe('meteredCall 计量', () => {
@@ -657,5 +869,74 @@ describe('meteredCall 计量', () => {
     expect(call.agentRole).toBe('pm');
     expect(call.model).toBe(DEFAULT_MODEL);
     expect(result.content).toContain('功能清单');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 5′ 中止/超时调用计量（T29）：失败也要留 llm_calls 痕迹                 */
+/* ------------------------------------------------------------------ */
+describe('中止/超时调用计量', () => {
+  /** 先吐一段增量再抛指定错误的桩 provider（complete 路径永不吐增量） */
+  function createAbortAfterDeltaProvider(error: LlmError, delta: string): LlmProvider {
+    return {
+      name: 'stub-abort',
+      async complete(): Promise<LlmResult> {
+        throw error;
+      },
+      async stream(_req: LlmRequest, onDelta: (text: string) => void): Promise<LlmResult> {
+        onDelta(delta);
+        throw error;
+      },
+    };
+  }
+
+  it('流式中止 → 落一条估算记录（completion 按已收增量估算），错误原样上抛', async () => {
+    const { sink, calls } = createFakeSink();
+    const abort = new LlmError('aborted', 'LLM 调用已中止：用户停止');
+    const pending = meteredCallWith(
+      createAbortAfterDeltaProvider(abort, '你好'),
+      sink,
+      9,
+      'pm',
+      { messages: [{ role: 'user', content: '一二三四五' }] },
+      () => {},
+    );
+    await expect(pending).rejects.toBe(abort);
+    expect(calls).toHaveLength(1);
+    const call = firstCall(calls);
+    expect(call.projectId).toBe(9);
+    expect(call.agentRole).toBe('pm');
+    expect(call.estimated).toBe(1);
+    expect(call.cost).toBe(0);
+    expect(call.promptTokens).toBe(estimateTokens('user:一二三四五'));
+    expect(call.completionTokens).toBe(estimateTokens('你好'));
+    expect(call.latencyMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('超时（complete 路径，零增量）→ 也落库，completion=0', async () => {
+    const { sink, calls } = createFakeSink();
+    const timeout = new LlmError('timeout', 'LLM 调用超时（complete 总时长上限 90ms）');
+    await expect(
+      meteredCallWith(createAbortAfterDeltaProvider(timeout, '不该被吐出'), sink, 3, 'engineer', {
+        messages: [{ role: 'user', content: '做一个待办事项应用' }],
+      }),
+    ).rejects.toBe(timeout);
+    expect(calls).toHaveLength(1);
+    const call = firstCall(calls);
+    expect(call.estimated).toBe(1);
+    expect(call.promptTokens).toBeGreaterThan(0);
+    expect(call.completionTokens).toBe(0);
+  });
+
+  it('其他错误（http_error/bad_response）→ 不落库（用量完全不可知，既有语义不变）', async () => {
+    const { sink, calls } = createFakeSink();
+    for (const code of ['http_error', 'bad_response', 'network_error'] as const) {
+      await expect(
+        meteredCallWith(createAbortAfterDeltaProvider(new LlmError(code, `炸了：${code}`), '半截'), sink, 1, 'seo', {
+          messages: [],
+        }),
+      ).rejects.toMatchObject({ code });
+    }
+    expect(calls).toHaveLength(0);
   });
 });

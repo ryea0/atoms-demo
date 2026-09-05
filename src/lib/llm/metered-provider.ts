@@ -7,7 +7,8 @@
  *
  * 语义与 usage.ts meteredCall 完全一致（内部复用 meteredCallWith，不重复估算/落库逻辑）：
  * - usage 缺失 → estimateTokens 字符公式估算并标 estimated=1；真实 usage → estimated=0；cost 恒 0
- * - provider 抛错（含 AbortError）原样上抛且不落库（失败/中止时用量不可知，与 meteredCall 一致）
+ * - 中止/超时（LlmError aborted/timeout）原样上抛且落一条估算记录（T29，不再零记录）；
+ *   其余错误原样上抛且不落库（用量完全不可知）
  * - 落库失败只 console.error 留痕，不影响调用结果（不静默吞）
  *
  * model 绑定语义：每次请求的 model 统一改写为绑定的 model（浅拷贝，不改调用方原对象），
@@ -35,7 +36,7 @@ export interface MeteredProviderInput {
   provider?: LlmProvider;
 }
 
-/** 包装任意 provider：每次 complete/stream 调用成功后计量落库（recordLlmCall），错误原样上抛 */
+/** 包装任意 provider：成功后计量落库；中止/超时落一条估算记录，其余错误原样上抛 */
 export function wrapMetered(input: MeteredProviderInput): LlmProvider {
   const inner = input.provider ?? getLlmProvider();
 

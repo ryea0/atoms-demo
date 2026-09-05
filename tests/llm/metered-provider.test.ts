@@ -1,11 +1,12 @@
 /**
  * 计量装饰器（wrapMetered）测试：provider 级计量必须与 meteredCall 同一语义——
- * 成功调用后落一条 llm_calls（usage 缺失走估算 estimated=1）、provider 抛错原样上抛且不落库、
+ * 成功调用后落一条 llm_calls（usage 缺失走估算 estimated=1）、
+ * 中止/超时原样上抛且落一条估算记录（T29）、其他错误原样上抛且不落库、
  * 缺省 provider 走 getLlmProvider()（mock）。全部用内存桩，不触真实存储。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { wrapMetered } from '@/lib/llm/metered-provider';
-import { DEFAULT_MODEL } from '@/lib/llm/client';
+import { DEFAULT_MODEL, LlmError } from '@/lib/llm/client';
 import { readSample } from '@/lib/llm/mock';
 import type { MeteringSink } from '@/lib/llm/usage';
 import type { LlmProvider, LlmRequest, LlmResult } from '@/lib/llm/types';
@@ -169,20 +170,30 @@ describe('wrapMetered 计量装饰器', () => {
     expect(calls).toHaveLength(0); // 失败不计量
   });
 
-  it('③ 补：AbortError 同样不落库（与 meteredCall 的中止语义一致）', async () => {
+  it('③ 补：中止/超时（LlmError aborted/timeout）→ 原样上抛且落一条估算记录（T29 中止计量）', async () => {
     const { sink, calls } = createFakeSink();
-    const abort = new Error('LLM 调用已中止（abort）');
-    abort.name = 'AbortError';
-    const metered = wrapMetered({
+    const abort = new LlmError('aborted', 'LLM 调用已中止（abort）');
+    const timeout = new LlmError('timeout', 'LLM 流式超时（idle 空闲 45000ms 无数据）');
+    const abortMetered = wrapMetered({
       storage: sink,
       projectId: 2,
       agentRole: 'architect',
       model: 'm4',
       provider: createStubProvider({ error: abort }),
     });
+    const timeoutMetered = wrapMetered({
+      storage: sink,
+      projectId: 2,
+      agentRole: 'architect',
+      model: 'm4',
+      provider: createStubProvider({ error: timeout }),
+    });
 
-    await expect(metered.stream(makeReq(), () => {})).rejects.toBe(abort);
-    expect(calls).toHaveLength(0);
+    await expect(abortMetered.stream(makeReq(), () => {})).rejects.toBe(abort);
+    await expect(timeoutMetered.complete(makeReq())).rejects.toBe(timeout);
+    expect(calls).toHaveLength(2); // 中止/超时也计量（估算），不再零记录
+    expect(calls[0]).toMatchObject({ projectId: 2, agentRole: 'architect', model: 'm4', estimated: 1 });
+    expect(calls[1]).toMatchObject({ projectId: 2, agentRole: 'architect', model: 'm4', estimated: 1 });
   });
 
   it('多次调用 → 逐次落库（runAgent 循环 N 次 provider 调用 = N 条 llm_calls）', async () => {

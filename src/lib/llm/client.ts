@@ -14,8 +14,41 @@ import type { LlmMessage, LlmProvider, LlmRequest, LlmResult, ToolCall } from '@
 /** 未配置 LLM_MODEL 时的内置默认模型（mock provider 不敏感） */
 export const DEFAULT_MODEL = 'mock-model';
 
-/** 单次请求超时（DESIGN §4.6「单步超时 90s」） */
-export const REQUEST_TIMEOUT_MS = 90_000;
+/** 非流式请求总时长上限（DESIGN §4.6「单步超时 90s」；env LLM_TIMEOUT_MS 可调） */
+export const DEFAULT_COMPLETE_TIMEOUT_MS = 90_000;
+/**
+ * 流式空闲超时（T29）：连续无 chunk 超过该阈值才判死，每收到数据即重置。
+ * 默认 45s 须大于实测 provider 最大 chunk 间隙（探针 9.3s），否则健康流被误杀。
+ */
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 45_000;
+/** 流式总时长上限（T29）：长文生成健康流也会跑满数分钟，兜底防无限占用 */
+export const DEFAULT_STREAM_TOTAL_TIMEOUT_MS = 300_000;
+
+/**
+ * 解析正整数毫秒配置：缺省/空串/非数字/≤0/小数一律回退默认，不抛错。
+ * 配置写错宁可退回保守默认，也不让一次手滑把超时打成 0 或 NaN。
+ */
+export function readPositiveIntMs(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed === '') return fallback;
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+/** 超时类别与实际生效值（错误消息必须带上，便于探针/日志定位是哪一刀） */
+interface TimeoutSpec {
+  kind: 'complete' | 'idle' | 'total';
+  ms: number;
+}
+
+/** 超时错误消息：带类别与实际生效值（不再硬编码 90000ms） */
+function timeoutMessage(spec: TimeoutSpec): string {
+  if (spec.kind === 'complete') return `LLM 调用超时（complete 总时长上限 ${spec.ms}ms）`;
+  if (spec.kind === 'idle') return `LLM 流式超时（idle 连续 ${spec.ms}ms 未收到数据）`;
+  return `LLM 流式超时（total 总时长上限 ${spec.ms}ms）`;
+}
 
 /** 结构化错误（规则 01/07：边界错误带 code/message，不泄漏堆栈与密钥） */
 export type LlmErrorCode =
@@ -220,19 +253,29 @@ function materializeToolCalls(map: Map<number, ToolCallAccumulator>): ToolCall[]
     }));
 }
 
-/** caller signal + 90s 超时合并（AbortSignal.any，Node 22） */
-function linkSignals(signal?: AbortSignal): AbortSignal {
-  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-  return signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
+/**
+ * caller signal + 总时长超时合并（AbortSignal.any，Node 22）。
+ * 仅 complete 路径使用（一次性一刀切）；流式路径需「每 chunk 续命」，
+ * AbortSignal.timeout 不可重置，故改由 stream 内自管 AbortController + 手动 timer。
+ */
+function linkSignals(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const total = AbortSignal.timeout(timeoutMs);
+  return signal === undefined ? total : AbortSignal.any([signal, total]);
 }
 
-/** 网络层异常 → 结构化错误（区分中止/超时） */
-function toLlmError(error: unknown, apiKey: string): LlmError {
+/**
+ * 网络层异常 → 结构化错误（区分中止/超时）。
+ * AbortError=caller 中止（code=aborted，永不降级）；TimeoutError=AbortSignal.timeout 实抛
+ * （Node 18+/undici，complete 路径的总时长一刀切），消息带实际生效值与类别。
+ */
+function toLlmError(error: unknown, apiKey: string, timeout?: TimeoutSpec): LlmError {
   if (error instanceof LlmError) return error;
   if (error instanceof Error) {
     const message = sanitize(error.message, apiKey);
     if (error.name === 'AbortError') return new LlmError('aborted', `LLM 调用已中止：${message}`);
-    if (error.name === 'TimeoutError') return new LlmError('timeout', `LLM 调用超时（${REQUEST_TIMEOUT_MS}ms）`);
+    if (error.name === 'TimeoutError') {
+      return new LlmError('timeout', timeoutMessage(timeout ?? { kind: 'complete', ms: DEFAULT_COMPLETE_TIMEOUT_MS }));
+    }
     return new LlmError('network_error', `LLM 请求失败：${message}`);
   }
   return new LlmError('network_error', `LLM 请求失败：${sanitize(String(error), apiKey)}`);
@@ -243,12 +286,12 @@ function toLlmError(error: unknown, apiKey: string): LlmError {
  * 200 但响应非 JSON（网关返回 HTML、响应体截断）→ 结构化 bad_response：
  * 带 code/status 与脱敏后的响应体片段，不向外抛裸 SyntaxError（V8 会内嵌响应体原文）。
  */
-async function readJsonBody(response: Response, key: string): Promise<unknown> {
+async function readJsonBody(response: Response, key: string, timeout?: TimeoutSpec): Promise<unknown> {
   let text: string;
   try {
     text = await response.text();
   } catch (error) {
-    throw toLlmError(error, key); // 响应体读取中断（网络/截断）
+    throw toLlmError(error, key, timeout); // 响应体读取中断（网络/截断/总时长到点）
   }
   try {
     return JSON.parse(text) as unknown;
@@ -275,8 +318,12 @@ export function createOpenAiProvider(env: NodeJS.ProcessEnv = process.env): LlmP
     return `${base.replace(/\/+$/, '')}/chat/completions`;
   };
 
-  /** 发起请求并处理 HTTP/网络层错误 */
-  const post = async (body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> => {
+  /**
+   * 发起请求并处理 HTTP/网络层错误。
+   * signal 由调用方组装好（complete=caller+总时长；stream=caller+自管 idle/total 计时器），
+   * 超时上下文用于错误归因与消息（不再硬编码 90000ms）。
+   */
+  const post = async (body: Record<string, unknown>, signal: AbortSignal, timeout?: TimeoutSpec): Promise<Response> => {
     const url = endpoint();
     const key = apiKey();
     let response: Response;
@@ -285,10 +332,10 @@ export function createOpenAiProvider(env: NodeJS.ProcessEnv = process.env): LlmP
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
         body: JSON.stringify(body),
-        signal: linkSignals(signal),
+        signal,
       });
     } catch (error) {
-      throw toLlmError(error, key);
+      throw toLlmError(error, key, timeout);
     }
     if (!response.ok) {
       const text = await response.text().catch(() => ''); // 读不到错误体时以空串兜底
@@ -306,8 +353,11 @@ export function createOpenAiProvider(env: NodeJS.ProcessEnv = process.env): LlmP
 
     /** 非流式：一次拿全量结果 */
     async complete(req: LlmRequest): Promise<LlmResult> {
-      const response = await post(toRequestBody(req, false), req.signal);
-      const json: unknown = await readJsonBody(response, apiKey());
+      // 总时长一刀切（T29：保持 90s 语义，env 可调）——complete 无内容进度可言，无法按数据续命
+      const completeMs = readPositiveIntMs(env.LLM_TIMEOUT_MS, DEFAULT_COMPLETE_TIMEOUT_MS);
+      const spec: TimeoutSpec = { kind: 'complete', ms: completeMs };
+      const response = await post(toRequestBody(req, false), linkSignals(req.signal, completeMs), spec);
+      const json: unknown = await readJsonBody(response, apiKey(), spec);
       const parsed = completionSchema.safeParse(json);
       if (!parsed.success) {
         throw new LlmError('bad_response', `LLM 响应结构无法解析：${clip(parsed.error.message, 300)}`);
@@ -330,76 +380,125 @@ export function createOpenAiProvider(env: NodeJS.ProcessEnv = process.env): LlmP
       };
     },
 
-    /** 流式：逐 chunk 回调增量，返回聚合后的完整结果 */
+    /**
+     * 流式：逐 chunk 回调增量，返回聚合后的完整结果。
+     * 超时双阈值（T29，DESIGN §4.6）：idle=连续无数据判死（每收到数据重置），
+     * total=总时长兜底。AbortSignal.timeout 不可重置，故用 AbortController + 手动 timer，
+     * finally 统一清理防泄漏；caller 中止经 AbortSignal.any 照常级联。
+     */
     async stream(req: LlmRequest, onDelta: (text: string) => void): Promise<LlmResult> {
-      const response = await post(toRequestBody(req, true), req.signal);
-      const body = response.body;
-      if (body === null) throw new LlmError('bad_response', 'LLM 流式响应缺少 body');
+      const idleMs = readPositiveIntMs(env.LLM_STREAM_IDLE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS);
+      const totalMs = readPositiveIntMs(env.LLM_STREAM_TOTAL_TIMEOUT_MS, DEFAULT_STREAM_TOTAL_TIMEOUT_MS);
+      const controller = new AbortController();
+      const signal = req.signal === undefined ? controller.signal : AbortSignal.any([req.signal, controller.signal]);
+      let idleFired = false;
+      let totalFired = false;
 
-      const reader = body.getReader();
-      const decoder = new TextDecoder();
-      const toolCallMap = new Map<number, ToolCallAccumulator>();
-      let buffer = '';
-      let content = '';
-      let usage: { promptTokens: number; completionTokens: number } | null = null;
-      let sawDone = false;
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      /** 空闲计时重新起算：每收到一段数据（含心跳/空段）即续命 */
+      const armIdle = (): void => {
+        if (idleTimer !== undefined) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          idleFired = true;
+          controller.abort();
+        }, idleMs);
+      };
+      const totalTimer: ReturnType<typeof setTimeout> = setTimeout(() => {
+        totalFired = true;
+        controller.abort();
+      }, totalMs);
+      const clearTimers = (): void => {
+        if (idleTimer !== undefined) clearTimeout(idleTimer);
+        clearTimeout(totalTimer);
+      };
 
-      /** 处理一条 SSE 行（data: payload） */
-      const handleData = (payload: string): void => {
-        if (payload === '[DONE]') {
-          sawDone = true;
-          return;
-        }
-        let json: unknown;
-        try {
-          json = JSON.parse(payload) as unknown;
-        } catch {
-          console.warn('[llm] 跳过无法解析的 SSE data 行');
-          return;
-        }
-        const chunk = streamChunkSchema.safeParse(json);
-        if (!chunk.success) {
-          console.warn('[llm] 跳过结构异常的 SSE chunk');
-          return;
-        }
-        const delta = chunk.data.choices?.[0]?.delta;
-        const text = delta?.content;
-        if (text !== undefined && text !== null && text !== '') {
-          content += text;
-          onDelta(text);
-        }
-        for (const call of delta?.tool_calls ?? []) accumulateToolCall(toolCallMap, call);
-        const chunkUsage = chunk.data.usage;
-        if (chunkUsage?.prompt_tokens !== undefined && chunkUsage?.completion_tokens !== undefined) {
-          usage = { promptTokens: chunkUsage.prompt_tokens, completionTokens: chunkUsage.completion_tokens };
-        }
+      /** 中止归因：caller 级联 > idle > total > 其他（网络/HTTP 错误原样映射，code 语义不变） */
+      const attribute = (error: unknown): LlmError => {
+        if (req.signal?.aborted === true) return toLlmError(error, apiKey());
+        if (idleFired) return new LlmError('timeout', timeoutMessage({ kind: 'idle', ms: idleMs }));
+        if (totalFired) return new LlmError('timeout', timeoutMessage({ kind: 'total', ms: totalMs }));
+        return toLlmError(error, apiKey());
       };
 
       try {
-        while (!sawDone) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() ?? '';
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (trimmed === '' || trimmed.startsWith(':')) continue; // 空行/心跳注释
-            if (!trimmed.startsWith('data:')) continue; // event:/id: 等行忽略
-            handleData(trimmed.slice(5).trim());
-            if (sawDone) break;
-          }
+        armIdle(); // 首片之前同样受空闲约束（连接挂起/首 token 停滞也算「无数据」）
+        let response: Response;
+        try {
+          response = await post(toRequestBody(req, true), signal);
+        } catch (error) {
+          throw attribute(error);
         }
-        buffer += decoder.decode();
-        const tail = buffer.trim();
-        if (!sawDone && tail.startsWith('data:')) handleData(tail.slice(5).trim());
-      } catch (error) {
-        throw toLlmError(error, apiKey());
-      } finally {
-        reader.releaseLock();
-      }
+        const body = response.body;
+        if (body === null) throw new LlmError('bad_response', 'LLM 流式响应缺少 body');
 
-      return { content, toolCalls: materializeToolCalls(toolCallMap), usage };
+        const reader = body.getReader();
+        const decoder = new TextDecoder();
+        const toolCallMap = new Map<number, ToolCallAccumulator>();
+        let buffer = '';
+        let content = '';
+        let usage: { promptTokens: number; completionTokens: number } | null = null;
+        let sawDone = false;
+
+        /** 处理一条 SSE 行（data: payload） */
+        const handleData = (payload: string): void => {
+          if (payload === '[DONE]') {
+            sawDone = true;
+            return;
+          }
+          let json: unknown;
+          try {
+            json = JSON.parse(payload) as unknown;
+          } catch {
+            console.warn('[llm] 跳过无法解析的 SSE data 行');
+            return;
+          }
+          const chunk = streamChunkSchema.safeParse(json);
+          if (!chunk.success) {
+            console.warn('[llm] 跳过结构异常的 SSE chunk');
+            return;
+          }
+          const delta = chunk.data.choices?.[0]?.delta;
+          const text = delta?.content;
+          if (text !== undefined && text !== null && text !== '') {
+            content += text;
+            onDelta(text);
+          }
+          for (const call of delta?.tool_calls ?? []) accumulateToolCall(toolCallMap, call);
+          const chunkUsage = chunk.data.usage;
+          if (chunkUsage?.prompt_tokens !== undefined && chunkUsage?.completion_tokens !== undefined) {
+            usage = { promptTokens: chunkUsage.prompt_tokens, completionTokens: chunkUsage.completion_tokens };
+          }
+        };
+
+        try {
+          while (!sawDone) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            armIdle(); // 收到数据 → 空闲计时重新起算（慢流不误杀）
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (trimmed === '' || trimmed.startsWith(':')) continue; // 空行/心跳注释
+              if (!trimmed.startsWith('data:')) continue; // event:/id: 等行忽略
+              handleData(trimmed.slice(5).trim());
+              if (sawDone) break;
+            }
+          }
+          buffer += decoder.decode();
+          const tail = buffer.trim();
+          if (!sawDone && tail.startsWith('data:')) handleData(tail.slice(5).trim());
+        } catch (error) {
+          throw attribute(error);
+        } finally {
+          reader.releaseLock();
+        }
+
+        return { content, toolCalls: materializeToolCalls(toolCallMap), usage };
+      } finally {
+        clearTimers(); // 成功/失败/中止都要清掉计时器，不残留挂起句柄
+      }
     },
   };
 }
