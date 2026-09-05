@@ -2,8 +2,8 @@
  * 危险 API 扫描层（纯函数，rules/07「生成物安全」/ DESIGN §5③ 纵深第 3 道）：
  * acorn AST 精检 + 正则兜底/辅检，输出 hard（拦截落库+带错重试）与 soft（⚠ 警告不拦截）。
  *
- * hard：eval / new Function / 字符串首参 setTimeout / postMessage 到 parent|top / 非白名单外链 script
- * soft：恒真 while(true) 无 break / fetch 到非 /api/ 地址
+ * hard：eval / new Function / 字符串或模板字面量首参 setTimeout / postMessage 接收链指向 parent|top / 非白名单外链 script
+ * soft：恒真 while(true) 无 break / fetch 到非 /api/ 地址（按字面量与模板静态前缀判定）
  *
  * 作用范围：AST 规则作用于 .js/.mjs 及 .html 内联 <script>；外链 script 白名单的正则规则仅作用于 .html。
  * 死循环/外部 fetch 在 .html 中按内联脚本逐段判（AST 优先，单段解析失败才退正则），避免与 AST 双通道重复计数。
@@ -118,13 +118,15 @@ function dangersOfCall(node: AstNode, baseLine: number): Danger[] {
     return [danger('hard', 'new_function', line, 'new Function()：字符串建函数，等价动态执行')];
   }
   if (name === 'setTimeout') {
-    const first = node.arguments?.[0];
-    // 依规格：首参为函数表达式（含箭头函数）放行；其余（字符串字面量、变量等非函数表达式）→ hard
-    if (isAstNode(first) && isFunctionExpr(first)) return [];
-    return [danger('hard', 'timer_string', line, 'setTimeout 首参不是函数表达式：疑似字符串代码注入')];
+    // 只有「代码以字面量写出」（字符串/模板字面量）才判注入 hard；
+    // 函数引用、成员方法、变量等一律放行，避免误伤 setTimeout(save, 500) 这类正常用法
+    if (isStringOrTemplateLiteral(node.arguments?.[0])) {
+      return [danger('hard', 'timer_string', line, 'setTimeout 首参为字符串/模板字面量：疑似字符串代码注入')];
+    }
+    return [];
   }
   if (name === 'fetch') {
-    const target = stringLiteralValue(node.arguments?.[0]);
+    const target = literalText(node.arguments?.[0]);
     // 非字面量（变量/拼接，如 fetch(API + '/' + id)）不报，避免误报
     if (target === null || target.startsWith(API_PREFIX)) return [];
     return [danger('soft', 'external_fetch', line, `fetch 到非 ${API_PREFIX} 地址「${target}」，预览沙箱禁外联`)];
@@ -135,13 +137,12 @@ function dangersOfCall(node: AstNode, baseLine: number): Danger[] {
   return [];
 }
 
-/** postMessage：接收目标或 targetOrigin 含 parent|top 字样 → 跨 frame 逃逸 hard */
+/** postMessage：接收链（parent / window.top …）指向外层 frame → 逃逸 hard。
+ * 只看接收链，不看 targetOrigin 字符串内容——URL 里带 top/parent 字样不代表跨 frame。 */
 function dangersOfPostMessage(node: AstNode, line: number): Danger[] {
   const callee = node.callee;
   const receiver = isAstNode(callee) && callee.type === 'MemberExpression' ? callee.object : null;
-  const origin = stringLiteralValue(node.arguments?.[1]) ?? '';
-  const toParent = chainHasName(receiver, ESCAPE_TARGETS) || /parent|top/i.test(origin);
-  if (!toParent) return [];
+  if (!chainHasName(receiver, ESCAPE_TARGETS)) return [];
   return [danger('hard', 'post_message_parent', line, 'postMessage 面向 parent/top：可逃出预览 iframe')];
 }
 
@@ -248,7 +249,7 @@ const ROUGH_RULES: RoughRule[] = [
   {
     rule: 'post_message_parent',
     severity: 'hard',
-    pattern: /\b(?:parent|top)\s*\.\s*postMessage\s*\(|postMessage\s*\([^)]*['"][^'"]*\b(?:parent|top)\b/gi,
+    pattern: /\b(?:parent|top)\s*\.\s*postMessage\s*\(/gi,
     detail: '疑似 postMessage 面向 parent/top（正则粗扫）',
   },
   { rule: 'infinite_loop', severity: 'soft', pattern: /\bwhile\s*\(\s*true\s*\)/gi, detail: '疑似 while(true) 无 break（正则粗扫）' },
@@ -286,8 +287,31 @@ function isAstNode(value: unknown): value is AstNode {
   return typeof value === 'object' && value !== null && typeof (value as { type?: unknown }).type === 'string';
 }
 
-function isFunctionExpr(node: AstNode): boolean {
-  return node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression';
+/** 是否为「代码以字面量写出」：字符串字面量或模板字面量（用于字符串 setTimeout 注入判定） */
+function isStringOrTemplateLiteral(node: unknown): boolean {
+  if (!isAstNode(node)) return false;
+  if (node.type === 'Literal') return typeof node.value === 'string';
+  return node.type === 'TemplateLiteral';
+}
+
+/** 取字面量的可读文本：字符串字面量取其值；模板字面量取插值前的静态前缀。
+ * 取前缀是保守选择——插值段（如 `/api/todos/${id}` 的 `${id}`）无法静态求值，
+ * 但其前的静态段已足够判定是否走 `/api/` 契约；前缀为空时按非白名单处理（宁可多一条软警告）。 */
+function literalText(node: unknown): string | null {
+  const value = stringLiteralValue(node);
+  if (value !== null) return value;
+  if (!isAstNode(node) || node.type !== 'TemplateLiteral' || !Array.isArray(node.quasis)) return null;
+  const quasi: unknown = node.quasis[0]; // TemplateElement
+  if (!isAstNode(quasi)) return null;
+  const payload: unknown = quasi.value; // { raw, cooked }
+  return readStringField(payload, 'cooked') ?? readStringField(payload, 'raw');
+}
+
+/** 读取对象上指定 string 字段（AST 载荷无类型，用守卫而非断言） */
+function readStringField(obj: unknown, key: string): string | null {
+  if (typeof obj !== 'object' || obj === null || !(key in obj)) return null;
+  const value: unknown = (obj as Record<string, unknown>)[key];
+  return typeof value === 'string' ? value : null;
 }
 
 /** 标识符名；非标识符返回 null */

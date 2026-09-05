@@ -243,6 +243,39 @@ describe('validateFile', () => {
   });
 });
 
+describe('规则精修（fix round 1）：setTimeout / postMessage / fetch 模板字面量', () => {
+  it('setTimeout 首参为函数引用、成员方法或缺参 → 不报（此规则只对字面量判 hard）', () => {
+    for (const code of ['setTimeout(save, 500);', 'setTimeout(this.tick, 1);', 'setTimeout();']) {
+      expect(scanDanger('app/frontend/main.js', code).filter((d) => d.rule === 'timer_string')).toHaveLength(0);
+    }
+  });
+
+  it('setTimeout 首参为字符串或模板字面量 → hard', () => {
+    for (const code of ["setTimeout('doIt()', 10);", 'setTimeout(`doIt()`, 10);']) {
+      const ds = scanDanger('app/frontend/main.js', code);
+      expect(ds.some((d) => d.rule === 'timer_string' && d.severity === 'hard')).toBe(true);
+    }
+  });
+
+  it('postMessage 接收者为 window（仅 targetOrigin 字符串含 top/parent 字样）→ 不报', () => {
+    const ds = scanDanger('app/frontend/main.js', "window.postMessage('x', 'https://top.example.com');");
+    expect(ds.filter((d) => d.rule === 'post_message_parent')).toHaveLength(0);
+  });
+
+  it('postMessage 接收链含 parent → 仍 hard', () => {
+    const ds = scanDanger('app/frontend/main.js', "window.parent.postMessage('x', 'https://safe.example.com');");
+    expect(ds.some((d) => d.rule === 'post_message_parent' && d.severity === 'hard')).toBe(true);
+  });
+
+  it('fetch 模板字面量：外部地址 → soft，/api/ 前缀（带插值）→ 不报', () => {
+    const evil = scanDanger('app/frontend/main.js', 'fetch(`https://evil.com/x`);');
+    expect(evil.some((d) => d.rule === 'external_fetch' && d.severity === 'soft')).toBe(true);
+
+    const api = scanDanger('app/frontend/main.js', 'fetch(`/api/todos/${id}`);');
+    expect(api.filter((d) => d.rule === 'external_fetch')).toHaveLength(0);
+  });
+});
+
 describe('黄金样例回归（校验层不得误伤 mock/seed 流水线的正常产物）', () => {
   it('样例 index.html 与 api.js 均无 hard、无语法错误', () => {
     const htmlVerdict = validateFile('app/frontend/index.html', renderIndexHtml('待办应用', ['/api/todos']));
