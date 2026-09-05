@@ -16,6 +16,7 @@ import { Toaster } from '@/components/ui/sonner';
 import { FRONTEND_INDEX_PATH, PreviewPane } from '@/components/preview/PreviewPane';
 import { useWorkspace } from '@/lib/client/store';
 import type { AgentRole } from '@/lib/db/provider/types';
+import { FileTree } from '@/components/tree/FileTree';
 import { PaneEmpty, PaneShell } from './PaneShell';
 import { TopBar, type WorkspaceView } from './TopBar';
 
@@ -52,8 +53,6 @@ export function Workspace({ projectId }: { projectId: number }) {
     return roles;
   }, [state.runs]);
 
-  const fileCount = state.files.size;
-
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-background">
       <TopBar
@@ -79,18 +78,14 @@ export function Workspace({ projectId }: { projectId: number }) {
           />
         </PaneShell>
 
-        {/* 文件树 ~20%：T20 在此挂 FileTree */}
+        {/* 文件树 ~20%：FileTree（T20）。选中态接线（activePath/onSelect）归 T25 查看器联动 */}
         <PaneShell
           label="文件树"
           title="文件"
           active={pane === 'files'}
           className="flex-1 border-r border-border lg:flex-none lg:w-[20%]"
         >
-          <PaneEmpty
-            hint="生成开始后，文件会在这里长出目录树"
-            sub="支持按名搜索、查看修改标记与下载项目"
-            meta={fileCount === 0 ? '还没有生成任何文件' : `已生成 ${fileCount} 个文件`}
-          />
+          <FileTree files={state.files} projectId={state.project?.id ?? null} />
         </PaneShell>
 
         {/* 查看器/预览 ~50%：T21 ViewerTabs、T22 PreviewPane 在此填充 */}
