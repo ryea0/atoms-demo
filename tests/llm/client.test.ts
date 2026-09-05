@@ -37,6 +37,22 @@ function createFakeSink(): { sink: MeteringSink; calls: RecordedCall[] } {
   };
 }
 
+/** 取第一条计量记录（空数组显式失败，避免 noUncheckedIndexedAccess 下的可空索引访问） */
+function firstCall(calls: RecordedCall[]): RecordedCall {
+  const call = calls[0];
+  if (call === undefined) throw new Error('预期至少一条计量记录，实际为空');
+  return call;
+}
+
+/**
+ * 测试用 env 字面量：补上 NODE_ENV='test'。
+ * next-env.d.ts 引入的 Next 全局类型把 ProcessEnv.NODE_ENV 声明为必填，
+ * 而测试确实运行在 test 环境——显式补齐比断言更诚实。
+ */
+function testEnv(partial: Record<string, string> = {}): NodeJS.ProcessEnv {
+  return { NODE_ENV: 'test', ...partial };
+}
+
 /** usage=null 的桩 provider：触发估算降级分支 */
 function createStubProvider(overrides: Partial<LlmResult> = {}): LlmProvider {
   const base: LlmResult = { content: '内容', toolCalls: [], usage: null };
@@ -317,32 +333,32 @@ describe('mock provider 角色路由', () => {
 /* ------------------------------------------------------------------ */
 describe('resolveModel', () => {
   it('角色级覆盖优先于全局默认', () => {
-    const env = { LLM_MODEL: 'base-model', LLM_MODEL_LEADER: 'leader-model', LLM_MODEL_ENGINEER: 'eng-model' };
+    const env = testEnv({ LLM_MODEL: 'base-model', LLM_MODEL_LEADER: 'leader-model', LLM_MODEL_ENGINEER: 'eng-model' });
     expect(resolveModel('leader', env)).toBe('leader-model');
     expect(resolveModel('engineer', env)).toBe('eng-model');
     expect(resolveModel('pm', env)).toBe('base-model');
   });
 
   it('无任何配置时回退内置默认模型', () => {
-    expect(resolveModel('architect', {})).toBe(DEFAULT_MODEL);
+    expect(resolveModel('architect', testEnv())).toBe(DEFAULT_MODEL);
   });
 });
 
 describe('getLlmProvider 工厂', () => {
   it('未配置默认 mock', () => {
-    expect(getLlmProvider({}).name).toBe('mock');
-    expect(getLlmProvider({ LLM_PROVIDER: 'mock' }).name).toBe('mock');
+    expect(getLlmProvider(testEnv()).name).toBe('mock');
+    expect(getLlmProvider(testEnv({ LLM_PROVIDER: 'mock' })).name).toBe('mock');
   });
 
   it('LLM_PROVIDER=openai → openai provider（仅构造，不发请求）', () => {
-    const provider = getLlmProvider({ LLM_PROVIDER: 'openai', LLM_BASE_URL: 'https://api.example.com/v1' });
+    const provider = getLlmProvider(testEnv({ LLM_PROVIDER: 'openai', LLM_BASE_URL: 'https://api.example.com/v1' }));
     expect(provider.name).toBe('openai');
     expect(typeof provider.complete).toBe('function');
     expect(typeof provider.stream).toBe('function');
   });
 
   it('未知 provider → 结构化错误', () => {
-    expect(() => getLlmProvider({ LLM_PROVIDER: 'claude' })).toThrow(LlmError);
+    expect(() => getLlmProvider(testEnv({ LLM_PROVIDER: 'claude' }))).toThrow(LlmError);
   });
 });
 
@@ -562,7 +578,7 @@ describe('meteredCall 计量', () => {
     );
     expect(result.content).toBe('内容');
     expect(calls).toHaveLength(1);
-    const call = calls[0];
+    const call = firstCall(calls);
     expect(call.projectId).toBe(42);
     expect(call.agentRole).toBe('engineer');
     expect(call.estimated).toBe(1);
@@ -632,9 +648,10 @@ describe('meteredCall 计量', () => {
       },
     );
     expect(calls).toHaveLength(1);
-    expect(calls[0].estimated).toBe(0);
-    expect(calls[0].agentRole).toBe('pm');
-    expect(calls[0].model).toBe(DEFAULT_MODEL);
+    const call = firstCall(calls);
+    expect(call.estimated).toBe(0);
+    expect(call.agentRole).toBe('pm');
+    expect(call.model).toBe(DEFAULT_MODEL);
     expect(result.content).toContain('功能清单');
   });
 });
