@@ -54,6 +54,12 @@ export interface UpdateAgentRunPatch { status?:RunStatus; summary?:string|null; 
 export interface LlmUsageRow { agentRole:AgentRole; model:string; tokens:number; calls:number; }
 
 /**
+ * 全局用量聚合行（T24 设置页用量卡片）：不按项目过滤——设置页看的是整个平台的花费。
+ * estimatedCalls>0 表示该组里有按 DESIGN §4.4 公式估算的调用（UI 显示「含估算」标记）。
+ */
+export interface LlmUsageGlobalRow { agentRole:AgentRole; model:string; tokens:number; calls:number; estimatedCalls:number; }
+
+/**
  * recordLlmCall 入参（llm 层 meteredCall 结构化落库，字段与 src/lib/llm/usage.ts 的 MeteringSink 一一对应）。
  * estimated=1 表示 usage 缺失按 DESIGN §4.4 公式估算；cost 默认 0（单价未配置时不计费）。
  */
@@ -194,7 +200,7 @@ export interface AgentModelBindingRow { id:number; role:AgentRole; providerId:nu
 
 /**
  * 模型管理只读仓库（DESIGN §5①）：T27 的 resolveRoleModel（三级路由）消费。
- * 刻意只读且最小——T24 的设置页 CRUD 在此之上扩展写方法（届时并入本接口或另立 LlmWriteRepo）。
+ * 刻意只读且最小——写侧在 LlmAdminRepo（T24 设置页）。
  */
 export interface LlmReadRepo {
   /** 角色绑定（role 唯一，无绑定返回 null） */
@@ -203,11 +209,46 @@ export interface LlmReadRepo {
   getLlmModelById(modelId: number): Promise<LlmModelRow|null>;
 }
 
+/* ---------------- 模型管理写侧入参（T24 设置页；缺省键不动库里既有值） ---------------- */
+
+export interface CreateLlmProviderInput { name:string; baseUrl:string; apiKey:string; enabled:boolean; }
+export interface PatchLlmProviderInput { name?:string; baseUrl?:string; apiKey?:string; enabled?:boolean; }
+export interface CreateLlmModelInput { providerId:number; modelId:string; displayName:string;
+  priceInput:number; priceOutput:number; enabled:boolean; }
+export interface PatchLlmModelInput { displayName?:string; priceInput?:number; priceOutput?:number; enabled?:boolean; }
+export interface UpsertAgentModelBindingInput { role:AgentRole; providerId:number; modelId:number; }
+
+/**
+ * 模型管理写仓库（T24 设置页 CRUD，DESIGN §5①/§7 全局表）。
+ * 三张表都无 project_id（全局配置），不存在项目级作用域问题；api_key 只进不出（rules/07）。
+ * 删除走外键级联：删 provider → 其下 llm_models → 引用它们的 agent_model_bindings 一并清除。
+ */
+export interface LlmAdminRepo {
+  createLlmProvider(input: CreateLlmProviderInput): Promise<LlmProviderRow>;
+  /** 全部服务商（id 升序，输出稳定可断言） */
+  listLlmProviders(): Promise<LlmProviderRow[]>;
+  /** 局部更新：patch 里出现的键才落库；未命中返回 null */
+  updateLlmProvider(providerId: number, patch: PatchLlmProviderInput): Promise<LlmProviderRow|null>;
+  deleteLlmProvider(providerId: number): Promise<boolean>;
+  createLlmModel(input: CreateLlmModelInput): Promise<LlmModelRow>;
+  /** 模型清单（providerId 缺省 = 全部；providerId 升序 + model_id 升序稳定排序） */
+  listLlmModels(providerId?: number): Promise<LlmModelRow[]>;
+  updateLlmModel(modelId: number, patch: PatchLlmModelInput): Promise<LlmModelRow|null>;
+  deleteLlmModel(modelId: number): Promise<boolean>;
+  /** role 唯一约束 upsert：同角色重复绑定覆盖旧行 */
+  upsertAgentModelBinding(input: UpsertAgentModelBindingInput): Promise<AgentModelBindingRow>;
+  /** 清除绑定 = 「跟随全局默认」（resolveRoleModel 随之回退 env） */
+  deleteAgentModelBinding(role: AgentRole): Promise<boolean>;
+  listAgentModelBindings(): Promise<AgentModelBindingRow[]>;
+  /** 全局用量聚合（settings 用量卡片）：单条 SQL groupBy，禁 N+1 */
+  usageAll(): Promise<LlmUsageGlobalRow[]>;
+}
+
 /**
  * 存储抽象（DESIGN §12）：按仓库分组继承（Task 5 已补齐全部仓库组）。
  * 实现侧约定：所有查询强制 project_id 过滤（CLAUDE.md 规则 9）、更新走乐观锁（规则 05）。
  */
-export interface StorageProvider extends ProjectsRepo, MessagesRepo, FilesRepo, RunsRepo, MiscRepo, LlmReadRepo {
+export interface StorageProvider extends ProjectsRepo, MessagesRepo, FilesRepo, RunsRepo, MiscRepo, LlmReadRepo, LlmAdminRepo {
   /**
    * 关闭底层连接（幂等；关闭后本实例不可再用，需重新走工厂）。
    * 文件库实例按 dbFile 路径 memoize——业务侧在模块层调用一次 createStorage() 并持有即可，
