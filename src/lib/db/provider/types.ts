@@ -19,8 +19,11 @@ export interface Message { id:number; projectId:number; role:'user'|'assistant'|
   content:string; meta?:{mentions?:AgentRole[]}|null; deliveredAt:number|null; createdAt:number; }
 export interface AgentRun { id:number; projectId:number; taskKey:string; agent:AgentRole; task:string;
   status:RunStatus; summary:string|null; startedAt:number|null; endedAt:number|null; error:string|null; }
+/** 文件写入者域：agent 角色名 / human（人机共编）/ seed（预置演示） */
+export type FileEditor = AgentRole|'human'|'seed';
+
 export interface FileRow { id:number; projectId:number; path:string; content:string;
-  producedBy:AgentRole|'seed'; lastEditor:AgentRole|'human'|'seed'; editingBy:string|null; editingExpiresAt:number|null;
+  producedBy:FileEditor; lastEditor:AgentRole|'human'|'seed'; editingBy:string|null; editingExpiresAt:number|null;
   version:number; createdAt:number; updatedAt:number; }
 export interface FileVersion { id:number; fileId:number; version:number; content:string; editor:string; createdAt:number; }
 export interface Checkpoint { id:number; projectId:number; label:string; agentRunId:number|null; createdAt:number; }
@@ -67,12 +70,51 @@ export interface MessagesRepo {
   markDelivered(messageIds: number[], projectId?: number): Promise<void>;
 }
 
+/** upsertFile 入参（统一写入口：agent/seed 生成、人工新建同走此 API） */
+export interface UpsertFileInput { projectId:number; path:string; content:string; editor:FileEditor; }
+
+/** saveHuman 入参：baseVersion 为编辑器打开时的版本号，不匹配即冲突（CAS，DESIGN §3.9） */
+export interface SaveHumanInput { projectId:number; fileId:number; content:string; baseVersion:number; }
+
+/** saveHuman 结果：失败时带回服务端当前内容，前端渲染冲突对话框（用我的版本/用 agent 版本/并排 diff） */
+export type SaveHumanResult = { ok:true; version:number } | { ok:false; conflict:true; current:string };
+
+/** file_tree 行（树形 UI 只需路径+版本+最后编辑者，不背内容） */
+export interface FileListItem { path:string; version:number; lastEditor:AgentRole|'human'|'seed'; }
+
 /**
- * 存储抽象（DESIGN §12）：按仓库分组继承，随 Task 4-5 继续补齐
- * （agent_runs/files/file_versions/llm_calls/preferences/checkpoints…）。
+ * 虚拟文件系统仓库（CLAUDE.md 规则 6/11、DESIGN §3.9/§3.10）：
+ * - 所有方法强制 project_id 过滤；file_versions 表无 project_id，归属经 files 回查/联表保证
+ * - 覆盖写（agent/人工/恢复）统一归档旧版本到 file_versions——diff、回滚、可再撤销都靠它
+ * - 乐观锁：更新条件带 version，影响行数=0 即冲突；事务短小（事务内只有纯 DB 写）
+ */
+export interface FilesRepo {
+  /** 新路径插入 v1（produced_by=editor）；已存在则旧版本入档并 version+1，返回 {fileId, version} */
+  upsertFile(input: UpsertFileInput): Promise<{ fileId:number; version:number }>;
+  getFile(projectId:number, path:string): Promise<FileRow|null>;
+  getFileById(projectId:number, fileId:number): Promise<FileRow|null>;
+  /** file_tree 用（路径升序稳定排序） */
+  listFiles(projectId:number): Promise<FileListItem[]>;
+  /** 人工保存（CAS）：版本不匹配 → {ok:false,conflict:true,current=服务端最新内容}；文件不存在亦按冲突返回（current 为空串） */
+  saveHuman(input: SaveHumanInput): Promise<SaveHumanResult>;
+  /** 版本历史（新→旧倒序，供查看器版本侧栏） */
+  listFileVersions(projectId:number, fileId:number): Promise<FileVersion[]>;
+  /** 恢复=以该历史版本内容写一个新版本（可再撤销），返回新版本号；历史版本不存在则抛错 */
+  restoreFileVersion(projectId:number, fileId:number, version:number): Promise<number>;
+  /** 声明式软锁：on=人开始编辑（TTL 10min），off=释放；软锁检查在编排器步骤边界做，仓库不拦截写入 */
+  setSoftLock(projectId:number, fileId:number, on:boolean): Promise<void>;
+  /** 当前仍持有软锁的文件（只含未过期） */
+  getSoftLockedFiles(projectId:number): Promise<FileRow[]>;
+  /** 全量文件行（快照/导出/预览装配用） */
+  readAllFiles(projectId:number): Promise<FileRow[]>;
+}
+
+/**
+ * 存储抽象（DESIGN §12）：按仓库分组继承，随 Task 5 继续补齐
+ * （agent_runs/llm_calls/preferences/checkpoints…）。
  * 实现侧约定：所有查询强制 project_id 过滤（CLAUDE.md 规则 9）、更新走乐观锁（规则 05）。
  */
-export interface StorageProvider extends ProjectsRepo, MessagesRepo {
+export interface StorageProvider extends ProjectsRepo, MessagesRepo, FilesRepo {
   /**
    * 关闭底层连接（幂等；关闭后本实例不可再用，需重新走工厂）。
    * 文件库实例按 dbFile 路径 memoize——业务侧在模块层调用一次 createStorage() 并持有即可，
