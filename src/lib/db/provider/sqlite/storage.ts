@@ -13,7 +13,7 @@ import { createMessagesRepo } from './repo-messages';
 import { createFilesRepo } from './repo-files';
 import { createRunsRepo } from './repo-runs';
 import { createMiscRepo } from './repo-misc';
-import { createLlmReadRepo } from './repo-llm';
+import { createLlmAdminRepo, createLlmReadRepo } from './repo-llm';
 import * as schema from './schema';
 import type { StorageProvider } from '../types';
 
@@ -49,6 +49,7 @@ function assembleStorage(dbFile: string, client: Database.Database, db: SqliteDb
     ...createRunsRepo(db),
     ...createMiscRepo(db),
     ...createLlmReadRepo(db),
+    ...createLlmAdminRepo(db),
     /** 关闭连接（幂等）：文件库实例同时移出缓存，之后需重新走工厂 */
     close(): void {
       fileStorages.delete(dbFile);
