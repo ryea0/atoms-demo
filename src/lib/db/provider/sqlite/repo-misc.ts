@@ -26,13 +26,14 @@ function toCheckpoint(row: typeof checkpoints.$inferSelect): Checkpoint {
     projectId: row.projectId,
     label: row.label,
     agentRunId: row.agentRunId,
+    afterRunId: row.afterRunId,
     createdAt: row.createdAt,
   };
 }
 
 export function createMiscRepo(db: SqliteDb): MiscRepo {
   /** 打点：读快照与写快照在同一事务里，快照与 checkpoint 行不会出现「有头无身」的中间态 */
-  function snapshotTx(projectId: number, label: string, agentRunId: number | null): number {
+  function snapshotTx(projectId: number, label: string, agentRunId: number | null, afterRunId: number): number {
     return db.transaction((tx) => {
       const snapshot = tx
         .select({ path: files.path, content: files.content })
@@ -40,7 +41,7 @@ export function createMiscRepo(db: SqliteDb): MiscRepo {
         .where(eq(files.projectId, projectId))
         .orderBy(asc(files.path))
         .all();
-      const inserted = tx.insert(checkpoints).values({ projectId, label, agentRunId }).returning().all();
+      const inserted = tx.insert(checkpoints).values({ projectId, label, agentRunId, afterRunId }).returning().all();
       const cp = inserted[0];
       if (!cp) throw new Error('检查点写入失败：insert 未返回行');
       if (snapshot.length > 0) {
@@ -133,8 +134,8 @@ export function createMiscRepo(db: SqliteDb): MiscRepo {
   }
 
   return {
-    async createCheckpoint(projectId: number, label: string, agentRunId: number | null): Promise<number> {
-      return snapshotTx(projectId, label, agentRunId);
+    async createCheckpoint(projectId: number, label: string, agentRunId: number | null, afterRunId: number): Promise<number> {
+      return snapshotTx(projectId, label, agentRunId, afterRunId);
     },
 
     async restoreCheckpoint(projectId: number, cpId: number): Promise<number[]> {

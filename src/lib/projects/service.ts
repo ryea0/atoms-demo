@@ -170,8 +170,9 @@ export class CheckpointNotFoundError extends Error {
 
 /**
  * 项目级回滚（DESIGN §3.10）：恢复 files（repo 层短事务，回滚可撤销）→
- * 相关 agent_runs 标 rolled_back（检查点关联的任务及其之前）→ SSE message 通知。
- * 返回受影响 fileId 列表（按快照路径升序，repo 契约）。
+ * 检查点**之后**的 agent_runs 标 rolled_back（id > checkpoint.afterRunId——生产检查点
+ * 全部由编排器在任务前打点，afterRunId 即打点时刻的最大 run id；打点之前的工作
+ * 仍然成立，不动）→ SSE message 通知。返回受影响 fileId 列表（按快照路径升序，repo 契约）。
  */
 export async function restoreCheckpointAndNotify(storage: StorageProvider, projectId: number, cpId: number): Promise<number[]> {
   const checkpoints = await storage.listCheckpoints(projectId);
@@ -179,9 +180,7 @@ export async function restoreCheckpointAndNotify(storage: StorageProvider, proje
   if (checkpoint === undefined) throw new CheckpointNotFoundError(cpId);
 
   const affected = await storage.restoreCheckpoint(projectId, cpId);
-  if (checkpoint.agentRunId !== null) {
-    await storage.markRunsRolledBack(projectId, checkpoint.agentRunId);
-  }
+  await storage.markRunsRolledBack(projectId, checkpoint.afterRunId);
 
   projectEventBus.emit(projectId, {
     runId: null,

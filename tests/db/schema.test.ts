@@ -154,6 +154,34 @@ describe('schema', () => {
     }
   });
 
+  /** 加列迁移兜底（fix 轮）：演进前的旧库缺 after_run_id，ensureSchema 必须 ALTER 补齐且幂等 */
+  it('旧库缺 after_run_id 列时 ensureSchema 幂等补列（形态与新库一致）', () => {
+    const db = openSqlite(':memory:');
+    try {
+      // 模拟演进前的旧表（无 after_run_id）
+      db.exec(
+        'CREATE TABLE `checkpoints` (`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL, `project_id` integer NOT NULL, `label` text NOT NULL, `agent_run_id` integer, `created_at` integer NOT NULL)',
+      );
+      ensureSchema(db);
+      ensureSchema(db); // 二次执行无冲突（列已补齐）
+      const columns = columnInfoRows.parse(db.pragma('table_info(checkpoints)'));
+      const added = columns.find((c) => c.name === 'after_run_id');
+      // pragma 对 ALTER 加列的类型返回大写（SQLite 规范化），按小写比较
+      expect(added && { ...added, type: added.type.toLowerCase() }).toMatchObject({ type: 'integer', notnull: 1, dflt_value: '0', pk: 0 });
+      // 新建表路径与迁移路径的列集合一致
+      const fresh = openSqlite(':memory:');
+      try {
+        ensureSchema(fresh);
+        const freshColumns = columnInfoRows.parse(fresh.pragma('table_info(checkpoints)'));
+        expect(columns.map((c) => c.name).sort()).toEqual(freshColumns.map((c) => c.name).sort());
+      } finally {
+        fresh.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   /** 文件库连接生命周期：同路径 memoize 复用同一实例，close 幂等，close 后可重开且数据仍在（WAL 落盘） */
   it('文件库按路径 memoize + close 可重开', async () => {
     const file = join(tmpdir(), `atoms-task2-${process.pid}.db`);

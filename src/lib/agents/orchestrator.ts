@@ -292,6 +292,15 @@ function pmRequirementText(project: Project, userMessage: string): string {
 /* 主流程                                                               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 任务前基线打点（DESIGN §3.10）。检查点在任务开跑**前**打——此刻该任务的 run 行
+ * 尚不存在，因此用 afterRunId=当前最大 run id 捕获回滚边界：restore 后
+ * id > afterRunId 的任务（= 打点之后发生的全部工作）标 rolled_back。
+ */
+async function checkpointBefore(storage: StorageProvider, projectId: number, label: string): Promise<void> {
+  await storage.createCheckpoint(projectId, label, null, await storage.latestRunId(projectId));
+}
+
 async function executeGeneration(input: StartGenerationInput, signal: AbortSignal): Promise<void> {
   const { storage, projectId } = input;
   const emit = (e: Omit<StreamEvent, 'seq' | 'projectId'>): StreamEvent => projectEventBus.emit(projectId, e);
@@ -366,7 +375,7 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
       }
 
       // 检查点：任务前基线（DESIGN §3.10；短事务在 repo 层保证）
-      await storage.createCheckpoint(projectId, `任务前:${taskKey}`, null);
+      await checkpointBefore(storage, projectId, `任务前:${taskKey}`);
 
       // 干预队列：步骤边界取待注入消息（DESIGN §3.5）→ 事件 → 打戳 → 拼进任务文本
       const interventions = await storage.takePendingInterventions(projectId);
@@ -403,7 +412,7 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
     }
 
     // 收尾：领导汇报（一次 LLM 调用）→ assistant message → done
-    await storage.createCheckpoint(projectId, '任务前:leader-closing', null);
+    await checkpointBefore(storage, projectId, '任务前:leader-closing');
     emit({ runId: null, event: 'agent_start', agent: 'leader', meta: { taskKey: 'leader-closing' } });
     const closer = await runCloser({ storage, projectId, signal });
     emit({ runId: closer.runId, event: 'agent_end', agent: 'leader', summary: (await runSummaryOf(storage, projectId, closer.runId)) ?? undefined });

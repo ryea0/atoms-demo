@@ -173,6 +173,12 @@ export const checkpoints = sqliteTable('checkpoints', {
   label: text('label').notNull(),
   /** 打点时的任务 run（软引用：runs 与 checkpoints 随 project 级联，不单删） */
   agentRunId: integer('agent_run_id'),
+  /**
+   * 打点时刻该项目最大的 agent_runs.id（回滚标记边界：restore 后 id > afterRunId 的
+   * 任务标 rolled_back）。检查点在任务开跑**前**打，run id 尚不存在，故须打点时捕获。
+   * 旧库行经 ALTER 迁移默认 0（= 回滚标记全部 run，dev 数据保守语义）。
+   */
+  afterRunId: integer('after_run_id').notNull().default(0),
   createdAt: integer('created_at').notNull().$defaultFn(() => Date.now()),
 });
 

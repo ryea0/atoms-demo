@@ -550,13 +550,18 @@ describe('POST /api/projects/[id]/files/[fid]/regenerate', () => {
 /* ------------------------------------------------------------------ */
 
 describe('POST /api/projects/[id]/checkpoints/[cpId]/restore', () => {
-  it('⑨ 内容回滚（版本推进）+ message 事件 + agent_runs 标 rolled_back；快照外文件不动', async () => {
+  it('⑨ 内容回滚（版本推进）+ message 事件 + 检查点之后的 run 标 rolled_back（生产形状打点）；快照外文件不动', async () => {
     const { id } = await seedProject();
+    // 生产形状（fix 轮）：检查点由编排器在任务**前**打——agentRunId=null、
+    // afterRunId=打点时刻 latestRunId；此处手工复刻同一形状
+    const before = await storage().createAgentRun({ projectId: id, taskKey: 'pm-prd', agent: 'pm', task: '产出 PRD' });
+    await storage().updateAgentRun(before.id, { status: 'done', summary: 'PRD 完成' });
     await storage().upsertFile({ projectId: id, path: 'app/frontend/index.html', content: '旧内容', editor: 'engineer' });
-    const run = await storage().createAgentRun({ projectId: id, taskKey: 'engineer:app/frontend/index.html', agent: 'engineer', task: '实现页面' });
-    const cpId = await storage().createCheckpoint(id, '任务前:engineer:app/frontend/index.html', run.id);
+    const cpId = await storage().createCheckpoint(id, '任务前:engineer:app/frontend/index.html', null, await storage().latestRunId(id));
 
-    // 打点之后：覆写该文件 + 新增另一个文件（快照外）
+    // 打点之后：新任务 run + 覆写该文件 + 新增另一个文件（快照外）
+    const after = await storage().createAgentRun({ projectId: id, taskKey: 'engineer:app/frontend/index.html', agent: 'engineer', task: '实现页面' });
+    await storage().updateAgentRun(after.id, { status: 'done' });
     await storage().upsertFile({ projectId: id, path: 'app/frontend/index.html', content: '新内容', editor: 'engineer' });
     await storage().upsertFile({ projectId: id, path: 'app/extra.js', content: '后加的', editor: 'engineer' });
 
@@ -578,8 +583,10 @@ describe('POST /api/projects/[id]/checkpoints/[cpId]/restore', () => {
     expect(restored?.version).toBe(3); // v1→v2 覆写，恢复再推 v3
     expect((await storage().getFile(id, 'app/extra.js'))?.content).toBe('后加的'); // 快照外不动
 
+    // 方向断言：打点之后（被撤销）的 run 标 rolled_back；打点之前（仍成立）的 run 保持 done
     const runs = await storage().listAgentRuns(id);
-    expect(runs.find((item) => item.id === run.id)?.status).toBe('rolled_back');
+    expect(runs.find((item) => item.id === before.id)?.status).toBe('done');
+    expect(runs.find((item) => item.id === after.id)?.status).toBe('rolled_back');
 
     expect(messages.some((text) => text.includes('回滚'))).toBe(true);
   });
@@ -628,7 +635,7 @@ describe('GET /api/projects/[id]（现场恢复快照）', () => {
     await storage().setSoftLock(id, (await storage().getFile(id, 'app/a.js'))!.id, true);
     await storage().addMessage({ projectId: id, role: 'user', content: REQUIREMENT });
     await storage().createAgentRun({ projectId: id, taskKey: 'pm-prd', agent: 'pm', task: 'PRD' });
-    await storage().createCheckpoint(id, '任务前:pm-prd', null);
+    await storage().createCheckpoint(id, '任务前:pm-prd', null, await storage().latestRunId(id));
     // 正在流式生成中的文件：file_start + delta（尚未 file_end）
     projectEventBus.emit(id, { runId: null, event: 'file_start', agent: 'engineer', path: 'app/b.js' });
     projectEventBus.emit(id, { runId: null, event: 'delta', agent: 'engineer', path: 'app/b.js', content: '部分内容' });
