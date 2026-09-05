@@ -6,21 +6,21 @@
   },
   {
     "path": "docs/system_design.md",
-    "desc": "系统设计说明（含 mermaid 架构与接口契约）",
+    "desc": "系统设计说明（运行形态、接口契约、数据模型与 5 张图索引）",
     "depends": ["docs/prd.md"]
   },
   {
     "path": "app/backend/api.js",
-    "desc": "内存态后端 handle(method,path,body)，资源 /api/todos",
+    "desc": "内存态后端 handle(method,path,body)，资源 /api/todos，零依赖同构模块",
     "depends": ["docs/system_design.md"]
   },
   {
     "path": "app/frontend/index.html",
-    "desc": "待办单页（Tailwind CDN + fetch 调用 /api/todos）",
+    "desc": "待办单页（Tailwind CDN + fetch 调用 /api/todos，组件级 UI 规格）",
     "depends": ["app/backend/api.js"]
   },
   {
-    "path": "start_app.sh",
+    "path": "app/start_app.sh",
     "desc": "预览启动说明（浏览器内全栈，无需安装依赖）",
     "depends": ["app/frontend/index.html"]
   }
