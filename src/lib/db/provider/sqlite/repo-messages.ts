@@ -66,10 +66,19 @@ export function createMessagesRepo(db: SqliteDb): MessagesRepo {
       return rows.map(toMessage);
     },
 
-    /** 批量标记已送达；入参来自同一项目的 takePendingInterventions（归属已在上游校验），空列表直接返回 */
-    async markDelivered(messageIds: number[]): Promise<void> {
-      if (messageIds.length === 0) return; // inArray 空数组会生成非法 SQL
-      await db.update(messages).set({ deliveredAt: Date.now() }).where(inArray(messages.id, messageIds));
+    /**
+     * 批量标记已送达（空列表直接返回：inArray 空数组会生成非法 SQL）。
+     * projectId 可选作用域（规则 9：写入强制 project_id 过滤）——编排器/路由应始终传入，
+     * 即使批量里混入了他项目 id 也只会动本项目；缺省时按裸 ids 生效，仅限已先行校验归属的调用方
+     * （保留以兼容 brief 原签名）。
+     */
+    async markDelivered(messageIds: number[], projectId?: number): Promise<void> {
+      if (messageIds.length === 0) return;
+      const scope = inArray(messages.id, messageIds);
+      await db
+        .update(messages)
+        .set({ deliveredAt: Date.now() })
+        .where(projectId === undefined ? scope : and(scope, eq(messages.projectId, projectId)));
     },
   };
 }

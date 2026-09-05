@@ -63,7 +63,8 @@ export interface MessagesRepo {
   addMessage(input: AddMessageInput): Promise<Message>;
   listMessages(projectId: number): Promise<Message[]>;
   takePendingInterventions(projectId: number): Promise<Message[]>;
-  markDelivered(messageIds: number[]): Promise<void>;
+  /** projectId 提供时强制项目级作用域（规则 9）；缺省则按裸 ids 生效（调用方须已自行校验归属） */
+  markDelivered(messageIds: number[], projectId?: number): Promise<void>;
 }
 
 /**

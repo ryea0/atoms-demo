@@ -100,4 +100,24 @@ describe('repo projects 聚合与状态', () => {
     expect(msgs[0]?.meta).toEqual({ mentions: ['engineer'] });
     expect(msgs[0]?.deliveredAt).not.toBeNull();
   });
+
+  it('markDelivered 带 projectId 只标记本项目；缺省 projectId 仍按裸 ids 标记', async () => {
+    const s = newTestStorage();
+    const a = await s.createProject({ sessionId: 's', title: 'A', requirement: 'r', mode: 'fast' });
+    const b = await s.createProject({ sessionId: 's', title: 'B', requirement: 'r', mode: 'fast' });
+    const ia = await s.addMessage({ projectId: a.id, role: 'intervention', content: 'A 的干预' });
+    const ib = await s.addMessage({ projectId: b.id, role: 'intervention', content: 'B 的干预' });
+
+    // 作用域路径：即使批量里混入了他项目 id，也只能动本项目（规则 9）
+    await s.markDelivered([ia.id, ib.id], a.id);
+    expect((await s.takePendingInterventions(a.id)).length).toBe(0);
+    expect((await s.takePendingInterventions(b.id)).length).toBe(1); // B 不被误伤
+    const after = await s.listMessages(a.id);
+    expect(after[0]?.deliveredAt).not.toBeNull();
+    expect((await s.listMessages(b.id))[0]?.deliveredAt).toBeNull();
+
+    // 缺省 projectId：向后兼容的裸 ids 路径
+    await s.markDelivered([ib.id]);
+    expect((await s.takePendingInterventions(b.id)).length).toBe(0);
+  });
 });
