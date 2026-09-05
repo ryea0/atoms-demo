@@ -81,6 +81,33 @@ function pmUserPrompt(requirement: string): string {
   return [`【需求】${requirement.trim()}`, '', `【任务】按系统提示的输出契约产出 PRD（落库为 ${PRD_PATH}）。`].join('\n');
 }
 
+/** 开头围栏行（``` / ```markdown / ```md，容忍行内空白）；其余语言标记（```text 等）不认 */
+const FENCE_OPEN_PATTERN = /^```\s*(?:markdown|md)?\s*$/;
+/** 闭合围栏行（裸 ```） */
+const FENCE_CLOSE_PATTERN = /^```\s*$/;
+/** 任意围栏行（用于探测正文内部还有围栏——那种情况不剥，避免猜错配对） */
+const FENCE_ANY_PATTERN = /^```/;
+
+/**
+ * 剥掉一对「开头+结尾」的可选代码围栏（`.md` 无语法校验，围栏一旦落库就静默进文档）。
+ * 只在输出以围栏行开头、且最后一行非空内容恰为围栏时才剥（首尾空白行不影响判断）；
+ * 只有开头围栏、或正文内部还有围栏行时一律原样保留——不猜配对，宁可可见也不误删。
+ */
+function stripCodeFence(raw: string): string {
+  const text = raw.trim();
+  const lines = text.split('\n');
+  if (!FENCE_OPEN_PATTERN.test((lines[0] ?? '').trim())) return text;
+
+  // 末尾回退过空行，找最后一个非空行作为候选闭合围栏
+  let last = lines.length - 1;
+  while (last > 0 && (lines[last] ?? '').trim() === '') last -= 1;
+  if (last < 1 || !FENCE_CLOSE_PATTERN.test((lines[last] ?? '').trim())) return text;
+  const body = lines.slice(1, last);
+  if (body.some((line) => FENCE_ANY_PATTERN.test(line))) return text;
+
+  return body.join('\n').trim();
+}
+
 /** 从 PRD 正文拼降级摘要（交接物，规则 7）：取标题 + 功能/验收条数 */
 function summarizePrd(content: string, fast: boolean, warnings: string[]): string {
   const heading = content.split('\n').find((line) => line.startsWith('#'))?.replace(/^#+\s*/, '') ?? 'PRD';
@@ -122,7 +149,9 @@ export async function runPm(ctx: PmContext): Promise<PmResult> {
       signal: ctx.signal,
     });
 
-    const content = result.content.trim();
+    // 真实模型常无视「不要围栏」的契约把 PRD 包进 ```markdown 围栏；.md 无语法校验，
+    // 围栏一旦落库就静默进文档正文——落库前剥一对成对的围栏（不成对不猜，见 stripCodeFence）
+    const content = stripCodeFence(result.content);
     if (content === '') throw new Error(`PM 模型空输出，无法落库 ${PRD_PATH}（由编排器决定回退）`);
 
     const warnings = validationWarnings(PRD_PATH, validateFile(PRD_PATH, content));

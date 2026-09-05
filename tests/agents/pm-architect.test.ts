@@ -164,6 +164,32 @@ describe('runPm（mock）', () => {
     expect(system).toContain('产品经理');
   });
 
+  it('模型输出带 markdown 围栏 → 落库前剥掉一对围栏（不进文档正文）', async () => {
+    const { storage, projectId } = await newProject();
+    const fenced = ['', '```markdown', '# PRD：待办事项应用', '', '## 功能清单', '', '- F1 新增待办', '```', '', ''].join('\n');
+    await runPm({ storage, projectId, requirement: '做一个待办清单', fast: false, provider: new FakeProvider(fenced) });
+
+    const row = await storage.getFile(projectId, PRD_PATH);
+    expect(row?.content.startsWith('```')).toBe(false);
+    expect(row?.content.endsWith('```')).toBe(false);
+    expect(row?.content).not.toContain('```');
+    expect(row?.content).toContain('# PRD：待办事项应用');
+  });
+
+  it('无围栏输出 → 原样落库（仅 trim），mock 产出不受影响', async () => {
+    const { storage, projectId } = await newProject();
+    const plain = '# PRD：待办事项应用\n\n## 功能清单\n- F1 新增待办';
+    await runPm({ storage, projectId, requirement: '做一个待办清单', fast: false, provider: new FakeProvider(plain) });
+    expect((await storage.getFile(projectId, PRD_PATH))?.content).toBe(plain);
+  });
+
+  it('只有开头围栏（不成对）→ 原样保留不猜（围栏留在正文，宁可可见也不误删）', async () => {
+    const { storage, projectId } = await newProject();
+    const malformed = ['```markdown', '# PRD：待办事项应用', '', '- F1 新增待办'].join('\n');
+    await runPm({ storage, projectId, requirement: '做一个待办清单', fast: false, provider: new FakeProvider(malformed) });
+    expect((await storage.getFile(projectId, PRD_PATH))?.content).toBe(malformed);
+  });
+
   it('角色标记契约：PM prompt 命中 mock 的 pm 场景（不被样例正文带偏）', () => {
     const scene = detectScene({
       model: 'mock-model',
@@ -325,10 +351,10 @@ describe('runArchitect（mock）', () => {
     expect(run.summary ?? '').toContain('缺失');
   });
 
-  it('分段路径过沙箱：`../escape.md` 段被拒（不落库）且记录 warning，其余段照常', async () => {
+  it('分段路径过沙箱：`docs/../escape.md` 段被拒（不落库）且记录 warning，其余段照常', async () => {
     const { storage, projectId } = await newProject();
     const evil = [
-      '===== ../escape.md =====',
+      '===== docs/../escape.md =====',
       '# 越权内容',
       `===== docs/file_tree.json =====`,
       JSON.stringify(
@@ -344,10 +370,23 @@ describe('runArchitect（mock）', () => {
 
     const result = await runArchitect({ storage, projectId, provider: new FakeProvider(evil) });
     expect(result.files).toEqual(['docs/file_tree.json']);
-    expect(await storage.getFile(projectId, '../escape.md')).toBeNull();
+    expect(await storage.getFile(projectId, 'escape.md')).toBeNull();
+    expect(await storage.getFile(projectId, 'docs/../escape.md')).toBeNull();
     expect(result.fileTree).toHaveLength(2);
     const run = await firstRun(storage, projectId);
-    expect(run.summary ?? '').toContain('../escape.md');
+    expect(run.summary ?? '').toContain('docs/../escape.md');
+  });
+
+  it('点开头的伪段头（../x.md）不再是段头：不落库，且以可追溯片段进告警', async () => {
+    const { storage, projectId } = await newProject();
+    const output = ['===== ../escape.md =====', '# 越权内容', ''].join('\n');
+    const result = await runArchitect({ storage, projectId, provider: new FakeProvider(output) });
+
+    expect(result.files).toEqual([]);
+    expect(await storage.getFile(projectId, 'escape.md')).toBeNull();
+    const summary = (await firstRun(storage, projectId)).summary ?? '';
+    expect(summary).toContain('未归属任何交付物');
+    expect(summary).toContain('../escape.md');
   });
 
   it('file_tree.json 段非法 JSON → fileTree 为空数组 + warning，仍不抛错', async () => {
@@ -366,5 +405,33 @@ describe('runArchitect（mock）', () => {
     expect(result.files).toEqual([]);
     expect(await storage.getFile(projectId, 'docs/random.md')).toBeNull();
     expect((await firstRun(storage, projectId)).summary ?? '').toContain('docs/random.md');
+  });
+
+  it('分隔头误报防护：裸等号线与中文标题行不切分，正文归属上一段（不丢内容、无误报警告）', async () => {
+    const { storage, projectId } = await newProject();
+    const output = [
+      '===== docs/file_tree.md =====',
+      '# 文件树（人读版）',
+      '',
+      '=======',
+      '分隔说明（真实模型常见的裸等号线，旧实现会被当成路径 =）',
+      '',
+      '===== 小结 =====',
+      '本节是正文小节，不是文件分段。',
+      '',
+      '===== docs/file_tree.json =====',
+      JSON.stringify([{ path: 'app/frontend/index.html', desc: '待办单页', depends: ['app/backend/api.js'] }], null, 2),
+      '',
+    ].join('\n');
+
+    const result = await runArchitect({ storage, projectId, provider: new FakeProvider(output) });
+    expect(result.files).toEqual(['docs/file_tree.md', 'docs/file_tree.json']);
+
+    const md = await storage.getFile(projectId, 'docs/file_tree.md');
+    expect(md?.content).toContain('=======');
+    expect(md?.content).toContain('===== 小结 =====');
+    expect(md?.content).toContain('本节是正文小节，不是文件分段。');
+    // 两行都留在上一段正文里 → 既没有内容被丢，也没有“契约外路径被拒”的误导告警
+    expect((await firstRun(storage, projectId)).summary ?? '').not.toContain('契约外');
   });
 });

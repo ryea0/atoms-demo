@@ -81,8 +81,14 @@ export interface ArchitectResult {
 /* 输出切分                                                            */
 /* ------------------------------------------------------------------ */
 
-/** 分段头：一行内 `===== 路径 =====`（等号 ≥3 个，容忍首尾空白） */
-const SEGMENT_HEADER_PATTERN = /^={3,}\s*(.+?)\s*={3,}$/;
+/**
+ * 分段头：一行内 `===== 路径 =====`（等号 ≥3 个，容忍首尾空白）。
+ * 捕获组收紧为「路径形状」（以字母/数字/下划线开头，含点+扩展名）：
+ * 裸等号线（`=======`，旧实现会捕获出路径 `=`）与散文式标题（`===== 小结 =====`）
+ * 都不算分段头，而是留在上一段正文里——否则其后的内容会被错误归属到
+ * 契约外路径并被整段丢弃（且只留下一条难以追溯的告警）。
+ */
+const SEGMENT_HEADER_PATTERN = /^={3,}\s*([\w][\w./-]*\.[\w-]+)\s*={3,}$/;
 
 /** 一个待落库分段（content 保留原始换行） */
 interface RawSegment {
@@ -94,6 +100,12 @@ interface SplitResult {
   segments: RawSegment[];
   /** 首个分段头之前、不带路径标记的正文（无法归属到文件，调用方记 warning） */
   preamble: string;
+}
+
+/** 告警里附带的原文片段（压成单行并截断：可追溯，又不撑爆 run.summary） */
+function snippet(text: string, max = 80): string {
+  const singleLine = text.replace(/\s+/g, ' ').trim();
+  return singleLine.length <= max ? singleLine : `${singleLine.slice(0, max)}…`;
 }
 
 /** 按 `===== 路径 =====` 行切分模型输出（确定性解析，不容错改写） */
@@ -253,7 +265,9 @@ export async function runArchitect(ctx: ArchitectContext): Promise<ArchitectResu
 
     const warnings: string[] = [];
     const { segments, preamble } = splitSegments(result.content);
-    if (preamble !== '') warnings.push(`输出开头有未带路径标记的正文，已忽略（${preamble.length} 字符）`);
+    if (preamble !== '') {
+      warnings.push(`输出开头有未归属任何交付物的正文（未落库，原文片段：${snippet(preamble)}）`);
+    }
 
     const expected = new Set<string>(ARCHITECT_DOC_PATHS);
     const files: string[] = [];
