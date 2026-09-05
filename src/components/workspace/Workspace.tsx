@@ -11,6 +11,8 @@
  * <lg 折叠为单栏 + 底部 tab 切换——显隐用纯 CSS 完成，三栏只挂载一次（不重复订阅 store）。
  */
 import { useCallback, useMemo, useState } from 'react';
+import { ChatPanel } from '@/components/chat/ChatPanel';
+import { EditSwitch } from '@/components/common/EditSwitch';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Toaster } from '@/components/ui/sonner';
 import { useWorkspace } from '@/lib/client/store';
@@ -61,21 +63,20 @@ export function Workspace({ projectId }: { projectId: number }) {
         connected={state.connected}
         view={view}
         onViewChange={handleViewChange}
+        /* 人工编辑能力开关（DESIGN §3.9，T23 交付）挂顶栏预留槽位；<sm 收起防顶栏溢出（设置页仍可切） */
+        actions={<EditSwitch className="hidden items-center gap-2 select-none text-sm text-muted-foreground sm:flex" />}
       />
 
       {/* 三栏主体：桌面并排，窄屏由显隐类折叠成单栏 */}
       <div className="flex min-h-0 flex-1">
-        {/* 聊天区 ~30%：T19 在此挂 ChatPanel */}
+        {/* 聊天区 ~30%：消息流 / 工具卡 / 任务时间线 / 干预（T19） */}
         <PaneShell
           label="聊天区"
           title="聊天"
           active={pane === 'chat'}
           className="flex-1 border-r border-border lg:flex-none lg:w-[30%]"
         >
-          <PaneEmpty
-            hint="团队消息与任务时间线会在这里实时展示"
-            sub="生成开始后，领导分派与成员产出都会出现在这里"
-          />
+          <ChatPanel state={state} />
         </PaneShell>
 
         {/* 文件树 ~20%：T20 在此挂 FileTree */}

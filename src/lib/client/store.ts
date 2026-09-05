@@ -25,6 +25,7 @@ import type {
   FileEditor,
   LlmUsageRow,
   Message,
+  MessageMeta,
   Project,
 } from '@/lib/db/provider/types';
 // type-only import：编译期完全擦除，不把服务端模块带进客户端 bundle
@@ -132,6 +133,30 @@ function lastIndexOf<T>(items: readonly T[], predicate: (item: T) => boolean): n
 
 function isAgentRole(value: unknown): value is AgentRole {
   return typeof value === 'string' && value in roleRegistry;
+}
+
+/**
+ * 消息 meta 组装（T19 卡片还原的数据源）：mentions 之外保留卡片语义——
+ * - kind=softlock/restore、path=关联文件（领导裁决/回滚通知卡）
+ * - intervention_injected 的 targetTask（T23 保证指向真实运行的任务，格式 `engineer:{path}`）
+ *   折算成 path，聊天区「已注入 {文件}」卡片据此显示注入边界对应的文件
+ * 事件里没有这些语义时返回 null（不写空 meta）。
+ */
+function messageMetaOf(event: StreamEvent, mentions: AgentRole[]): MessageMeta | null {
+  const meta: MessageMeta = {};
+  if (typeof event.meta?.kind === 'string' && event.meta.kind !== '') meta.kind = event.meta.kind;
+  if (typeof event.meta?.path === 'string' && event.meta.path !== '') {
+    meta.path = event.meta.path;
+  } else if (event.event === 'intervention_injected') {
+    const target = event.meta?.targetTask;
+    if (typeof target === 'string') {
+      const separator = target.indexOf(':');
+      const candidate = separator > 0 ? target.slice(separator + 1) : '';
+      if (candidate !== '') meta.path = candidate;
+    }
+  }
+  if (mentions.length > 0) meta.mentions = mentions;
+  return Object.keys(meta).length === 0 ? null : meta;
 }
 
 /** 在流路径列表（files Map 插入序 = 展示序） */
@@ -392,7 +417,7 @@ export class WorkspaceStore {
       projectId: event.projectId,
       role,
       content: event.content ?? '',
-      meta: mentions.length > 0 ? { mentions } : null,
+      meta: messageMetaOf(event, mentions),
       deliveredAt: now,
       createdAt: now,
     };

@@ -56,3 +56,29 @@ export function statusBadgeVariant(status: ProjectStatus): 'default' | 'secondar
 export function modeLabel(mode: 'fast' | 'full'): string {
   return mode === 'fast' ? '快速' : '完整';
 }
+
+/* ------------------------------------------------------------------ */
+/* 运行态派生                                                           */
+/* ------------------------------------------------------------------ */
+
+/** 生成进行中的判定信号（从 WorkspaceState 摘出的最小字段集，便于纯函数测试） */
+export interface GenerationSignal {
+  /** done/stopped 之后为真（store 口径；error 不算收尾） */
+  finished: boolean;
+  /** 项目状态（快照未就绪为 null） */
+  projectStatus: ProjectStatus | null;
+  /** 状态为 running 的任务数 */
+  runningRunCount: number;
+  /** 正在流式生成的文件数 */
+  livePathCount: number;
+}
+
+/**
+ * 生成是否进行中（T19 停止钮 / 干预黄条 / 裁决按钮可用性的单一事实来源）：
+ * 已收尾一律为否；未收尾时任一信号为真即视为进行中（新项目 draft 未开跑也是否）。
+ */
+export function isGenerationRunning(signal: GenerationSignal): boolean {
+  if (signal.finished) return false;
+  if (signal.runningRunCount > 0 || signal.livePathCount > 0) return true;
+  return signal.projectStatus === 'running';
+}

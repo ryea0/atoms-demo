@@ -9,7 +9,7 @@
  * 另存平台自身的会话级本地偏好（公告条关闭标记；注意：localStorage 禁令针对生成的应用，
  * 平台页面不受限，但仍用 sessionStorage 保持「关一次、本次会话不再打扰」的轻语义）。
  */
-import type { Project, ProjectListItem } from '@/lib/db/provider/types';
+import type { AgentRole, Project, ProjectListItem } from '@/lib/db/provider/types';
 import type { WorkspaceSnapshot } from '@/lib/client/store';
 
 /** 结构化 API 错误（message 来自服务端 code/message，可直接展示给用户） */
@@ -98,6 +98,31 @@ export function fetchWorkspaceSnapshot(projectId: number, signal?: AbortSignal):
 /** 导出 zip：直接交给浏览器下载（Route Handler 返回二进制，不走 JSON 封装） */
 export function openProjectExport(projectId: number): void {
   window.open(`/api/projects/${projectId}/export`, '_blank');
+}
+
+/** POST /api/projects/[id]/messages 响应：delivered 区分「新一轮生成」与「运行中干预入队」 */
+export interface SendMessageResult {
+  delivered: 'round' | 'intervention';
+  messageId?: number;
+}
+
+/**
+ * 追加消息（T19 聊天输入）：空闲 = 作为新一轮生成（fire-and-forget）；
+ * 编排器在跑 = role=intervention 入队（delivered_at 打戳前即待注入，DESIGN §3.5）。
+ */
+export function sendProjectMessage(
+  projectId: number,
+  body: { content: string; mentions?: AgentRole[] },
+): Promise<SendMessageResult> {
+  return requestJson<SendMessageResult>(`/api/projects/${projectId}/messages`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/** 停止当前生成（空闲项目为幂等 no-op；stopped 事件与状态收口由运行中轮次负责） */
+export function stopProjectGeneration(projectId: number): Promise<void> {
+  return requestJson<void>(`/api/projects/${projectId}/stop`, { method: 'POST' });
 }
 
 /* ------------------------------------------------------------------ */
