@@ -95,6 +95,58 @@ export function fetchWorkspaceSnapshot(projectId: number, signal?: AbortSignal):
   return requestJson<WorkspaceSnapshot>(`/api/projects/${projectId}`, { signal });
 }
 
+/* ------------------------------------------------------------------ */
+/* 人工编辑（DESIGN §3.9 人机共编：同一写 API + CAS 乐观锁 + 声明式软锁）   */
+/* ------------------------------------------------------------------ */
+
+/** 人工保存结果：ok=新版本号；冲突时带回服务端当前内容（并排 diff / 放弃草稿用） */
+export type SaveHumanFileResult = { ok: true; version: number } | { ok: false; conflict: true; current: string };
+
+/**
+ * PATCH /api/projects/[id]/files/[fid]：人工编辑保存。
+ * 409 不抛错——它是 CAS 冲突的正常分支，转成 {ok:false,conflict,current} 交冲突对话框；
+ * 其余失败（400/404/500）抛 ApiError，由调用方提示用户。
+ */
+export async function saveHumanFile(
+  projectId: number,
+  fileId: number,
+  content: string,
+  baseVersion: number,
+): Promise<SaveHumanFileResult> {
+  const response = await fetch(`/api/projects/${projectId}/files/${fileId}`, {
+    method: 'PATCH',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content, baseVersion }),
+  });
+  if (response.ok) {
+    const body = (await parseBody(response)) as { version?: unknown } | null;
+    return { ok: true, version: typeof body?.version === 'number' ? body.version : baseVersion + 1 };
+  }
+  if (response.status === 409) {
+    const body = (await parseBody(response)) as { current?: unknown } | null;
+    return { ok: false, conflict: true, current: typeof body?.current === 'string' ? body.current : '' };
+  }
+  const payload = (await parseBody(response)) as { code?: unknown; message?: unknown } | null;
+  const code = typeof payload?.code === 'string' ? payload.code : 'http_error';
+  const message =
+    typeof payload?.message === 'string' && payload.message !== ''
+      ? payload.message
+      : `请求失败（HTTP ${response.status}）`;
+  throw new ApiError(response.status, code, message);
+}
+
+/**
+ * PUT /api/projects/[id]/files/[fid]/lock：声明/释放人工软锁（DESIGN §3.9 预防层）。
+ * 进入编辑态置 on=true（agent 文件边界据此挂起并请求裁决），保存/离开置 on=false。
+ */
+export async function setFileSoftLock(projectId: number, fileId: number, on: boolean): Promise<void> {
+  await requestJson(`/api/projects/${projectId}/files/${fileId}/lock`, {
+    method: 'PUT',
+    body: JSON.stringify({ on }),
+  });
+}
+
 /** 导出 zip：直接交给浏览器下载（Route Handler 返回二进制，不走 JSON 封装） */
 export function openProjectExport(projectId: number): void {
   window.open(`/api/projects/${projectId}/export`, '_blank');

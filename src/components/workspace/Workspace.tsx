@@ -19,6 +19,7 @@ import { FRONTEND_INDEX_PATH, PreviewPane } from '@/components/preview/PreviewPa
 import { useWorkspace } from '@/lib/client/store';
 import type { AgentRole } from '@/lib/db/provider/types';
 import { FileTree } from '@/components/tree/FileTree';
+import { ViewerTabs } from '@/components/viewer/ViewerTabs';
 import { PaneEmpty, PaneShell } from './PaneShell';
 import { TopBar, type WorkspaceView } from './TopBar';
 
@@ -99,10 +100,7 @@ export function Workspace({ projectId }: { projectId: number }) {
           {view === 'preview' ? (
             <PreviewPane projectId={projectId} hasFrontend={state.files.has(FRONTEND_INDEX_PATH)} />
           ) : (
-            <PaneEmpty
-              hint="在文件树中选择文件，在这里查看与编辑"
-              sub="支持 Markdown 渲染、代码高亮与流程图"
-            />
+            <ViewerTabs />
           )}
         </PaneShell>
       </div>

@@ -34,6 +34,11 @@ import { fetchWorkspaceSnapshot } from '@/lib/client/session';
 
 /** 单个文件的客户端态（快照行 / 在流占位共用） */
 export interface WorkspaceFile {
+  /**
+   * files 表行 id（查看器编辑保存 PATCH /files/[fid]、软锁声明都按它定位文件）。
+   * SSE 事件不带 id，故在流期间为 null；快照 hydrate 补齐。
+   */
+  id: number | null;
   content: string;
   version: number;
   lastEditor: FileEditor;
@@ -99,7 +104,7 @@ function filesEquals(a: ReadonlyMap<string, WorkspaceFile>, b: ReadonlyMap<strin
   for (const [path, fa] of a) {
     const fb = b.get(path);
     if (fb === undefined) return false;
-    if (fa.content !== fb.content || fa.version !== fb.version) return false;
+    if (fa.id !== fb.id || fa.content !== fb.content || fa.version !== fb.version) return false;
     if (fa.lastEditor !== fb.lastEditor || fa.streaming !== fb.streaming) return false;
   }
   return true;
@@ -278,10 +283,29 @@ export class WorkspaceStore {
     if (path === undefined) return;
     this.patch(
       this.upsertFile(path, (prev) => ({
+        id: prev?.id ?? null,
         content: contentOf(prev),
         version: prev?.version ?? 0,
         lastEditor: event.agent ?? prev?.lastEditor ?? 'engineer',
         streaming: true,
+      })),
+    );
+  }
+
+  /**
+   * 人工保存就地定版（PATCH 成功后调用）。
+   * 人工写走 PATCH /files/[fid]，**不发 SSE 事件**——store 若不推进，查看器会回显保存前
+   * 旧内容，且同文件再编辑拿过期 version 必然 409（把用户自己刚存的内容谎报成「工程师已更新」）。
+   * lastEditor 记 human，与 files 表口径一致；agent 之后照常经 file_end 覆盖（后写胜出）。
+   */
+  applyHumanSave(path: string, patch: { content: string; version: number }): void {
+    this.patch(
+      this.upsertFile(path, (prev) => ({
+        id: prev?.id ?? null,
+        content: patch.content,
+        version: patch.version,
+        lastEditor: 'human',
+        streaming: false,
       })),
     );
   }
@@ -292,6 +316,7 @@ export class WorkspaceStore {
     const metaVersion = event.meta?.version;
     this.patch(
       this.upsertFile(path, (prev) => ({
+        id: prev?.id ?? null,
         content: prev?.content ?? '',
         // 服务端在 file_end 带 meta.version（落库后的真实版本）；缺失则本地 +1 兜底
         version: typeof metaVersion === 'number' ? metaVersion : (prev?.version ?? 0) + 1,
@@ -309,6 +334,7 @@ export class WorkspaceStore {
       return {
         ...patch,
         ...this.upsertFile(path, (prev) => ({
+          id: prev?.id ?? null,
           content: prev?.content ?? '',
           version: prev?.version ?? 0,
           lastEditor: prev?.lastEditor ?? 'engineer',
@@ -475,6 +501,7 @@ export class WorkspaceStore {
     const files = new Map<string, WorkspaceFile>();
     for (const row of snapshot.files) {
       files.set(row.path, {
+        id: row.id,
         content: row.content,
         version: row.version,
         lastEditor: row.lastEditor,
@@ -485,6 +512,7 @@ export class WorkspaceStore {
     for (const item of snapshot.streamingFiles) {
       const existing = files.get(item.path);
       files.set(item.path, {
+        id: existing?.id ?? null,
         content: item.content,
         version: existing?.version ?? 0,
         lastEditor: existing?.lastEditor ?? 'engineer',
@@ -593,7 +621,13 @@ export function useWorkspace(projectId: number): WorkspaceState {
 }
 
 /** 文件尚不存在时的共享空占位（引用恒定，避免 getSnapshot 每次返回新对象） */
-const MISSING_FILE: WorkspaceFile = { content: '', version: 0, lastEditor: 'engineer', streaming: false };
+const MISSING_FILE: WorkspaceFile = {
+  id: null,
+  content: '',
+  version: 0,
+  lastEditor: 'engineer',
+  streaming: false,
+};
 
 /**
  * 单文件订阅（细粒度选择器，T19 打字机/查看器消费）：只在该 path 的内容变化时才重渲染。
