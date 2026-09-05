@@ -7,6 +7,9 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  /* 产品强调色与面板底色（.claude/rules/04 设计基线） */
+  --color-brand: var(--brand);
+  --color-panel: var(--panel);
   --font-sans: var(--font-sans);
   --font-mono: var(--font-mono);
   --font-heading: var(--font-sans);
@@ -51,6 +54,9 @@
 :root {
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
+  /* 蓝 #3B82F6：选中态/链接/M 角标；#F7F7F8：侧栏与面板分层底色 */
+  --brand: #3b82f6;
+  --panel: #f7f7f8;
   --card: oklch(1 0 0);
   --card-foreground: oklch(0.145 0 0);
   --popover: oklch(1 0 0);
