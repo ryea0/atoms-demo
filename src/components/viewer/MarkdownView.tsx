@@ -8,11 +8,12 @@
  * - 表格/标题/列表用产品 token 排版；流式期间（streaming）按 120ms 合批重解析，
  *   避免逐 delta 重建整棵 markdown 树（.claude/rules/03）
  *
- * 已知限制：未引入 remark-gfm，管道表格按普通段落展示（新增依赖需走统一评审，见任务报告）。
+ * 已知限制：无语言围栏的 ``` 块按行内 code 渲染（react-markdown 的 code 渲染器只认 language-* 前缀）。
  */
 import { useEffect, useState } from 'react';
 import Markdown from 'react-markdown';
 import type { Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { highlightToHtml, HIGHLIGHT_DEBOUNCE_MS, resolveLanguage, type HighlightLanguage } from '@/lib/client/highlight';
 import { useDebouncedValue } from '@/lib/client/use-debounced-value';
 
@@ -111,7 +112,10 @@ export function MarkdownView({ content, streaming = false }: MarkdownViewProps):
 
   return (
     <div className={TYPOGRAPHY_CLASSES}>
-      <Markdown components={MARKDOWN_COMPONENTS}>{shown}</Markdown>
+      {/* remark-gfm：管道表格/删除线/任务列表（PM/架构师产物常用）；平台自身依赖，不进生成物 */}
+      <Markdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
+        {shown}
+      </Markdown>
     </div>
   );
 }

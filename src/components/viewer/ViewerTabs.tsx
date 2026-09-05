@@ -20,7 +20,7 @@ import { useParams } from 'next/navigation';
 import { toast } from 'sonner';
 import { X } from 'lucide-react';
 import { roleRegistry } from '@/lib/agents/registry';
-import { useWorkspaceFile } from '@/lib/client/store';
+import { createWorkspaceStore, useWorkspaceFile } from '@/lib/client/store';
 import { saveHumanFile, setFileSoftLock } from '@/lib/client/session';
 import { Button } from '@/components/ui/button';
 import { ConflictDialog } from '@/components/viewer/ConflictDialog';
@@ -269,6 +269,8 @@ function releaseLock(projectId: number, fileId: number): void {
 function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
   const file = useWorkspaceFile(projectId, path);
   const kind = viewerKindForPath(path);
+  // 与 useWorkspaceFile 同一 per-project 单例：人工保存成功后需要就地推进 store
+  const store = createWorkspaceStore(projectId);
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
@@ -308,6 +310,8 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
       try {
         const result = await saveHumanFile(projectId, currentId, content, current.version);
         if (result.ok) {
+          // 人工写不发 SSE：store 必须就地推进，否则回显旧内容、二次编辑用过期版本必 409
+          store.applyHumanSave(path, { content, version: result.version });
           leaveEditing();
           return;
         }
@@ -320,7 +324,7 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
         setSaving(false);
       }
     },
-    [projectId, leaveEditing],
+    [projectId, leaveEditing, store, path],
   );
 
   const handleKeepMine = (): void => {
@@ -329,25 +333,21 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
   };
 
   const body = useMemo(() => {
-    if (kind === 'markdown') {
-      return (
-        <div className="min-h-0 flex-1 overflow-auto">
-          <div className="px-4 py-3">
-            <LazyMarkdownView content={file.content} streaming={file.streaming} />
-          </div>
-        </div>
+    // 三类视图统一走打字机滚动——brief「流式文件自动滚动」不限于代码文件，
+    // PM 流式写 PRD / 架构师流式画图同样要跟随到底部。
+    // 取舍：markdown/mermaid 的重解析/重渲染开销由各自 120ms 合批压制（见视图内注释），
+    // 跟随滚动本身只是 ref 写 scrollTop，不引入额外渲染。
+    const view =
+      kind === 'markdown' ? (
+        <LazyMarkdownView content={file.content} streaming={file.streaming} />
+      ) : kind === 'mermaid' ? (
+        <LazyMermaidView content={file.content} streaming={file.streaming} />
+      ) : (
+        <LazyCodeView content={file.content} path={path} streaming={file.streaming} />
       );
-    }
-    if (kind === 'mermaid') {
-      return (
-        <div className="min-h-0 flex-1 overflow-auto">
-          <LazyMermaidView content={file.content} streaming={file.streaming} />
-        </div>
-      );
-    }
     return (
       <TypewriterScroller streaming={file.streaming} scrollKey={file.content.length}>
-        <LazyCodeView content={file.content} path={path} streaming={file.streaming} />
+        {view}
       </TypewriterScroller>
     );
   }, [kind, file.content, file.streaming, path]);

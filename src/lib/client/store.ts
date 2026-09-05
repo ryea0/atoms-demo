@@ -267,6 +267,24 @@ export class WorkspaceStore {
     );
   }
 
+  /**
+   * 人工保存就地定版（PATCH 成功后调用）。
+   * 人工写走 PATCH /files/[fid]，**不发 SSE 事件**——store 若不推进，查看器会回显保存前
+   * 旧内容，且同文件再编辑拿过期 version 必然 409（把用户自己刚存的内容谎报成「工程师已更新」）。
+   * lastEditor 记 human，与 files 表口径一致；agent 之后照常经 file_end 覆盖（后写胜出）。
+   */
+  applyHumanSave(path: string, patch: { content: string; version: number }): void {
+    this.patch(
+      this.upsertFile(path, (prev) => ({
+        id: prev?.id ?? null,
+        content: patch.content,
+        version: patch.version,
+        lastEditor: 'human',
+        streaming: false,
+      })),
+    );
+  }
+
   private applyFileEnd(event: StreamEvent): void {
     const path = event.path;
     if (path === undefined) return;

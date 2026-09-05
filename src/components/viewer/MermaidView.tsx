@@ -75,7 +75,8 @@ export function MermaidView({ content, streaming = false }: MermaidViewProps): R
   }, [shown]);
 
   return (
-    <div className="flex h-full flex-col gap-2 px-4 py-3">
+    // 内边距由外层 TypewriterScroller 统一提供（三类视图共用同一滚动容器）
+    <div className="flex h-full flex-col gap-2">
       {state.failed ? (
         <p
           role="alert"
