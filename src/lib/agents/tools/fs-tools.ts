@@ -52,8 +52,12 @@ const GREP_MAX_LINES = 50;
 /** grep 单行展示上限（压缩/超长行也占上下文预算） */
 const GREP_LINE_CHARS = 240;
 
-/** zod 校验失败 → 一行可读错误（字段路径 + 原因），直接回喂模型 */
-function formatIssues(error:z.ZodError):string {
+/**
+ * zod 校验失败 → 一行可读错误（字段路径 + 原因），直接回喂模型。
+ * 工具层（defineTool 预检）与 AgentRunner（Task 8 调用前预检）共用同一份格式，
+ * 保证模型在两条路径上看到一致的错误说明；"参数校验失败：" 前缀由调用方拼接。
+ */
+export function formatZodIssues(error:z.ZodError):string {
   return error.issues
     .map((issue) => `${issue.path.length > 0 ? issue.path.join('.') : '(root)'}: ${issue.message}`)
     .join('; ');
@@ -83,7 +87,7 @@ function defineTool<S extends z.ZodType>(def:{
     parameters:toParameters(def.schema),
     async execute(args:unknown, ctx:ToolContext):Promise<{ok:boolean;output:string}> {
       const parsed = def.schema.safeParse(args);
-      if (!parsed.success) return { ok:false, output:`参数校验失败：${formatIssues(parsed.error)}` };
+      if (!parsed.success) return { ok:false, output:`参数校验失败：${formatZodIssues(parsed.error)}` };
       return def.execute(parsed.data, ctx);
     },
   };
