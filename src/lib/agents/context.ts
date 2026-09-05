@@ -18,8 +18,8 @@ export const MAX_CONTEXT_CHARS = 24000;
 /** file_tree 默认路径（架构师产出的机器可读依赖声明索引） */
 export const DEFAULT_FILE_TREE_PATH = 'docs/file_tree.json';
 
-/** 裁剪第 ② 级：MEMORY 详情保留长度 */
-const MEMORY_KEEP_CHARS = 2000;
+/** 裁剪第 ②/④ 级：MEMORY / PREFERENCES 详情保留长度 */
+const DOC_KEEP_CHARS = 2000;
 
 /** 硬截提示（第 ④ 级追加，让模型知道上下文不完整、避免编造缺失内容） */
 const TRIMMED_NOTICE = '（上下文已裁剪）';
@@ -226,8 +226,14 @@ function dropNonDependencyBodies(a: Assembled): Assembled {
 
 /** 第 ② 级：MEMORY 详情保留首 2000 字符 */
 function truncateMemory(a: Assembled): Assembled {
-  if (a.memoryDoc === null || a.memoryDoc.length <= MEMORY_KEEP_CHARS) return a;
-  return { ...a, memoryDoc: `${a.memoryDoc.slice(0, MEMORY_KEEP_CHARS)}\n…（长期记忆已按预算截断）` };
+  if (a.memoryDoc === null || a.memoryDoc.length <= DOC_KEEP_CHARS) return a;
+  return { ...a, memoryDoc: `${a.memoryDoc.slice(0, DOC_KEEP_CHARS)}\n…（长期记忆已按预算截断）` };
+}
+
+/** 第 ④ 级（系统侧）：项目偏好详情保留首 2000 字符——system 侧内容同样受预算约束（与 MEMORY 同口径） */
+function truncatePreferences(a: Assembled): Assembled {
+  if (a.preferencesDoc === null || a.preferencesDoc.length <= DOC_KEEP_CHARS) return a;
+  return { ...a, preferencesDoc: `${a.preferencesDoc.slice(0, DOC_KEEP_CHARS)}\n…（项目偏好已按预算截断）` };
 }
 
 /** system_design 类文件识别（路径含 system_design / system-design） */
@@ -318,8 +324,8 @@ function trimSystemDesignSections(a: Assembled, keywords: string[]): Assembled {
 }
 
 /**
- * 第 ④ 级（硬截）：a) 依赖正文按保护级从低到高整篇丢弃——先丢树声明依赖，后丢 extraFiles 目标；
- * b) 仍超 → 截最后一个保留文件的正文尾部；c) 仍超 → 由 buildOutput 对 user 整体硬截。
+ * 第 ④ 级（user 侧硬截）：依赖正文按保护级从低到高整篇丢弃——先丢树声明依赖，后丢 extraFiles 目标。
+ * dropSequence 覆盖全部 depFiles，循环结束后若仍超预算（无正文可丢），由 buildOutput 对 user 整体硬截。
  */
 function hardTrim(a: Assembled): { assembled: Assembled; trimmed: boolean } {
   const targets = new Set(a.targetPaths);
@@ -329,26 +335,13 @@ function hardTrim(a: Assembled): { assembled: Assembled; trimmed: boolean } {
     ...a.depFiles.filter((file) => targets.has(file.path)).reverse(),
   ];
 
-  let remaining = a.depFiles;
   let current = a;
   let trimmed = false;
 
   for (const victim of dropSequence) {
     if (totalLength(current) <= MAX_CONTEXT_CHARS) break;
-    remaining = remaining.filter((file) => file.path !== victim.path);
-    current = { ...current, depFiles: remaining };
+    current = { ...current, depFiles: current.depFiles.filter((file) => file.path !== victim.path) };
     trimmed = true;
-  }
-
-  if (totalLength(current) > MAX_CONTEXT_CHARS && remaining.length > 0) {
-    const last = remaining[remaining.length - 1];
-    if (last !== undefined) {
-      const overflow = totalLength(current) - MAX_CONTEXT_CHARS;
-      const kept = last.content.slice(0, Math.max(0, last.content.length - overflow));
-      remaining = [...remaining.slice(0, -1), { path: last.path, content: kept }];
-      current = { ...current, depFiles: remaining };
-      trimmed = true;
-    }
   }
   return { assembled: current, trimmed };
 }
@@ -364,11 +357,18 @@ function applyBudget(a: Assembled): { assembled: Assembled; hardTrimmed: boolean
   current = trimSystemDesignSections(current, extractKeywords(current.task, current.targetPaths));
   if (totalLength(current) <= MAX_CONTEXT_CHARS) return { assembled: current, hardTrimmed: false };
 
+  // 第 ④ 级（硬截）：系统侧先裁项目偏好详情，再丢依赖正文；仍超由 buildOutput 硬截 user 尾部
+  current = truncatePreferences(current);
+  if (totalLength(current) <= MAX_CONTEXT_CHARS) return { assembled: current, hardTrimmed: false };
+
   const result = hardTrim(current);
   return { assembled: result.assembled, hardTrimmed: result.trimmed };
 }
 
-/** 渲染输出；走过硬截梯级则追加提示，且任何情况下都保证总量 ≤ MAX_CONTEXT_CHARS */
+/**
+ * 渲染输出；走过 user 侧硬截梯级则追加提示，且任何情况下都保证总量 ≤ MAX_CONTEXT_CHARS。
+ * （systemPrompt 为角色层常量、非文件内容，按调用契约视为有界；文件类系统侧内容由第②/④级约束。）
+ */
 function buildOutput(a: Assembled, hardTrimmed: boolean): { system: string; user: string } {
   const system = renderSystem(a);
   let user = renderUser(a);

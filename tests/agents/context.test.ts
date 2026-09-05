@@ -306,6 +306,20 @@ describe('assembleContext 预算裁剪', () => {
     expect(system.length + user.length).toBeLessThanOrEqual(MAX_CONTEXT_CHARS);
     expect(user).toContain('【需求】');
     expect(user).toContain('（上下文已裁剪）');
+    expect(user).not.toContain('===== app/frontend/index.html ====='); // 正文可丢尽丢，不让提示行挤掉预算
+  });
+
+  it('⑥ 超长 PREFERENCES（系统侧）→ 详情保留首 2000 字符，总量同样 ≤ 24000', async () => {
+    const storage = newTestStorage();
+    const preferencesMd = `${'偏好'.repeat(950)}PREF-KEEP-MARKER${'偏好'.repeat(15000)}PREF-TAIL-MARKER`;
+    const { projectId } = await seedProject(storage, { preferencesMd });
+    const { system, user } = await assembleContext(baseInput(storage, projectId));
+
+    expect(system.length + user.length).toBeLessThanOrEqual(MAX_CONTEXT_CHARS);
+    expect(system).toContain('PREF-KEEP-MARKER'); // 首 2000 字符仍在
+    expect(system).not.toContain('PREF-TAIL-MARKER'); // 详情已裁
+    expect(system).toContain('项目偏好已按预算截断'); // 诚实标注
+    expect(user).not.toContain('（上下文已裁剪）'); // 系统侧裁剪即达标，无需 user 硬截
   });
 
   it('预算常量为 24000（与 DESIGN §4.1 一致，防止被顺手改掉）', () => {
