@@ -331,6 +331,7 @@ DB 决策：本机无 Postgres/docker；编排器单写者，SQLite 够用零配
 | Agent 内核 | `AgentRunner.run()` / `AgentAdapter` | 自写工具循环 | 接入现成 coding agent（pi/Claude Agent SDK）作为引擎 |
 | 角色注册表 | `RoleRegistry`（role→{prompt, tools, model 绑定} 配置） | 领导/PM/架构师/工程师/3 专家 | 用户自定义角色（UI 配置 prompt+工具集） |
 | 工具注册表 | `ToolRegistry`（schema+impl+policy 三件套） | write/read/list/grep | 外部检索、图片生成、代码执行（沙箱成熟后） |
+| 检索 | `RetrievalProvider.search()`（RankedHit[]，bm25 可选） | GrepRetriever（RegExp 扫 files，默认） | FtsRetriever（同库 fts5 虚表 trigram/bm25，`RETRIEVAL_PROVIDER=fts5`，T28） |
 | 查看器渲染 | `RendererRegistry`（按文件类型/扩展名） | markdown/代码(Shiki)/mermaid | plantuml、CSV 表格、图片 |
 | 传输层 | `TransportAdapter`（事件发布） | SSE（EventSource） | WebSocket 双向、Webhook 外发 |
 | 调度策略 | `Scheduler`（拓扑序执行策略对象） | 串行 | 并行（写集检测启用）、优先级/抢占 |

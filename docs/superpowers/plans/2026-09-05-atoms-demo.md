@@ -773,7 +773,42 @@ export function orchestratorStatus(projectId:number):'idle'|'running';
 
 **与 T24 的边界**：T27 提供核心层（probe/resolve/fallback）；T24 的设置页 UI 与 providers CRUD API 消费它们（「测试连接」按钮=probeProvider，「模型导入」=probe.models 落 llm_models，绑定下拉=resolveRoleModel 数据源）。
 
+---
+
+### Task 28: RetrievalProvider 扩展点 — Grep 默认 + FTS5 可选（§12 落地，用户追加）
+
+**Files:**
+- Create: `src/lib/retrieval/types.ts`、`grep.ts`、`fts.ts`、`registry.ts`
+- Modify: `src/lib/agents/tools/fs-tools.ts`（grep 工具走路由）、`src/lib/db/provider/sqlite/ddl.ts`（FTS5 虚表+触发器）、对应 parity 测试
+- Test: `tests/retrieval/retrieval.test.ts`
+
+**Interfaces:**
+
+```ts
+export interface RankedHit { path:string; line:number; text:string; score:number; }
+export interface RetrievalProvider {
+  name:'grep'|'fts5';
+  search(query:string, opts:{projectId:number; limit?:number}):Promise<RankedHit[]>;
+}
+export function getRetriever(storage:StorageProvider, env=process.env):RetrievalProvider;
+// RETRIEVAL_PROVIDER=fts5 时 FtsRetriever（同 app.db 内 fts5 虚表，trigram 分词，bm25 排序，
+// files 表触发器同步索引）；默认 grep（现行为，纯 RegExp 扫描）
+```
+
+- grep 工具改经 `getRetriever`（默认输出与今天逐字节等价——行为不变是验收标准）
+- FTS5：`CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(path, content, tokenize='trigram')` + INSERT/UPDATE/DELETE 触发器；虚表 DDL 进 ddl.ts 并过 T2 对齐守卫（drizzle-kit 不管虚表，db:push 幂等验证）
+- DESIGN §12 表补「检索 | RetrievalProvider | GrepRetriever | FtsRetriever（trigram/bm25）」行
+
+**Steps:**
+- [ ] Step 1: 失败测试——grep 路由默认等价；fts5 建表+触发器同步（写文件→立即搜到；删文件→搜不到）；trigram 命中 `api.js` 子串；bm25 排序确定性；跨项目隔离
+- [ ] Step 2-4: 红绿 + parity 守卫扩展
+- [ ] Step 5: Commit `feat(retrieval): provider registry with grep default + fts5 opt-in`
+
+**排期**：批次 D 之后（不占关键路径；用户可指令提前）。
+
 ## Self-Review 结论
+
+
 
 - **Spec 覆盖**：DESIGN §1-§12 逐节核对——编排(§3.1-3.4→T11/15)、干预停止(§3.5→T15/16/19)、SSE(§3.6→T15/16/17)、预览(§3.7→T16/22)、快速模式+seed(§3.8→T11/13/25)、人机共编(§3.9→T4/21/23)、检查点(§3.10→T5/25)、Harness(§4→T8/9)、质量+校验(§5⑤⑤′→T10/13)、模型管理/计量(§5①③→T6/24)、隔离(§4.7→T3/7)、检索(§4.1→T9)、布局(§2→T17-22)、@指定(§3.1→T11/19)。Race Mode(E3)/Publish(E4) 按 DESIGN §8 降级阶梯为"时间富余"项，未入计划（如需追加为 T27）。
 - **占位符扫描**：无 TBD/TODO；UI 任务给出组件结构+行为规格+关键代码路径。
