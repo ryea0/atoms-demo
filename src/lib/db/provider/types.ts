@@ -169,11 +169,36 @@ export interface MiscRepo {
   setPreference(scope: PreferenceScope, targetId: string, data: Record<string, unknown>): Promise<void>;
 }
 
+/* ------------------------------------------------------------------ */
+/* 模型管理全局表（DESIGN §7/§5①）：provider → model → 角色绑定            */
+/* ------------------------------------------------------------------ */
+
+/** LLM 服务商行（全局表）；api_key 仅服务端使用，绝不进日志/前端/SSE（.claude/rules/07） */
+export interface LlmProviderRow { id:number; name:string; baseUrl:string; apiKey:string; enabled:boolean; createdAt:number; }
+
+/** 模型行（全局表）：price_input/output 用于 llm_calls 成本核算（DESIGN §5③），默认 0 */
+export interface LlmModelRow { id:number; providerId:number; modelId:string; displayName:string;
+  priceInput:number; priceOutput:number; enabled:boolean; createdAt:number; }
+
+/** 角色绑定行（全局表，role 唯一）：一角色一绑定（DESIGN §5①） */
+export interface AgentModelBindingRow { id:number; role:AgentRole; providerId:number; modelId:number; createdAt:number; }
+
+/**
+ * 模型管理只读仓库（DESIGN §5①）：T27 的 resolveRoleModel（三级路由）消费。
+ * 刻意只读且最小——T24 的设置页 CRUD 在此之上扩展写方法（届时并入本接口或另立 LlmWriteRepo）。
+ */
+export interface LlmReadRepo {
+  /** 角色绑定（role 唯一，无绑定返回 null） */
+  getAgentModelBinding(role: AgentRole): Promise<AgentModelBindingRow|null>;
+  getLlmProviderById(providerId: number): Promise<LlmProviderRow|null>;
+  getLlmModelById(modelId: number): Promise<LlmModelRow|null>;
+}
+
 /**
  * 存储抽象（DESIGN §12）：按仓库分组继承（Task 5 已补齐全部仓库组）。
  * 实现侧约定：所有查询强制 project_id 过滤（CLAUDE.md 规则 9）、更新走乐观锁（规则 05）。
  */
-export interface StorageProvider extends ProjectsRepo, MessagesRepo, FilesRepo, RunsRepo, MiscRepo {
+export interface StorageProvider extends ProjectsRepo, MessagesRepo, FilesRepo, RunsRepo, MiscRepo, LlmReadRepo {
   /**
    * 关闭底层连接（幂等；关闭后本实例不可再用，需重新走工厂）。
    * 文件库实例按 dbFile 路径 memoize——业务侧在模块层调用一次 createStorage() 并持有即可，

@@ -13,6 +13,7 @@ import { createMessagesRepo } from './repo-messages';
 import { createFilesRepo } from './repo-files';
 import { createRunsRepo } from './repo-runs';
 import { createMiscRepo } from './repo-misc';
+import { createLlmReadRepo } from './repo-llm';
 import * as schema from './schema';
 import type { StorageProvider } from '../types';
 
@@ -47,12 +48,23 @@ function assembleStorage(dbFile: string, client: Database.Database, db: SqliteDb
     ...createFilesRepo(db),
     ...createRunsRepo(db),
     ...createMiscRepo(db),
+    ...createLlmReadRepo(db),
     /** 关闭连接（幂等）：文件库实例同时移出缓存，之后需重新走工厂 */
     close(): void {
       fileStorages.delete(dbFile);
       if (client.open) client.close();
     },
   };
+}
+
+/**
+ * 由既有连接装配 StorageProvider（不走路径 memoize）。
+ * 生产入口是 createSqliteStorage；本函数供测试工具注入共享连接（同一 client 上另开 drizzle 实例直接插桩数据）。
+ * 传 ':memory:' 作缓存键：本路径不进缓存，close() 里的缓存清理对它天然为空操作。
+ */
+export function createStorageFromClient(client: Database.Database): StorageProvider {
+  ensureSchema(client);
+  return assembleStorage(':memory:', client, drizzle(client, { schema }));
 }
 
 /**
