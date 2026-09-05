@@ -13,7 +13,7 @@ import type { RankedHit } from '@/lib/retrieval/types';
 import { newTestStorage, newTestStorageWithDb } from '@/lib/db/test-util';
 import { files } from '@/lib/db/provider/sqlite/schema';
 import { fsTools, type Tool, type ToolContext } from '@/lib/agents/tools';
-import type { StorageProvider } from '@/lib/db/provider/types';
+import type { FileRow, StorageProvider } from '@/lib/db/provider/types';
 
 /** 测试用 env 字面量（与 tests/llm/resolve.test.ts 同理：Next 的 ProcessEnv 要求显式 NODE_ENV） */
 function testEnv(partial: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -69,19 +69,30 @@ describe('getRetriever：RETRIEVAL_PROVIDER 路由', () => {
   });
 
   it('fts5 请求但存储无 sqlite 能力 → 回退 grep 且检索仍可用', async () => {
-    // 测试桩：只实现 grep 路径需要的 readAllFiles（非 sqlite 的 StorageProvider 未来实现同理）
-    const stub = {
-      readAllFiles: async () => [
-        {
-          id: 1, projectId: 1, path: 'a.ts', content: 'needle here\n', producedBy: 'seed' as const,
-          lastEditor: 'seed' as const, editingBy: null, editingExpiresAt: null, version: 1, createdAt: 0, updatedAt: 0,
-        },
-      ],
-    } as unknown as StorageProvider;
+    // 合法实现桩（无需伪造 searchFtsFiles / 双重断言）：只实现 grep 路径需要的 readAllFiles，
+    // 即「无全文索引能力」的 StorageProvider（未来的 PostgresStorage 同形）——能力可选项缺省即回退
+    const stub: StorageProvider = {
+      readAllFiles: async (projectId: number): Promise<FileRow[]> => {
+        // 桩同断言入参：检索层必须把 projectId 透传给存储（跨项目过滤由实现负责）
+        expect(projectId).toBe(1);
+        return [
+          {
+            id: 1, projectId: 1, path: 'a.ts', content: 'needle here\n', producedBy: 'seed',
+            lastEditor: 'seed', editingBy: null, editingExpiresAt: null, version: 1, createdAt: 0, updatedAt: 0,
+          },
+        ];
+      },
+    } as StorageProvider;
     const retriever = getRetriever(stub, FTS5_ENV);
     expect(retriever.name).toBe('grep');
     const hits = await retriever.search('needle', { projectId: 1 });
     expect(hits).toEqual([{ path: 'a.ts', line: 1, text: 'needle here', score: 0 }]);
+  });
+
+  it('searchFtsFiles 为可选项：显式置 undefined 的实现同样回退 grep（契约即文档）', () => {
+    const storage = newTestStorage();
+    const withoutFts: StorageProvider = { ...storage, searchFtsFiles: undefined };
+    expect(getRetriever(withoutFts, FTS5_ENV).name).toBe('grep');
   });
 });
 

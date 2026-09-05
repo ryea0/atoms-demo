@@ -259,12 +259,13 @@ export interface LlmAdminRepo {
 export interface FtsRankedFile { fileId:number; path:string; content:string; score:number; }
 
 /**
- * 全文索引检索仓库（可选能力）：只由具备 FTS 的实现提供（当前是 SQLite 的 files_fts 虚表）。
- * 查询按字面短语解释（转义由实现负责），limit=null 取全量；必须强制 project_id 过滤（规则 9）。
- * 检索层（src/lib/retrieval）按能力探测选择实现——没有该方法的实现自动回退 grep。
+ * 全文索引检索仓库（可选能力）：`searchFtsFiles` 为**可选成员**——只有具备全文索引的实现提供
+ * （当前是 SQLite 的 files_fts 虚表），Postgres 等实现整体省略即可。检索层（src/lib/retrieval）
+ * 探测到缺失即回退默认 grep——实现者既不必伪造方法抛错，也不会静默把 grep 语义变成「未命中」。
+ * 查询按字面短语解释（转义由实现负责），limit=null 取全量；实现必须强制 project_id 过滤（规则 9）。
  */
 export interface FtsSearchRepo {
-  searchFtsFiles(projectId:number, query:string, limit:number|null):Promise<FtsRankedFile[]>;
+  searchFtsFiles?(projectId:number, query:string, limit:number|null):Promise<FtsRankedFile[]>;
 }
 
 /**
