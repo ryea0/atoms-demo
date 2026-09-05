@@ -18,6 +18,8 @@ const eslintConfig = [
       "out/**",
       "build/**",
       "next-env.d.ts",
+      // SDD 并行 worktree（在途分支代码不进主干 lint）
+      ".superpowers/**",
     ],
   },
 ];
