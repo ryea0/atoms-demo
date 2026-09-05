@@ -131,8 +131,9 @@ const FILES: readonly (readonly [path: string, editor: WorkspaceFile['lastEditor
 
 function makeFiles(extra?: readonly (readonly [string, WorkspaceFile])[]): Map<string, WorkspaceFile> {
   const files = new Map<string, WorkspaceFile>();
+  let nextId = 1;
   for (const [path, editor] of FILES) {
-    files.set(path, { content: `# ${path}\n正文`, version: 1, lastEditor: editor, streaming: false });
+    files.set(path, { id: nextId++, content: `# ${path}\n正文`, version: 1, lastEditor: editor, streaming: false });
   }
   for (const [path, file] of extra ?? []) files.set(path, file);
   return files;
@@ -157,7 +158,7 @@ afterEach(() => {
 describe('FileTree 渲染', () => {
   it('目录树按默认展开渲染：docs/app 可见，未列入默认的目录折叠且可展开', () => {
     const files = makeFiles([
-      ['src/lib/util.ts', { content: 'export {};', version: 1, lastEditor: 'engineer', streaming: false }],
+      ['src/lib/util.ts', { id: 90, content: 'export {};', version: 1, lastEditor: 'engineer', streaming: false }],
     ]);
     renderTree({ files });
 
@@ -244,7 +245,7 @@ describe('FileTree 角标与流式状态', () => {
     const files = makeFiles([
       [
         'app/backend/api.js',
-        { content: 'export const a = 1;\nexport const b = 2;', version: 0, lastEditor: 'engineer', streaming: true },
+        { id: 91, content: 'export const a = 1;\nexport const b = 2;', version: 0, lastEditor: 'engineer', streaming: true },
       ],
     ]);
     renderTree({ files });

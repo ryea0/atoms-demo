@@ -20,7 +20,7 @@ import { useWorkspace } from '@/lib/client/store';
 import type { AgentRole } from '@/lib/db/provider/types';
 import { FileTree } from '@/components/tree/FileTree';
 import { ViewerTabs } from '@/components/viewer/ViewerTabs';
-import { PaneEmpty, PaneShell } from './PaneShell';
+import { PaneShell } from './PaneShell';
 import { TopBar, type WorkspaceView } from './TopBar';
 
 /** 窄屏（<lg）单栏模式下的栏目 */

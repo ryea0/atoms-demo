@@ -72,7 +72,7 @@ function makeRun(over: Partial<AgentRun> = {}): AgentRun {
 }
 
 function makeFile(over: Partial<WorkspaceFile> = {}): WorkspaceFile {
-  return { content: 'define([], () => ({}))', version: 2, lastEditor: 'engineer', streaming: false, ...over };
+  return { id: 1, content: 'define([], () => ({}))', version: 2, lastEditor: 'engineer', streaming: false, ...over };
 }
 
 function makeState(over: Partial<WorkspaceState> = {}): WorkspaceState {
