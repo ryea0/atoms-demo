@@ -3,8 +3,8 @@
  * 约定（CLAUDE.md 规则 6/9/11、.claude/rules/05、DESIGN §3.9/§3.10）：
  * - agent/人工读写只走 files 表；所有查询强制 project_id 过滤——file_versions 无 project_id，
  *   归属一律经 files 回查或联表约束，绝不以裸 fileId 信任调用方
- * - 覆盖写统一入口：事务内「旧版本入 file_versions → 推进 content/version/last_editor」，
- *   agent 写、人工保存、版本恢复共用，保证 diff/回滚/可再撤销语义一致
+ * - 覆盖写统一入口：事务内「CAS 推进 content/version/last_editor（version=base_version 命中）
+ *   → 旧版本入 file_versions」，agent 写、人工保存、版本恢复共用，保证 diff/回滚/可再撤销语义一致
  * - 事务必须短小：better-sqlite3 的事务回调是同步执行的（返回即 COMMIT），
  *   因此事务内只能用 drizzle 同步 API（run/all）做纯 DB 写，严禁 await/IO/LLM 调用
  */

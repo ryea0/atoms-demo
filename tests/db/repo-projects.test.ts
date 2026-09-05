@@ -1,11 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { eq } from 'drizzle-orm';
 import { newTestStorage } from '@/lib/db/test-util';
 import { openSqlite } from '@/lib/db/provider/sqlite/storage';
 import { ensureSchema } from '@/lib/db/provider/sqlite/ddl';
 import { createProjectsRepo } from '@/lib/db/provider/sqlite/repo-projects';
 import { createMessagesRepo } from '@/lib/db/provider/sqlite/repo-messages';
-import { files, llmCalls } from '@/lib/db/provider/sqlite/schema';
+import { files, llmCalls, projects } from '@/lib/db/provider/sqlite/schema';
 import * as schema from '@/lib/db/provider/sqlite/schema';
 
 describe('repo projects/messages', () => {
@@ -73,22 +74,37 @@ describe('repo projects 聚合与状态', () => {
 
   it('重命名/状态更新；getRecentSessions 按 updatedAt 倒序且默认 8 条', async () => {
     const r = newRepos();
+    const ids: number[] = [];
     for (let i = 0; i < 10; i += 1) {
-      await r.createProject({ sessionId: 's', title: `p${i}`, requirement: 'r', mode: 'fast' });
+      const created = await r.createProject({ sessionId: 's', title: `p${i}`, requirement: 'r', mode: 'fast' });
+      ids.push(created.id);
     }
-    const oldest = (await r.listProjects('s')).at(-1);
-    if (!oldest) throw new Error('应已创建 10 个项目');
-    await r.renameProject(oldest.id, '改名了');
-    await r.updateProjectStatus(oldest.id, 'running');
+    // updated_at 是毫秒精度：同一毫秒批量建项目会让全部行并列，orderBy 退化成 id 兜底 → 断言非确定
+    // （原用例的 flake）。夹具先把基线拨成彼此不同的过去值，让排序断言只考察 updatedAt。
+    const base = Date.now() - 10_000;
+    let offset = 0;
+    for (const id of ids) {
+      if (id === ids[0]) continue; // 首个创建的项目留给 renameProject 推进
+      await r.db.update(projects).set({ updatedAt: base + offset }).where(eq(projects.id, id));
+      offset += 1;
+    }
+    const oldestId = ids[0];
+    if (oldestId === undefined) throw new Error('应已创建 10 个项目');
+    await r.renameProject(oldestId, '改名了');
+    await r.updateProjectStatus(oldestId, 'running');
 
-    const after = await r.getProject(oldest.id);
+    const after = await r.getProject(oldestId);
     expect(after?.title).toBe('改名了');
     expect(after?.status).toBe('running');
 
     const recent = await r.getRecentSessions('s');
     expect(recent).toHaveLength(8); // 默认 limit=8
-    expect(recent[0]?.id).toBe(oldest.id); // 刚更新的项目排最前
-    expect(recent[0]?.updatedAt ?? 0).toBeGreaterThanOrEqual(recent[1]?.updatedAt ?? 0);
+    expect(recent[0]?.id).toBe(oldestId); // 刚更新的项目排最前
+    let prevUpdatedAt: number | undefined;
+    for (const row of recent) {
+      if (prevUpdatedAt !== undefined) expect(prevUpdatedAt).toBeGreaterThanOrEqual(row.updatedAt);
+      prevUpdatedAt = row.updatedAt;
+    }
     expect(await r.getRecentSessions('s', 3)).toHaveLength(3);
   });
 

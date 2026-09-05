@@ -38,6 +38,29 @@ export interface CreateProjectInput { sessionId:string; title:string; requiremen
 export interface AddMessageInput { projectId:number; role:Message['role']; content:string;
   meta?:Message['meta']; }
 
+/** createAgentRun 入参（id/status/时间戳由存储层与库默认值生成：status=pending、started_at 由编排器开跑时补） */
+export interface CreateAgentRunInput { projectId:number; taskKey:string; agent:AgentRole; task:string; }
+
+/**
+ * updateAgentRun 入参：只推进调用方出现的字段。
+ * summary/error/时间戳传 null = 显式清空（如中断后重算降级摘要）；缺省键一律不动库里既有值。
+ */
+export interface UpdateAgentRunPatch { status?:RunStatus; summary?:string|null; error?:string|null;
+  startedAt?:number|null; endedAt?:number|null; }
+
+/** usageByProject 聚合行：tokens=prompt+completion 之和（设置页/卡片墙统计用） */
+export interface LlmUsageRow { agentRole:AgentRole; model:string; tokens:number; calls:number; }
+
+/**
+ * recordLlmCall 入参（llm 层 meteredCall 结构化落库，字段与 src/lib/llm/usage.ts 的 MeteringSink 一一对应）。
+ * estimated=1 表示 usage 缺失按 DESIGN §4.4 公式估算；cost 默认 0（单价未配置时不计费）。
+ */
+export interface RecordLlmCallInput { projectId:number; agentRole:AgentRole; model:string;
+  promptTokens:number; completionTokens:number; estimated:number; cost:number; latencyMs:number; }
+
+/** 偏好作用域：demo 只用 session 级（DESIGN §4.2），user 级为 schema 预留 */
+export type PreferenceScope = 'session'|'user';
+
 /** 项目卡片 DTO（列表页一次查询聚合取齐，禁 N+1——.claude/rules/05） */
 export type ProjectListItem = Project & {
   /** files 表行数 */
@@ -110,11 +133,47 @@ export interface FilesRepo {
 }
 
 /**
- * 存储抽象（DESIGN §12）：按仓库分组继承，随 Task 5 继续补齐
- * （agent_runs/llm_calls/preferences/checkpoints…）。
+ * agent_runs 仓库：summary 是子任务间唯一交接物（CLAUDE.md 规则 7），回滚时统一标 rolled_back（DESIGN §3.10）。
+ */
+export interface RunsRepo {
+  createAgentRun(input: CreateAgentRunInput): Promise<AgentRun>;
+  /** 按 id 推进；projectId 提供时叠加项目级作用域（规则 9），缺省按裸 id 生效（调用方须已自行校验归属） */
+  updateAgentRun(id: number, patch: UpdateAgentRunPatch, projectId?: number): Promise<void>;
+  /** 任务时间线（created_at 正序，并列按 id 稳定排序） */
+  listAgentRuns(projectId: number): Promise<AgentRun[]>;
+  /** 检查点回滚配套：id ≤ uptoRunId 的本项目任务（含已 done/failed）全部改标 rolled_back */
+  markRunsRolledBack(projectId: number, uptoRunId: number): Promise<void>;
+}
+
+/**
+ * 杂项仓库：项目级检查点（DESIGN §3.10）+ llm_calls 计量（CLAUDE.md 规则 10）+ 个人偏好（DESIGN §3.9/§4.2）。
+ * 检查点快照/恢复必须在一个短事务内完成（事务里只有纯 DB 读写，无 await/IO/LLM 调用）。
+ */
+export interface MiscRepo {
+  /** 打点：当前全部 files 全量快照入 checkpoint_files（读快照与落库同事务），返回 checkpoint id */
+  createCheckpoint(projectId: number, label: string, agentRunId: number|null): Promise<number>;
+  /**
+   * 恢复：当前内容先各入 file_versions（回滚可撤销），再按快照 upsert 回 files——
+   * 快照内已有文件行覆盖内容并 version+1、已消失的行重建；快照外的文件（打点后新增）一律不动。
+   * 返回受影响 fileId（按快照路径升序）。checkpointId 不存在或归属不符时抛错。
+   */
+  restoreCheckpoint(projectId: number, cpId: number): Promise<number[]>;
+  /** 打点列表（新→旧，时间线「回到此任务前」用） */
+  listCheckpoints(projectId: number): Promise<Checkpoint[]>;
+  recordLlmCall(input: RecordLlmCallInput): Promise<void>;
+  /** 按 agentRole+model 聚合 tokens/calls（单条 SQL groupBy，禁 N+1） */
+  usageByProject(projectId: number): Promise<LlmUsageRow[]>;
+  /** 未命中返回 null；data 已由 text({mode:'json'}) 反序列化 */
+  getPreference(scope: PreferenceScope, targetId: string): Promise<unknown|null>;
+  /** upsert on (scope,target_id)：同键二次写覆盖（编辑能力开关等只存最新值） */
+  setPreference(scope: PreferenceScope, targetId: string, data: Record<string, unknown>): Promise<void>;
+}
+
+/**
+ * 存储抽象（DESIGN §12）：按仓库分组继承（Task 5 已补齐全部仓库组）。
  * 实现侧约定：所有查询强制 project_id 过滤（CLAUDE.md 规则 9）、更新走乐观锁（规则 05）。
  */
-export interface StorageProvider extends ProjectsRepo, MessagesRepo, FilesRepo {
+export interface StorageProvider extends ProjectsRepo, MessagesRepo, FilesRepo, RunsRepo, MiscRepo {
   /**
    * 关闭底层连接（幂等；关闭后本实例不可再用，需重新走工厂）。
    * 文件库实例按 dbFile 路径 memoize——业务侧在模块层调用一次 createStorage() 并持有即可，
