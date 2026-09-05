@@ -16,7 +16,7 @@ import { MessageList } from './MessageList';
 import { Timeline } from './Timeline';
 import { isGenerationRunning } from '@/lib/client/format';
 import { sendProjectMessage, stopProjectGeneration } from '@/lib/client/session';
-import type { WorkspaceState } from '@/lib/client/store';
+import { createWorkspaceStore, type WorkspaceState } from '@/lib/client/store';
 
 export interface ChatPanelProps {
   /** 工作台聚合状态（Workspace 从 useWorkspace 取好后传入） */
@@ -50,7 +50,17 @@ export function ChatPanel({ state, onOpenFile, onRollback }: ChatPanelProps): Re
     async (input: ChatInputSendInput): Promise<boolean> => {
       if (projectId === null) return false;
       try {
-        await sendProjectMessage(projectId, input);
+        const result = await sendProjectMessage(projectId, input);
+        // 入队分支只落库不发 SSE：用响应 messageId 本地补登待注入卡，「📥 排队中」即时可见，
+        // 之后同 messageId 的 intervention_injected 事件把它翻转为「已注入 {文件}」
+        if (result.delivered === 'intervention' && result.messageId !== undefined) {
+          createWorkspaceStore(projectId).appendPendingIntervention({
+            projectId,
+            messageId: result.messageId,
+            content: input.content,
+            mentions: input.mentions,
+          });
+        }
         return true;
       } catch (error) {
         console.error('[chat] 消息发送失败：', error);

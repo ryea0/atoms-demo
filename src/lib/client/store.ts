@@ -407,7 +407,22 @@ export class WorkspaceStore {
     const meta: Record<string, unknown> = event.meta ?? {};
     const rawId = meta.messageId;
     const id = typeof rawId === 'number' ? rawId : (this.syntheticId -= 1);
-    if (id > 0 && this.state.messages.some((message) => message.id === id)) return {};
+
+    const existingIndex = id > 0 ? this.state.messages.findIndex((message) => message.id === id) : -1;
+    if (existingIndex >= 0) {
+      const existing = this.state.messages[existingIndex];
+      if (existing === undefined) return {};
+      // 唯一例外：本地补登的待注入干预（appendPendingIntervention）等到注入事件——
+      // 翻转为已注入（打戳 + 带上 targetTask 折算的 path），而不是被去重吞掉留在「排队中」
+      if (event.event !== 'intervention_injected' || existing.deliveredAt !== null) return {};
+      const messages = [...this.state.messages];
+      messages[existingIndex] = {
+        ...existing,
+        deliveredAt: Date.now(),
+        meta: messageMetaOf(event, existing.meta?.mentions ?? []),
+      };
+      return { messages };
+    }
 
     const rawMentions: unknown[] = Array.isArray(meta.mentions) ? meta.mentions : [];
     const mentions = rawMentions.filter(isAgentRole);
@@ -422,6 +437,33 @@ export class WorkspaceStore {
       createdAt: now,
     };
     return { messages: [...this.state.messages, message] };
+  }
+
+  /**
+   * 本地补登「运行中干预」（T19 R1）：POST /messages 的入队分支只落库不发 SSE，
+   * 用响应里的 messageId 补一条 deliveredAt=null 的待注入消息，「📥 排队中」卡片即时出现，
+   * 不必等注入事件或刷新。之后同 messageId 的注入事件会把它翻转为已注入（见 messagesPatchFor）。
+   */
+  appendPendingIntervention(input: {
+    projectId: number;
+    messageId: number;
+    content: string;
+    mentions: readonly AgentRole[];
+  }): void {
+    // 防串台 / 非法 id / 与既有消息（快照、重放）重复
+    if (this.state.projectId !== null && this.state.projectId !== input.projectId) return;
+    if (input.messageId <= 0) return;
+    if (this.state.messages.some((message) => message.id === input.messageId)) return;
+    const message: Message = {
+      id: input.messageId,
+      projectId: input.projectId,
+      role: 'intervention',
+      content: input.content,
+      meta: input.mentions.length > 0 ? { mentions: [...input.mentions] } : null,
+      deliveredAt: null,
+      createdAt: Date.now(),
+    };
+    this.patch({ messages: [...this.state.messages, message] });
   }
 
   /**

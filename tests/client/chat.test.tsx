@@ -9,9 +9,14 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ChatPanel } from '@/components/chat/ChatPanel';
-import type { WorkspaceFile, WorkspaceState } from '@/lib/client/store';
+import {
+  clearWorkspaceStores,
+  createWorkspaceStore,
+  type WorkspaceFile,
+  type WorkspaceState,
+} from '@/lib/client/store';
 import type { AgentRun, Message, Project } from '@/lib/db/provider/types';
 
 const PROJECT_ID = 7;
@@ -131,6 +136,7 @@ function mount(state: WorkspaceState, handlers: { onOpenFile?: (path: string) =>
 beforeEach(() => {
   messageId = 0;
   cleanup();
+  clearWorkspaceStores(); // store 是 per-project 单例：测试间互不串扰（本地补登干预用）
 });
 
 afterEach(() => {
@@ -500,6 +506,75 @@ describe('输入区', () => {
     vi.stubGlobal('fetch', fallback.fetchMock as unknown as typeof fetch);
     mount(makeState());
     await waitFor(() => expect(screen.getByRole('button', { name: '生成模式' }).textContent).toContain('完整'));
+  });
+
+  it('IME 组词中的 Enter：不误选 @ 候选、不把半截拼音当消息发出', async () => {
+    const { calls, fetchMock } = makeFetchMock();
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+    mount(makeState({ finished: true, project: makeProject({ status: 'done' }) }));
+
+    const input = screen.getByRole('textbox', { name: '输入消息' }) as HTMLTextAreaElement;
+    // 浮层打开时：组词 Enter 只确认候选词
+    fireEvent.change(input, { target: { value: '@工程师', selectionStart: 4 } });
+    expect(screen.getByRole('listbox', { name: '成员浮层' })).toBeInTheDocument();
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+    expect(screen.getByRole('listbox', { name: '成员浮层' })).toBeInTheDocument();
+    expect(input.value).toBe('@工程师');
+
+    // 无浮层时：组词 Enter 不提交（文本保留、无请求）
+    fireEvent.change(input, { target: { value: 'zu ci zhong de Enter', selectionStart: 20 } });
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+    expect(input.value).toBe('zu ci zhong de Enter');
+    expect(calls.some((call) => call.url.endsWith('/messages'))).toBe(false);
+
+    // 组词结束后正常 Enter 才提交
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => {
+      expect(lastPost(calls, `/api/projects/${PROJECT_ID}/messages`)?.body).toEqual({
+        content: 'zu ci zhong de Enter',
+        mentions: [],
+      });
+    });
+  });
+
+  it('运行中发送干预：队列卡即时出现（不依赖刷新），注入事件到达后翻转为已注入', async () => {
+    const { calls, fetchMock } = makeFetchMock(); // messages 回包 {delivered:'intervention', messageId:99}
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    // ChatPanel 不订阅 store（生产里由 Workspace 的 useWorkspace 驱动重渲染）：
+    // 测试里手动订阅并用最新 messages 重渲染，等价模拟父组件数据流
+    const store = createWorkspaceStore(PROJECT_ID);
+    let current = makeState({ runs: [makeRun()] });
+    const mounted = render(createElement(ChatPanel, { state: current }));
+    const unsubscribe = store.subscribe(() => {
+      current = makeState({ runs: [makeRun()], messages: store.getState().messages });
+      mounted.rerender(createElement(ChatPanel, { state: current }));
+    });
+
+    const input = screen.getByRole('textbox', { name: '输入消息' }) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '要能同时开多个笔记' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+
+    // 入队分支只落库不发 SSE：响应 messageId 本地补登，队列卡即时可见
+    await waitFor(() => expect(screen.getByText(/排队中/)).toBeInTheDocument());
+    expect(screen.getByText('要能同时开多个笔记')).toBeInTheDocument();
+
+    // 注入事件（同 messageId）到达：翻转为「已注入 {文件}」，不再是排队中
+    act(() => {
+      store.applyEvent({
+        seq: 1,
+        projectId: PROJECT_ID,
+        runId: null,
+        event: 'intervention_injected',
+        content: '要能同时开多个笔记',
+        meta: { messageId: 99, targetTask: 'engineer:app/main.js' },
+      });
+    });
+    expect(screen.getByText('已注入 app/main.js')).toBeInTheDocument();
+    expect(screen.queryByText(/排队中/)).not.toBeInTheDocument();
+    expect(calls.filter((call) => call.url.endsWith('/messages'))).toHaveLength(1);
+
+    unsubscribe();
   });
 
   it('快照未就绪（projectId=null）：输入区禁用，不误发请求', () => {

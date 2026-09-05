@@ -182,6 +182,9 @@ export function ChatInput({ onSend, onStop, running, disabled = false }: ChatInp
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
+    // IME 组词中的按键只确认候选词（中文输入）：既不能误选 @ 候选，也不能把半截拼音当消息发出。
+    // keyCode 229 兜底不透传 isComposing 的非标准键盘事件（先例：HomeHero 的需求输入框）
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (popoverOpen && mention !== null) {
       if (event.key === 'ArrowDown') {
         event.preventDefault();
