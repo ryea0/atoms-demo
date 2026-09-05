@@ -168,6 +168,40 @@ describe('Workspace 三栏布局', () => {
 
     expect(screen.getByRole('region', { name: '聊天区' })).toBeInTheDocument();
     expect(screen.getByText('加载中…')).toBeInTheDocument();
+
+    // 项目未就绪：分享没有可复制的地址，必须禁用（防 /p/ 死链 + 假成功提示）
+    expect(screen.getByRole('button', { name: '复制分享链接' })).toBeDisabled();
+  });
+
+  it('快照加载失败（project 恒 null）：分享保持禁用，不弹「已复制」', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(new TypeError('Failed to fetch'));
+    const writeText = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined);
+    Object.defineProperty(window.navigator, 'clipboard', { value: { writeText }, configurable: true });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
+    MockEventSource.instances.length = 0;
+    render(createElement(Workspace, { projectId: PROJECT_ID }));
+
+    // 骨架仍在，标题回落为加载中
+    expect(await screen.findByText('加载中…')).toBeInTheDocument();
+    const shareButton = screen.getByRole('button', { name: '复制分享链接' });
+    expect(shareButton).toBeDisabled();
+
+    // 禁用按钮点击不触发复制，也不产生成功 toast
+    fireEvent.click(shareButton);
+    expect(writeText).not.toHaveBeenCalled();
+    expect(screen.queryByText('链接已复制')).not.toBeInTheDocument();
+  });
+
+  it('顶栏触控目标：<lg 档位扩到 ≥44px（jsdom 不套 CSS，断言响应式标记类）', async () => {
+    mountWorkspace();
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+
+    // 分享 / 设置：桌面 36px 视觉，<lg 44px
+    expect(screen.getByRole('button', { name: '复制分享链接' }).className).toContain('max-lg:size-11');
+    expect(screen.getByRole('link', { name: '打开设置' }).className).toContain('max-lg:size-11');
+    // 视图切换：列表 <lg 48px，触发器随其 h-[calc(100%-1px)] 达 47px
+    expect(screen.getByRole('tablist', { name: '视图切换' }).className).toContain('max-lg:h-12');
   });
 });
 

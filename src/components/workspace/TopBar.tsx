@@ -91,15 +91,17 @@ function AgentAvatars({ running }: { running: ReadonlySet<AgentRole> }) {
 
 export function TopBar({ project, runningRoles, connected, view, onViewChange }: TopBarProps) {
   const share = useCallback(() => {
+    // 项目未就绪时按钮已禁用，这里兜底，绝不复制出 /p/ 死链
+    if (project === null) return;
     // 分享固定指向工作台根路径（不携带查看器内状态），对方打开即见完整三栏
-    void copyText(`${window.location.origin}/p/${project?.id ?? ''}`).then((copied) => {
+    void copyText(`${window.location.origin}/p/${project.id}`).then((copied) => {
       if (copied) {
         toast.success('链接已复制', { description: '发给协作者即可打开同一项目' });
       } else {
         toast.error('复制失败', { description: '请手动复制浏览器地址栏链接' });
       }
     });
-  }, [project?.id]);
+  }, [project]);
 
   const handleViewChange = useCallback(
     (value: string) => {
@@ -142,7 +144,7 @@ export function TopBar({ project, runningRoles, connected, view, onViewChange }:
               variant="ghost"
               size="sm"
               aria-label="项目信息"
-              className="min-w-0 max-w-[13rem] gap-1.5 sm:max-w-[18rem]"
+              className="min-w-0 max-w-[13rem] gap-1.5 max-lg:h-11 sm:max-w-[18rem]"
             >
               <span className="truncate">{project.title}</span>
               <Badge variant={statusBadgeVariant(project.status)} className="shrink-0">
@@ -172,23 +174,11 @@ export function TopBar({ project, runningRoles, connected, view, onViewChange }:
       )}
 
       <div className="ml-auto flex min-w-0 items-center gap-1.5 sm:gap-2">
-        {/* 视图切换：编辑器（T21）/ 预览（T22）。
-            注：shadcn tabs 原语用的 `data-active:` 变体在 Radix Tabs 上不存在（Radix 只写
-            data-state="active"），激活态样式必须在此显式补 data-[state=active] 才生效 */}
+        {/* 视图切换：编辑器（T21）/ 预览（T22）；<lg 提到 48px 高，触控目标 ≥44px（规则 04） */}
         <Tabs value={view} onValueChange={handleViewChange}>
-          <TabsList aria-label="视图切换" className="shrink-0">
-            <TabsTrigger
-              value="editor"
-              className="data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm"
-            >
-              编辑器
-            </TabsTrigger>
-            <TabsTrigger
-              value="preview"
-              className="data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm"
-            >
-              预览
-            </TabsTrigger>
+          <TabsList aria-label="视图切换" className="shrink-0 max-lg:h-12">
+            <TabsTrigger value="editor">编辑器</TabsTrigger>
+            <TabsTrigger value="preview">预览</TabsTrigger>
           </TabsList>
         </Tabs>
 
@@ -207,7 +197,10 @@ export function TopBar({ project, runningRoles, connected, view, onViewChange }:
           aria-label="复制分享链接"
           title="复制分享链接"
           onClick={share}
-          className="size-9 shrink-0"
+          /* 项目未就绪（快照加载中/失败）时没有可分享的项目地址，禁用防死链 */
+          disabled={project === null}
+          /* 桌面 50px 顶栏内保持 36px 视觉；<lg 扩到 44px 触控目标（规则 04） */
+          className="size-9 shrink-0 max-lg:size-11"
         >
           <Link2 className="size-4" aria-hidden />
         </Button>
@@ -216,7 +209,7 @@ export function TopBar({ project, runningRoles, connected, view, onViewChange }:
           href="/settings"
           aria-label="打开设置"
           title="设置"
-          className="flex size-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          className="flex size-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground max-lg:size-11"
         >
           <Settings className="size-4" aria-hidden />
         </Link>
