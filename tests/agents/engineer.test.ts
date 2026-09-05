@@ -107,15 +107,20 @@ function nodeOf(tree: FileTree, path: string): FileTreeNode {
   return node;
 }
 
-/** runEngineerFile 入参组装 */
-function fileCtx(base: { storage: StorageProvider; projectId: number; tree: FileTree }, target: FileTreeNode, provider?: LlmProvider) {
+/** runEngineerFile 入参组装（requirement/designSummary 可按模板分支覆盖） */
+function fileCtx(
+  base: { storage: StorageProvider; projectId: number; tree: FileTree },
+  target: FileTreeNode,
+  provider?: LlmProvider,
+  overrides: { requirement?: string; designSummary?: string } = {},
+) {
   return {
     storage: base.storage,
     projectId: base.projectId,
-    requirement: '做一个待办清单',
+    requirement: overrides.requirement ?? '做一个待办清单',
     target,
     fileTree: base.tree,
-    designSummary: '快速模式：前端单页 + 内存态后端 handle(method,path,body)，资源 /api/todos。',
+    designSummary: overrides.designSummary ?? '快速模式：前端单页 + 内存态后端 handle(method,path,body)，资源 /api/todos。',
     ...(provider === undefined ? {} : { provider }),
   };
 }
@@ -211,6 +216,7 @@ describe('runEngineerFile：mock 全链路与质量下限', () => {
     expect(html).not.toContain('localStorage');
     // 完整 CRUD：增删改查四类交互都在（PATCH=改、DELETE=删）
     expect(html).toContain('fetch(API');
+    expect(html).toContain('编辑'); // 改（内联编辑入口）
     expect(html).toContain("method: 'POST'");
     expect(html).toContain("method: 'PATCH'");
     expect(html).toContain("method: 'DELETE'");
@@ -222,6 +228,67 @@ describe('runEngineerFile：mock 全链路与质量下限', () => {
     const html = await runEngineerFile(fileCtx(base, nodeOf(base.tree, 'app/frontend/index.html')));
     expect(api.softWarnings).toEqual([]);
     expect(html.softWarnings).toEqual([]);
+    // 通过路径不产出 errors（T15 契约：ok=true ⇒ errors 不出现）
+    expect(api.errors).toBeUndefined();
+    expect(html.errors).toBeUndefined();
+  });
+
+  it('F1 dashboard 分支：统计卡片只读 UI（无编辑/删除）+ 聚合后端（无创建路径）', async () => {
+    const base = await newProject('做一个数据看板 dashboard');
+    const overrides = { requirement: '做一个数据看板 dashboard', designSummary: '快速模式：数据仪表盘 + 聚合接口 /api/stats。' };
+    const api = await runEngineerFile(
+      fileCtx(base, nodeOf(base.tree, 'app/backend/api.js'), undefined, overrides),
+    );
+    const html = await runEngineerFile(
+      fileCtx(base, nodeOf(base.tree, 'app/frontend/index.html'), undefined, overrides),
+    );
+    expect(api.ok).toBe(true);
+    expect(html.ok).toBe(true);
+
+    const htmlContent = (await base.storage.getFile(base.projectId, 'app/frontend/index.html'))?.content ?? '';
+    expect(htmlContent).toContain("var API = '/api/stats';");
+    expect(htmlContent).toContain('card-total'); // 统计卡片语义
+    expect(htmlContent).toContain('card-done');
+    expect(htmlContent).toContain('card-rate');
+    expect(htmlContent).toContain('完成率');
+    expect(htmlContent).toContain('刷新');
+    // 只读仪表盘：不出现编辑/删除操作
+    expect(htmlContent).not.toContain('编辑');
+    expect(htmlContent).not.toContain('删除');
+
+    const apiContent = (await base.storage.getFile(base.projectId, 'app/backend/api.js'))?.content ?? '';
+    expect(apiContent).toContain('total');
+    expect(apiContent).toContain('rate');
+    expect(apiContent).toContain('recent');
+    // 聚合只读：无创建语义（nextId）与写方法放行
+    expect(apiContent).not.toContain('nextId');
+    expect(apiContent).toContain('405');
+  });
+
+  it('F1 landing 分支：hero + 留资表单（POST /api/leads），无待办列表语义', async () => {
+    const base = await newProject('个人作品集主页');
+    const overrides = { requirement: '个人作品集主页', designSummary: '快速模式：落地页 + 留资接口 /api/leads。' };
+    const api = await runEngineerFile(
+      fileCtx(base, nodeOf(base.tree, 'app/backend/api.js'), undefined, overrides),
+    );
+    const html = await runEngineerFile(
+      fileCtx(base, nodeOf(base.tree, 'app/frontend/index.html'), undefined, overrides),
+    );
+    expect(api.ok).toBe(true);
+    expect(html.ok).toBe(true);
+
+    const htmlContent = (await base.storage.getFile(base.projectId, 'app/frontend/index.html'))?.content ?? '';
+    expect(htmlContent).toContain("var API = '/api/leads';");
+    expect(htmlContent).toContain('lead-form'); // 留资表单
+    expect(htmlContent).toContain("method: 'POST'");
+    // 无待办 CRUD 语义
+    expect(htmlContent).not.toContain('待办');
+    expect(htmlContent).not.toContain('checkbox');
+
+    const apiContent = (await base.storage.getFile(base.projectId, 'app/backend/api.js'))?.content ?? '';
+    expect(apiContent).toContain('nextId'); // 留资创建
+    expect(apiContent).toContain('201');
+    expect(apiContent).toContain('contact 不能为空'); // 400 校验
   });
 });
 
@@ -242,6 +309,7 @@ describe('runEngineerFile：校验失败重试（D1：重跑单文件任务）',
     // 两次完整 runAgent（写文件 + 收尾各一步）→ provider 恰好 4 次调用
     expect(provider.requests).toHaveLength(4);
     expect(result.ok).toBe(true);
+    expect(result.errors).toBeUndefined(); // ok=true 不产出 errors（T15 契约）
     expect(result.version).toBe(2); // 第一次 BAD_API v1 被修复版覆写为 v2
     const row = await base.storage.getFile(base.projectId, 'app/backend/api.js');
     expect(row?.content).toBe(GOOD_API);
@@ -293,6 +361,8 @@ describe('runEngineerFile：校验失败重试（D1：重跑单文件任务）',
 
     expect(provider.requests).toHaveLength(4);
     expect(result.ok).toBe(false);
+    // errors 与 softWarnings 分离：硬错误单独带回（T15 契约：ok=false ⇒ errors 非空）
+    expect(result.errors?.some((item) => item.includes('eval'))).toBe(true);
     expect(result.softWarnings.some((warning) => warning.includes('eval'))).toBe(true);
     // 文件保留落库（不回滚、不删除）
     const row = await base.storage.getFile(base.projectId, 'app/backend/api.js');
@@ -330,6 +400,45 @@ describe('runEngineerReview：一次廉价自审', () => {
     // 自审也留 run 记录（时间线可见）
     const runs = await base.storage.listAgentRuns(base.projectId);
     expect(runs.some((run) => run.taskKey === 'engineer-review:app/backend/api.js')).toBe(true);
+  });
+
+  it('F2 自审改写引入语法错误 → 校验失败回滚原内容、返回 false、错误落 agent_runs.error', async () => {
+    const base = await newProject('做一个待办清单', { seedTree: false });
+    const target = nodeOf(base.tree, 'app/backend/api.js');
+    const seeded = await base.storage.upsertFile({
+      projectId: base.projectId,
+      path: 'app/backend/api.js',
+      content: GOOD_API,
+      editor: 'engineer',
+    });
+    expect(seeded.version).toBe(1);
+
+    const GARBAGE = 'function handle(method, path, body { return {}; }'; // acorn 必报语法错误
+    const provider = new FakeProvider(
+      { toolCalls: [{ id: 'r1', name: 'write_file', args: { path: 'app/backend/api.js', content: GARBAGE } }] },
+      { content: '已重写修复' },
+    );
+
+    const changed = await runEngineerReview({
+      storage: base.storage,
+      projectId: base.projectId,
+      requirement: '做一个待办清单',
+      target,
+      fileTree: base.tree,
+      designSummary: '',
+      path: 'app/backend/api.js',
+      provider,
+    });
+
+    expect(changed).toBe(false); // 改写未通过复检 → 视为未改进，回滚
+    const row = await base.storage.getFile(base.projectId, 'app/backend/api.js');
+    expect(row?.content).toBe(GOOD_API); // 内容回到自审前（restoreFileVersion 生成新版本）
+    expect(row?.version).toBe(3); // v1 原文 → v2 垃圾改写 → v3 恢复
+    // 校验错误被记录（不静默吞）
+    const runs = await base.storage.listAgentRuns(base.projectId);
+    const reviewRun = runs.find((run) => run.taskKey === 'engineer-review:app/backend/api.js');
+    expect(reviewRun?.error).toContain('语法');
+    expect(reviewRun?.summary).toContain('回滚');
   });
 
   it('⑥ 无问题（FakeProvider 不写文件）→ 返回 false、版本不变', async () => {

@@ -55,6 +55,8 @@ export interface EngineerFileResult {
   version: number;
   ok: boolean;
   softWarnings: string[];
+  /** 阻断性错误（语法错误 + 硬违规），与 softWarnings 分离；ok=false ⇒ 非空（T15 契约） */
+  errors?: string[];
 }
 
 /** 写后自审入参：同单文件任务 + 待审文件路径 */
@@ -341,6 +343,7 @@ export async function runEngineerFile(ctx: EngineerFileContext): Promise<Enginee
           editor: 'engineer',
         });
         const verdict = validateFile(ctx.target.path, content);
+        const fallbackErrors = blockingErrors(verdict);
         const softWarnings = [
           ...verdict.soft.map((item) => item.detail),
           '模型两次均未调用 write_file 写入目标文件，已回退保底模板。',
@@ -349,7 +352,14 @@ export async function runEngineerFile(ctx: EngineerFileContext): Promise<Enginee
           status: 'done',
           summary: `${ctx.target.path} v${upserted.version} 由保底模板生成（模型未写入）`,
         });
-        return { runId: run.id, path: ctx.target.path, version: upserted.version, ok: verdict.ok, softWarnings };
+        return {
+          runId: run.id,
+          path: ctx.target.path,
+          version: upserted.version,
+          ok: verdict.ok,
+          softWarnings,
+          ...(fallbackErrors.length === 0 ? {} : { errors: fallbackErrors }),
+        };
       }
 
       const verdict = validateFile(row.path, row.content);
@@ -380,6 +390,7 @@ export async function runEngineerFile(ctx: EngineerFileContext): Promise<Enginee
         version: row.version,
         ok: false,
         softWarnings: [...softWarnings, ...errors],
+        errors, // ok=false ⇒ errors 非空（T15 契约）
       };
     }
     throw new Error('runEngineerFile 未产生结果（不可达：循环内所有路径均 return）');
@@ -395,7 +406,9 @@ export async function runEngineerFile(ctx: EngineerFileContext): Promise<Enginee
 
 /**
  * 写后自审：一次廉价 review 调用（语法/逻辑/遗漏/XSS 清单），发现问题由模型
- * write_file 覆写修复，一次即止。返回是否发生了改写（版本号递增判定）。
+ * write_file 覆写修复，一次即止（一次即止限制的是 LLM 调用次数，不是校验）。
+ * 改写后必须复检新内容：语法/硬违规 → restoreFileVersion 回滚到自审前版本、
+ * 返回 false、错误记入 agent_runs.error。返回 true 仅当改写且通过复检。
  */
 export async function runEngineerReview(ctx: EngineerReviewContext): Promise<boolean> {
   const before = await ctx.storage.getFile(ctx.projectId, ctx.path);
@@ -444,12 +457,40 @@ export async function runEngineerReview(ctx: EngineerReviewContext): Promise<boo
     });
 
     const after = await ctx.storage.getFile(ctx.projectId, ctx.path);
-    const changed = after !== null && after.version > before.version;
+    if (after === null) {
+      // 理论不可达（自审前文件存在且本流程只有 write_file 一种写路径）；显式失败好过误报
+      await finishRun(ctx.storage, ctx.projectId, run.id, {
+        status: 'done',
+        summary: `${ctx.path} 自审期间文件消失，按未改写处理`,
+      });
+      return false;
+    }
+    if (after.version <= before.version) {
+      await finishRun(ctx.storage, ctx.projectId, run.id, {
+        status: 'done',
+        summary: `${ctx.path} 自审通过，未改写`,
+      });
+      return false;
+    }
+
+    // 发生了改写：复检新内容（一次即止限制调用次数，不豁免校验）
+    const reviewErrors = blockingErrors(validateFile(ctx.path, after.content));
+    if (reviewErrors.length === 0) {
+      await finishRun(ctx.storage, ctx.projectId, run.id, {
+        status: 'done',
+        summary: `${ctx.path} 自审后已覆写修复（v${after.version}）`,
+      });
+      return true;
+    }
+
+    // 改写引入语法/硬违规：回滚到自审前版本（可再撤销），错误落 agent_runs.error
+    await ctx.storage.restoreFileVersion(ctx.projectId, before.id, before.version);
     await finishRun(ctx.storage, ctx.projectId, run.id, {
       status: 'done',
-      summary: changed ? `${ctx.path} 自审后已覆写修复（v${after?.version ?? '?'}）` : `${ctx.path} 自审通过，未改写`,
+      summary: `${ctx.path} 自审改写未通过校验，已回滚至 v${before.version}（⚠）`,
+      error: reviewErrors.join('；'),
     });
-    return changed;
+    return false;
   } catch (error) {
     await failRun(ctx.storage, ctx.projectId, run.id, error);
     throw error;

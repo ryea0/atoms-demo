@@ -26,7 +26,7 @@ flowchart LR
 | 方法 | 路径 | 入参 | 返回 |
 | --- | --- | --- | --- |
 | GET | /api/todos | - | `{code:200, data:[{id,title,done}]}` |
-| POST | /api/todos | `{title}` | `{code:200, data:{id,title,done}}` |
+| POST | /api/todos | `{title}` | `{code:201, data:{id,title,done}}` |
 | PUT/PATCH | /api/todos/:id | `{done?,title?}` | `{code:200, data:更新后条目}` |
 | DELETE | /api/todos/:id | - | `{code:200, data:{ok:true}}` |
 
@@ -48,7 +48,7 @@ sequenceDiagram
   participant A as api.js handle
   V->>P: 提交标题
   P->>A: POST /api/todos {title}
-  A-->>P: {code:200, data:todo}
+  A-->>P: {code:201, data:todo}
   P->>V: 追加渲染 + 清空输入框
   V->>P: 勾选/删除
   P->>A: PUT·DELETE /api/todos/:id
