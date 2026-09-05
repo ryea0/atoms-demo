@@ -15,9 +15,11 @@ import type { LlmProvider } from '@/lib/llm/types';
 export interface RunnerCallbacks {
   /**
    * 每个模型发起的工具调用产生回喂文本后触发（含校验失败/未知工具——此时 output 即回喂给模型的错误说明），
-   * 供时间线展示与 agent_runs 落库；args 为模型原始入参（未收窄，可能是非法形状）
+   * 供时间线展示与 agent_runs 落库；args 为模型原始入参（未收窄，可能是非法形状）。
+   * 消费者契约：以 `ok === false` 判定失败用于时间线/展示（参数校验失败、未知工具名恒为 false；
+   * 工具已执行时取 execute 返回的 ok，执行失败如"文件不存在"也是 false）；output 永远可直接展示。
    */
-  onToolCall?: (call: { name: string; args: unknown; output: string }) => void;
+  onToolCall?: (call: { name: string; args: unknown; output: string; ok?: boolean }) => void;
   /** 流式增量：原样透传 provider.stream 的 onDelta，内核不缓冲不裁剪（落库时机=file_end，见 DESIGN §3.6） */
   onDelta?: (text: string) => void;
 }

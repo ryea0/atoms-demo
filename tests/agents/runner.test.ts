@@ -118,9 +118,11 @@ describe('runAgent：校验重试与终止', () => {
       { toolCalls: [{ id: 'c2', name: 'write_file', args: { path: 'docs/prd.md', content: '# PRD' } }] },
       { content: 'PRD 已写入 docs/prd.md' },
     );
-    const seen: { name: string; output: string }[] = [];
+    const seen: { name: string; output: string; ok: boolean | undefined }[] = [];
     const result = await runAgent(
-      makeOpts(ctx, provider, { callbacks: { onToolCall: (call) => seen.push({ name: call.name, output: call.output }) } }),
+      makeOpts(ctx, provider, {
+        callbacks: { onToolCall: (call) => seen.push({ name: call.name, output: call.output, ok: call.ok }) },
+      }),
     );
 
     expect(result.content).toBe('PRD 已写入 docs/prd.md');
@@ -138,12 +140,72 @@ describe('runAgent：校验重试与终止', () => {
     expect(fedBack[0]?.content).toContain('参数校验失败');
     expect(fedBack[0]?.content).toContain('content');
 
-    // onToolCall 每次调用都回调（含校验失败那次），成功那次的 output 为执行结果
+    // onToolCall 每次调用都回调（含校验失败那次），ok 布尔区分成败，output 永远可展示
     expect(seen).toHaveLength(2);
-    expect(seen[1]?.output).toBe('已写入 docs/prd.md v1');
+    expect(seen[0]).toEqual({ name: 'write_file', ok: false, output: expect.stringContaining('参数校验失败') });
+    expect(seen[1]).toEqual({ name: 'write_file', ok: true, output: '已写入 docs/prd.md v1' });
 
     const row = await storage.getFile(projectId, 'docs/prd.md');
     expect(row?.content).toBe('# PRD');
+  });
+
+  it('② 同一响应内两个坏参数调用 → 当步即抛 AgentValidationError，不再发起下一次 provider 调用', async () => {
+    const { storage, projectId, ctx } = await newCtx();
+    const provider = new FakeProvider({
+      toolCalls: [
+        { id: 'c1', name: 'write_file', args: { path: 'a.md' } }, // 缺 content
+        { id: 'c2', name: 'read_file', args: {} }, // 缺 path
+      ],
+    });
+    const error = await catchError(runAgent(makeOpts(ctx, provider)));
+
+    // 首个失败已占用本步重试预算，同响应内再失败立即终止（生产路径：mock leader 一次回 3 个 assign_task）
+    expect(error).toBeInstanceOf(AgentValidationError);
+    if (error instanceof AgentValidationError) expect(error.toolName).toBe('read_file');
+    expect(provider.requests).toHaveLength(1);
+    // 被终止前没有任何工具真正执行
+    expect(await storage.listFiles(projectId)).toHaveLength(0);
+  });
+
+  it('② 同一响应"先有效后无效"：有效调用执行落库、无效调用回喂，历史保持调用/结果一一对应', async () => {
+    const { storage, projectId, ctx } = await newCtx();
+    const provider = new FakeProvider(
+      {
+        toolCalls: [
+          { id: 'ok-1', name: 'write_file', args: { path: 'app/main.js', content: 'export const a = 1;' } },
+          { id: 'bad-1', name: 'write_file', args: { path: 'app/broken.js' } }, // 缺 content
+        ],
+      },
+      { content: '收尾：一个文件已写入' },
+    );
+    const calls: { name: string; ok: boolean | undefined }[] = [];
+    const result = await runAgent(
+      makeOpts(ctx, provider, { callbacks: { onToolCall: (call) => calls.push({ name: call.name, ok: call.ok }) } }),
+    );
+
+    expect(result.steps).toBe(2);
+    expect(result.content).toBe('收尾：一个文件已写入');
+    // 有效调用真的执行了（副作用落库），无效调用只回喂
+    expect((await storage.getFile(projectId, 'app/main.js'))?.content).toBe('export const a = 1;');
+    expect(await storage.getFile(projectId, 'app/broken.js')).toBeNull();
+
+    // 历史一致性：assistant(tool_calls) 在全部 tool 结果之前；每个 call id 恰好一条结果
+    const history = requestAt(provider, 1).messages;
+    const assistantIndex = history.findIndex((message) => message.role === 'assistant');
+    const assistant = history[assistantIndex];
+    const firstToolIndex = history.findIndex((message) => message.role === 'tool');
+    expect(assistantIndex).toBeGreaterThanOrEqual(0);
+    expect(assistantIndex).toBeLessThan(firstToolIndex);
+    expect(assistant?.toolCalls?.map((call) => call.id)).toEqual(['ok-1', 'bad-1']);
+    const toolResults = history.filter((message) => message.role === 'tool');
+    expect(toolResults.map((message) => message.toolCallId)).toEqual(['ok-1', 'bad-1']);
+    expect(toolResults[0]?.content).toBe('已写入 app/main.js v1');
+    expect(toolResults[1]?.content).toContain('参数校验失败');
+
+    expect(calls).toEqual([
+      { name: 'write_file', ok: true },
+      { name: 'write_file', ok: false },
+    ]);
   });
 
   it('② 连续两轮坏参数 → 抛 AgentValidationError（含工具名与校验详情），不再发第三次请求', async () => {

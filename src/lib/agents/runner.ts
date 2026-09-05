@@ -24,10 +24,9 @@
  * - 其余（provider 网络/HTTP/解析错误）原样上抛，由调用方落 agent_runs.error + SSE error 事件，
  *   并决定是否回退默认流水线
  */
-import { z } from 'zod';
 import { getLlmProvider } from '@/lib/llm/client';
 import type { LlmMessage, LlmProvider, LlmRequest, LlmResult, ToolDef } from '@/lib/llm/types';
-import type { Tool } from '@/lib/agents/tools';
+import { formatZodIssues, type Tool } from '@/lib/agents/tools';
 import { AgentAbortError, AgentStepLimitError, AgentValidationError, type RunOptions, type RunResult } from './types';
 
 export { AgentAbortError, AgentStepLimitError, AgentValidationError } from './types';
@@ -35,13 +34,6 @@ export type { RunnerCallbacks, RunOptions, RunResult } from './types';
 
 /** 默认最大步数（DESIGN §4.6）：每次 provider 调用记 1 步 */
 export const DEFAULT_MAX_STEPS = 12;
-
-/** zod 校验错误 → 一行可读中文（字段路径 + 原因），直接回喂模型（与工具层输出同风格） */
-function formatIssues(error: z.ZodError): string {
-  return error.issues
-    .map((issue) => `${issue.path.length > 0 ? issue.path.join('.') : '(root)'}: ${issue.message}`)
-    .join('; ');
-}
 
 /** signal 已触发即抛 AgentAbortError（每轮 provider 调用前 / 每次工具执行前调用） */
 function throwIfAborted(signal: AbortSignal | undefined, role: string): void {
@@ -85,7 +77,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
     const request: LlmRequest = {
       model: opts.model,
-      messages,
+      // 传副本：provider 不该持有内核这份还在增长的消息数组（防 history 被外部改写）
+      messages: [...messages],
       tools: toolDefs.length > 0 ? toolDefs : undefined,
       signal,
     };
@@ -118,6 +111,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
       const tool = toolByName.get(call.name);
       let output: string;
+      let ok = false; // 校验失败/未知工具恒为 false（消费者以 ok===false 判定失败）
       if (tool === undefined) {
         // 未知工具等同校验失败（模型没按工具协议来），错误说明回喂给同一条重试预算
         output = `未知工具：${call.name}（可用工具：${opts.tools.map((item) => item.name).join('、') || '（无）'}）`;
@@ -126,17 +120,19 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       } else {
         const parsed = tool.schema.safeParse(call.args);
         if (!parsed.success) {
-          output = `参数校验失败：${formatIssues(parsed.error)}`;
+          output = `参数校验失败：${formatZodIssues(parsed.error)}`;
           if (lastStepHadValidationError || stepHadValidationError) throw new AgentValidationError(call.name, output);
           stepHadValidationError = true;
         } else {
           // 执行失败（ok=false，如文件不存在/路径不合法）只是普通工具结果，回喂后继续，不占校验重试预算
-          output = (await tool.execute(parsed.data, opts.ctx)).output;
+          const executed = await tool.execute(parsed.data, opts.ctx);
+          output = executed.output;
+          ok = executed.ok;
         }
       }
 
       messages.push({ role: 'tool', toolCallId: call.id, content: output });
-      onToolCall?.({ name: call.name, args: call.args, output });
+      onToolCall?.({ name: call.name, args: call.args, output, ok });
     }
     lastStepHadValidationError = stepHadValidationError;
   }
