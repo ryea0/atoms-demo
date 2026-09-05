@@ -1,7 +1,8 @@
 /**
  * mock provider（DESIGN §5⑥ 行为规格，P1 交付物）：离线全链路的基石。
  * 按消息中的角色标记路由到固定优质样例（samples/）：
- * - leader（带 assign_task 工具）→ 3 个 assign_task 工具调用（pm→architect→engineer 依赖链）
+ * - leader（带 assign_task 工具）→ 3 个 assign_task 工具调用（pm→architect→engineer 依赖链）；
+ *   工具结果已回喂的收尾轮 → 纯文本零工具调用（让内核循环终止，Task 11）
  * - leader 收尾（总结/汇报，无分派工具）→ 领导汇报 + MEMORY
  * - pm → 样例 PRD；architect → 样例多段设计（system_design + mermaid + file_tree）
  * - engineer → 按目标路径用模板骨架生成文件内容
@@ -289,13 +290,28 @@ function renderLeaderRoute(): { content: string; toolCalls: ToolCall[] } {
   return { content, toolCalls };
 }
 
+/**
+ * 领导收尾轮（Task 11 扩展）：分派轮的工具结果已回喂后，模型必须返回「纯文本 + 零工具调用」，
+ * AgentRunner 的工具循环才能终止（否则 mock 会永远再回 3 个 assign_task 直到 maxSteps 熔断）。
+ */
+const LEADER_FOLLOWUP_TEXT =
+  '任务已分派完毕（mock 样例）：PM 出 PRD → 架构师出系统设计与 file_tree → 工程师逐文件实现，按依赖串行执行。';
+
+/** 领导场景分流：已有工具结果回喂 = 收尾轮，否则 = 分派轮 */
+function renderLeaderTurn(req: LlmRequest): { content: string; toolCalls: ToolCall[] } {
+  const hasToolResult = req.messages.some((message) => message.role === 'tool');
+  return hasToolResult
+    ? { content: LEADER_FOLLOWUP_TEXT, toolCalls: [] }
+    : renderLeaderRoute();
+}
+
 /** 渲染一次 mock 调用的完整产出 */
 function render(req: LlmRequest): { content: string; toolCalls: ToolCall[] } {
   const requirement = requirementOf(req.messages);
   const scene = detectScene(req);
   switch (scene) {
     case 'leader':
-      return renderLeaderRoute();
+      return renderLeaderTurn(req);
     case 'closer':
       return { content: renderCloserReport(requirement), toolCalls: [] };
     case 'pm':
