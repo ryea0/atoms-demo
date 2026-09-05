@@ -29,7 +29,7 @@ export interface RunOptions {
   userPrompt: string;
   tools: Tool[];
   model: string;
-  /** 最大 provider 调用次数（每次记 1 步），超出抛普通 Error；缺省 DEFAULT_MAX_STEPS=12 */
+  /** 最大 provider 调用次数（每次记 1 步），超出抛 AgentStepLimitError；缺省 DEFAULT_MAX_STEPS=12 */
   maxSteps?: number;
   /** 工具执行上下文（闭包绑定 project_id，内核原样透传给 tool.execute） */
   ctx: ToolContext;
@@ -67,5 +67,20 @@ export class AgentAbortError extends Error {
   constructor(message = 'agent 执行已被中止') {
     super(message);
     this.name = 'AbortError';
+  }
+}
+
+/** 步数超限（DESIGN §4.6 防失控终止）：结构化错误，调用方按类型分流而不是字符串匹配 message */
+export class AgentStepLimitError extends Error {
+  /** 配置的上限 */
+  readonly maxSteps: number;
+  /** 实际已执行的步数（= provider 调用次数） */
+  readonly steps: number;
+
+  constructor(maxSteps: number, steps: number) {
+    super(`已达最大步数上限（maxSteps=${maxSteps}，实际执行 ${steps} 步仍未完成），已终止以防失控`);
+    this.name = 'AgentStepLimitError';
+    this.maxSteps = maxSteps;
+    this.steps = steps;
   }
 }

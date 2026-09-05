@@ -14,22 +14,23 @@
  *       校验通过 → tool.execute → output 回喂（执行失败 ok=false 同样回喂，但不算校验失败）
  *   → 继续下一轮
  *
- * 防失控（§4.6）：maxSteps（默认 12，每次 provider 调用记 1 步）超限抛错；
+ * 防失控（§4.6）：maxSteps（默认 12，每次 provider 调用记 1 步）超限抛 AgentStepLimitError；
  * signal 在每轮 provider 调用前与每次工具执行前检查；工具结果截断由工具层负责。
  *
  * 错误上抛约定（provider/stream 错误不在内核翻译，也不做三段式第 3 步回退——那是调用方的活）：
  * - AgentAbortError（name='AbortError'）：signal 已触发（含 provider 因中止而抛错时的归一）
  * - AgentValidationError：校验重试预算耗尽
- * - 其余（provider 网络/HTTP/解析错误、maxSteps 超限的普通 Error）原样上抛，
- *   由调用方落 agent_runs.error + SSE error 事件，并决定是否回退默认流水线
+ * - AgentStepLimitError：maxSteps 超限（防失控终止）
+ * - 其余（provider 网络/HTTP/解析错误）原样上抛，由调用方落 agent_runs.error + SSE error 事件，
+ *   并决定是否回退默认流水线
  */
 import { z } from 'zod';
 import { getLlmProvider } from '@/lib/llm/client';
 import type { LlmMessage, LlmProvider, LlmRequest, LlmResult, ToolDef } from '@/lib/llm/types';
 import type { Tool } from '@/lib/agents/tools';
-import { AgentAbortError, AgentValidationError, type RunOptions, type RunResult } from './types';
+import { AgentAbortError, AgentStepLimitError, AgentValidationError, type RunOptions, type RunResult } from './types';
 
-export { AgentAbortError, AgentValidationError } from './types';
+export { AgentAbortError, AgentStepLimitError, AgentValidationError } from './types';
 export type { RunnerCallbacks, RunOptions, RunResult } from './types';
 
 /** 默认最大步数（DESIGN §4.6）：每次 provider 调用记 1 步 */
@@ -80,9 +81,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
   while (true) {
     throwIfAborted(signal, opts.role);
-    if (steps >= maxSteps) {
-      throw new Error(`已达最大步数上限（maxSteps=${maxSteps}，实际执行 ${steps} 步仍未完成），已终止以防失控`);
-    }
+    if (steps >= maxSteps) throw new AgentStepLimitError(maxSteps, steps);
 
     const request: LlmRequest = {
       model: opts.model,

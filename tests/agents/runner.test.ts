@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_MAX_STEPS, runAgent } from '@/lib/agents/runner';
-import { AgentAbortError, AgentValidationError, type RunOptions } from '@/lib/agents/types';
+import { AgentAbortError, AgentStepLimitError, AgentValidationError, type RunOptions } from '@/lib/agents/types';
 import { fsTools, type ToolContext } from '@/lib/agents/tools';
 import { newTestStorage } from '@/lib/db/test-util';
 import type { AgentRole, StorageProvider } from '@/lib/db/provider/types';
@@ -163,13 +163,17 @@ describe('runAgent：校验重试与终止', () => {
     expect(provider.requests).toHaveLength(2);
   });
 
-  it('③ maxSteps=1 且持续返回工具调用 → 超限抛错（中文提示含步数），第 2 次调用前终止', async () => {
+  it('③ maxSteps=1 且持续返回工具调用 → 抛 AgentStepLimitError（中文提示含步数），第 2 次调用前终止', async () => {
     const { ctx } = await newCtx();
     const provider = new FakeProvider({ toolCalls: [{ id: 'c1', name: 'list_files', args: {} }] });
     const error = await catchError(runAgent(makeOpts(ctx, provider, { maxSteps: 1 })));
 
-    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(AgentStepLimitError);
     expect(error).not.toBeInstanceOf(AgentValidationError);
+    if (error instanceof AgentStepLimitError) {
+      expect(error.maxSteps).toBe(1);
+      expect(error.steps).toBe(1);
+    }
     expect((error as Error).message).toContain('最大步数');
     expect((error as Error).message).toContain('maxSteps=1');
     expect(provider.requests).toHaveLength(1);
@@ -282,6 +286,11 @@ describe('runAgent：步数语义', () => {
 
     const error = await catchError(runAgent(makeOpts(ctx, provider)));
 
+    expect(error).toBeInstanceOf(AgentStepLimitError);
+    if (error instanceof AgentStepLimitError) {
+      expect(error.maxSteps).toBe(DEFAULT_MAX_STEPS);
+      expect(error.steps).toBe(DEFAULT_MAX_STEPS);
+    }
     expect((error as Error).message).toContain('最大步数');
     expect(provider.requests).toHaveLength(DEFAULT_MAX_STEPS);
   });
