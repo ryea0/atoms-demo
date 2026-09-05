@@ -147,8 +147,9 @@ describe('Workspace 三栏布局', () => {
     expect(screen.getByRole('region', { name: '文件树' })).toBeInTheDocument();
     expect(screen.getByRole('region', { name: '查看器' })).toBeInTheDocument();
 
-    // 空态提示（聊天/查看器仍为占位；文件树自 T20 起挂真实 FileTree）
-    expect(screen.getByText('团队消息与任务时间线会在这里实时展示')).toBeInTheDocument();
+    // 聊天区已挂 ChatPanel（T19）：快照里有 runs → 任务时间线可见，输入区就位；文件树为 T20 真实 FileTree（断言见下），查看器仍是空态占位
+    expect(screen.getByRole('region', { name: '任务时间线' })).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '输入消息' })).toBeInTheDocument();
     expect(screen.getByText('在文件树中选择文件，在这里查看与编辑')).toBeInTheDocument();
 
     // 文件树渲染快照文件（docs/app 整棵子树默认展开可见）

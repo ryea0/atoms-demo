@@ -3,12 +3,13 @@
 /**
  * 工作台顶栏（Task 18，DESIGN §2「顶部条 50px」）：
  * 返回 logo · 项目标题+状态下拉 · 视图切换 tabs[编辑器|预览] · 成员头像排（运行中高亮+脉冲）
- * · 分享（复制链接 toast） · 设置入口 · SSE 连接指示灯。
+ * · 分享（复制链接 toast） · 设置入口 · SSE 连接指示灯 · 预留操作槽（T19 挂 EditSwitch）。
  *
  * 只做展示与切换回调：项目 / 运行中角色 / 连接态都由 Workspace 从 useWorkspace 取好传入，
- * 不自己拉数据。预览面板（T22）接管「预览」档位；data-topbar-actions 容器留给 T23 挂 EditSwitch。
+ * 不自己拉数据。预览面板（T22）接管「预览」档位；actions 槽由 Workspace 注入（T19 EditSwitch）。
  */
 import { useCallback } from 'react';
+import type { ReactNode } from 'react';
 import Link from 'next/link';
 import { ChevronDown, Download, Link2, Settings } from 'lucide-react';
 import { toast } from 'sonner';
@@ -42,6 +43,8 @@ export interface TopBarProps {
   /** 受控视图（状态在 Workspace，供查看器主区联动切换） */
   view: WorkspaceView;
   onViewChange: (view: WorkspaceView) => void;
+  /** 预留操作槽内容（T19 挂 EditSwitch；缺省渲染空容器） */
+  actions?: ReactNode;
 }
 
 interface InfoRow {
@@ -89,7 +92,7 @@ function AgentAvatars({ running }: { running: ReadonlySet<AgentRole> }) {
   );
 }
 
-export function TopBar({ project, runningRoles, connected, view, onViewChange }: TopBarProps) {
+export function TopBar({ project, runningRoles, connected, view, onViewChange, actions }: TopBarProps) {
   const share = useCallback(() => {
     // 项目未就绪时按钮已禁用，这里兜底，绝不复制出 /p/ 死链
     if (project === null) return;
@@ -220,8 +223,8 @@ export function TopBar({ project, runningRoles, connected, view, onViewChange }:
           <Settings className="size-4" aria-hidden />
         </Link>
 
-        {/* T19 挂 EditSwitch 用 */}
-        <div data-topbar-actions="" />
+        {/* 预留操作槽（Workspace 注入 EditSwitch，DESIGN §3.9 编辑能力开关） */}
+        <div data-topbar-actions="">{actions}</div>
       </div>
     </header>
   );

@@ -199,6 +199,83 @@ describe('workspaceStore 事件分流', () => {
     expect(store.getState().messages).toHaveLength(3);
   });
 
+  it('appendPendingIntervention：本地补登待注入干预；注入事件到达翻转为已注入（不重复、不丢 path）', () => {
+    const store = createWorkspaceStore();
+    store.appendPendingIntervention({ projectId: PROJECT_ID, messageId: 77, content: '优先做计时', mentions: [] });
+    expect(store.getState().messages.at(-1)).toMatchObject({
+      id: 77,
+      role: 'intervention',
+      deliveredAt: null,
+      content: '优先做计时',
+    });
+
+    // 同 id 重复补登：幂等
+    store.appendPendingIntervention({ projectId: PROJECT_ID, messageId: 77, content: '重复', mentions: [] });
+    expect(store.getState().messages).toHaveLength(1);
+
+    // 注入事件（同 messageId）：翻转为已注入并带上 targetTask 折算的 path
+    store.applyEvent(
+      ev({
+        event: 'intervention_injected',
+        content: '优先做计时',
+        meta: { messageId: 77, targetTask: 'engineer:app/main.js' },
+      }),
+    );
+    expect(store.getState().messages).toHaveLength(1);
+    expect(store.getState().messages.at(-1)).toMatchObject({
+      id: 77,
+      deliveredAt: expect.any(Number),
+      meta: { path: 'app/main.js' },
+    });
+
+    // store 已绑定项目后：projectId 不同的补登被拒（防串台）
+    const bound = createWorkspaceStore(PROJECT_ID);
+    bound.hydrate(makeSnapshot());
+    bound.appendPendingIntervention({ projectId: PROJECT_ID, messageId: 80, content: '本项目的', mentions: [] });
+    expect(bound.getState().messages).toHaveLength(1);
+    bound.appendPendingIntervention({ projectId: 999, messageId: 81, content: '别串台', mentions: [] });
+    expect(bound.getState().messages).toHaveLength(1);
+  });
+
+  it('intervention_injected 的 targetTask（engineer:{path}）折算成 meta.path；leader 卡片保留 kind/path', () => {
+    const store = createWorkspaceStore();
+
+    // T19「已注入 {文件}」队列卡：targetTask 可解析出文件路径
+    store.applyEvent(
+      ev({
+        event: 'intervention_injected',
+        content: '优先做计时',
+        meta: { messageId: 8, targetTask: 'engineer:app/main.js' },
+      }),
+    );
+    expect(store.getState().messages.at(-1)).toMatchObject({
+      id: 8,
+      role: 'intervention',
+      meta: { path: 'app/main.js' },
+    });
+
+    // 领导卡片语义（softlock/restore）随事件保留，刷新前的聊天区即可还原卡片
+    store.applyEvent(
+      ev({
+        event: 'message',
+        agent: 'leader',
+        path: 'app/main.js',
+        content: '检测到你正在编辑 app/main.js',
+        meta: { role: 'assistant', kind: 'softlock', path: 'app/main.js', messageId: 9 },
+      }),
+    );
+    expect(store.getState().messages.at(-1)).toMatchObject({
+      id: 9,
+      meta: { kind: 'softlock', path: 'app/main.js' },
+    });
+
+    // targetTask 解析不出路径（非 engineer:{path} 形态）时不写 path
+    store.applyEvent(
+      ev({ event: 'intervention_injected', content: '再排一条', meta: { messageId: 10, targetTask: 'pm-prd' } }),
+    );
+    expect(store.getState().messages.at(-1)).toMatchObject({ id: 10, meta: null });
+  });
+
   it('error 记录错误并清该路径在流标记；stopped 收尾且项目转 paused', () => {
     const store = createWorkspaceStore();
     store.hydrate(makeSnapshot());
