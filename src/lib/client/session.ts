@@ -99,12 +99,14 @@ export function fetchWorkspaceSnapshot(projectId: number, signal?: AbortSignal):
 /* 人工编辑（DESIGN §3.9 人机共编：同一写 API + CAS 乐观锁 + 声明式软锁）   */
 /* ------------------------------------------------------------------ */
 
-/** 人工保存结果：ok=新版本号；冲突时带回服务端当前内容（并排 diff / 放弃草稿用） */
-export type SaveHumanFileResult = { ok: true; version: number } | { ok: false; conflict: true; current: string };
+/** 人工保存结果：ok=新版本号；冲突时带回服务端当前内容与当前版本号（并排 diff / 「用我的」就地重发用） */
+export type SaveHumanFileResult =
+  | { ok: true; version: number }
+  | { ok: false; conflict: true; current: string; version: number };
 
 /**
  * PATCH /api/projects/[id]/files/[fid]：人工编辑保存。
- * 409 不抛错——它是 CAS 冲突的正常分支，转成 {ok:false,conflict,current} 交冲突对话框；
+ * 409 不抛错——它是 CAS 冲突的正常分支，转成 {ok:false,conflict,current,version} 交冲突对话框；
  * 其余失败（400/404/500）抛 ApiError，由调用方提示用户。
  */
 export async function saveHumanFile(
@@ -124,8 +126,14 @@ export async function saveHumanFile(
     return { ok: true, version: typeof body?.version === 'number' ? body.version : baseVersion + 1 };
   }
   if (response.status === 409) {
-    const body = (await parseBody(response)) as { current?: unknown } | null;
-    return { ok: false, conflict: true, current: typeof body?.current === 'string' ? body.current : '' };
+    const body = (await parseBody(response)) as { current?: unknown; version?: unknown } | null;
+    return {
+      ok: false,
+      conflict: true,
+      current: typeof body?.current === 'string' ? body.current : '',
+      // 服务端当前版本号：SSE 断连拿不到推进时，「用我的版本」用它重发一次即成（T25）
+      version: typeof body?.version === 'number' ? body.version : baseVersion,
+    };
   }
   const payload = (await parseBody(response)) as { code?: unknown; message?: unknown } | null;
   const code = typeof payload?.code === 'string' ? payload.code : 'http_error';
@@ -147,9 +155,9 @@ export async function setFileSoftLock(projectId: number, fileId: number, on: boo
   });
 }
 
-/** 导出 zip：直接交给浏览器下载（Route Handler 返回二进制，不走 JSON 封装） */
+/** 导出 zip：直接交给浏览器下载（Route Handler 返回二进制，不走 JSON 封装）；noopener 断开 opener */
 export function openProjectExport(projectId: number): void {
-  window.open(`/api/projects/${projectId}/export`, '_blank');
+  window.open(`/api/projects/${projectId}/export`, '_blank', 'noopener,noreferrer');
 }
 
 /** 全栈预览装配 HTML 的同源地址（iframe src 与新窗口共用，装配/CSP 都在服务端） */
@@ -180,6 +188,25 @@ export function sendProjectMessage(
     method: 'POST',
     body: JSON.stringify(body),
   });
+}
+
+/** POST /api/projects/[id]/checkpoints/[cpId]/restore 响应：restoredFiles=恢复的文件数 */
+export interface RestoreCheckpointResult {
+  ok: true;
+  checkpointId: number;
+  restoredFiles: number;
+}
+
+/**
+ * 项目级回滚（DESIGN §3.10，T25 时间线「回到此任务前」入口）：
+ * 服务端事务内恢复 files（回滚前内容入版本历史，可再撤销）→ 检查点之后的任务标 rolled_back
+ * → 聊天区落一条回滚通知（SSE message 事件）。**不发 file 事件**——调用方须重拉快照对齐 store。
+ */
+export function restoreProjectCheckpoint(projectId: number, checkpointId: number): Promise<RestoreCheckpointResult> {
+  return requestJson<RestoreCheckpointResult>(
+    `/api/projects/${projectId}/checkpoints/${checkpointId}/restore`,
+    { method: 'POST' },
+  );
 }
 
 /** 停止当前生成（空闲项目为幂等 no-op；stopped 事件与状态收口由运行中轮次负责） */

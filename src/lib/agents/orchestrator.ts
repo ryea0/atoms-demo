@@ -285,10 +285,24 @@ function appendInterventions(base: string, interventions: readonly Message[]): s
   return `${base}${interventionBlock(interventions)}`;
 }
 
+/** 文件级任务键（`engineer:{path}`）折算出的展示路径；任务级键（如 pm-prd）无 path */
+function injectedPathOf(targetTaskKey: string): string | undefined {
+  const prefix = 'engineer:';
+  return targetTaskKey.startsWith(prefix) ? targetTaskKey.slice(prefix.length) || undefined : undefined;
+}
+
+/** 打戳落库的 meta：原 meta（mentions）+ 注入边界（targetTask）+ 文件级注入的展示 path（T25） */
+function injectedMetaOf(item: Message, targetTaskKey: string): MessageMeta {
+  const path = injectedPathOf(targetTaskKey);
+  return { ...item.meta, targetTask: targetTaskKey, ...(path === undefined ? {} : { path }) };
+}
+
 /**
  * 步骤边界取走待注入干预（DESIGN §3.5 两级边界共用的确定性通道）：
  * 先事件留痕再打戳（带项目作用域，CLAUDE.md 规则 9）；空列表不打戳不发作。
  * 任务边界（必检级）与工程师文件边界（每文件完成间）都走这里。
+ * 打戳同时把 targetTask 写回消息 meta（T25）：前端刷新后从快照读 meta 仍能还原
+ * 「已注入 {文件}」，不再降级成无边界信息的「已注入下一步骤」。
  */
 async function takeInterventions(
   storage: StorageProvider,
@@ -305,8 +319,9 @@ async function takeInterventions(
       content: item.content,
       meta: { messageId: item.id, targetTask: targetTaskKey },
     });
+    // 逐条打戳（每条 meta 各自带原 mentions，合并而非覆盖）
+    await storage.markDelivered([item.id], projectId, injectedMetaOf(item, targetTaskKey));
   }
-  await storage.markDelivered(items.map((item) => item.id), projectId);
   return items;
 }
 
@@ -364,19 +379,27 @@ async function editingEnabledFor(c: TaskContext): Promise<boolean> {
 
 /**
  * 挂起等待裁决：轮询干预队列（用户回复=三选一）与软锁状态。
- * - 用户回复三选一 → 消费该条干预（打戳带项目作用域）并返回裁决
+ * - 用户回复三选一 → 消费该条干预：发 intervention_injected 事件（队列卡实时翻转为已消费，
+ *   T25——此前该路径只打戳不发事件，聊天区卡片要等刷新才变）+ 打戳带项目作用域与 targetTask
  * - 软锁消失（人退出编辑 / TTL 到期）→ 按「稍后」处理：不代用户做「覆盖」决定，
  *   人工未保存的本地改动仍以库中最新版为准，本轮先跳过
  * - 停止信号 → 抛 AgentAbortError（顶层统一收口 stopped/paused）
  */
 async function awaitSoftLockRuling(c: TaskContext, path: string): Promise<SoftLockRuling> {
+  const targetTask = `engineer:${path}`;
   while (!c.signal.aborted) {
     const pending = await c.storage.takePendingInterventions(c.projectId);
     const hit = pending.find((item) => rulingOf(item.content) !== null);
     if (hit !== undefined) {
       const ruling = rulingOf(hit.content);
       if (ruling === null) break; // 不可达（find 谓词已收窄）
-      await c.storage.markDelivered([hit.id], c.projectId);
+      c.emit({
+        runId: null,
+        event: 'intervention_injected',
+        content: hit.content,
+        meta: { messageId: hit.id, targetTask, ruling },
+      });
+      await c.storage.markDelivered([hit.id], c.projectId, injectedMetaOf(hit, targetTask));
       return ruling;
     }
     const stillLocked = (await c.storage.getSoftLockedFiles(c.projectId)).some((row) => row.path === path);

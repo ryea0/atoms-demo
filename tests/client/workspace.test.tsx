@@ -361,3 +361,99 @@ describe('窄屏底部栏目切换', () => {
     expect(viewerTab).toHaveAttribute('aria-selected', 'false');
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* 跨面板接线（T25）：文件树 / 产物卡 / 时间线回滚                         */
+/* ------------------------------------------------------------------ */
+
+describe('跨面板接线（T25）', () => {
+  it('文件树点击 → 查看器打开该文件页签，文件树行同步高亮', async () => {
+    mountWorkspace();
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('prd.md'));
+
+    // 查看器出现对应页签与文件面板（头部显示完整路径）
+    expect(await screen.findByRole('tab', { selected: true, name: /prd\.md/ })).toBeInTheDocument();
+    expect(screen.getByText('docs/prd.md')).toBeInTheDocument();
+    // 文件树选中态由查看器激活页签回写（单一选中状态）
+    expect(screen.getByRole('treeitem', { name: /prd\.md/ })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('产物工具卡点击 → 打开同一查看器页签（与文件树共用选中状态）', async () => {
+    const snapshot = makeSnapshot({
+      agentRuns: [makeRun({ id: 43, agent: 'engineer', status: 'done', taskKey: 'engineer:index.html' })],
+    });
+    mountWorkspace(snapshot);
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+
+    const card = screen.getByRole('button', { name: '打开 index.html' });
+    fireEvent.click(card);
+
+    expect(await screen.findByRole('tab', { selected: true, name: /index\.html/ })).toBeInTheDocument();
+    expect(screen.getByRole('treeitem', { name: /index\.html/ })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('时间线「回到此任务前」→ 确认对话框 → POST restore → 快照刷新（未保存修改将被覆盖）', async () => {
+    const snapshot = makeSnapshot({
+      agentRuns: [makeRun({ id: 42, agent: 'engineer', status: 'done', taskKey: 'engineer:index.html' })],
+      checkpoints: [
+        {
+          id: 5,
+          projectId: PROJECT_ID,
+          label: '任务前:eng-app-main',
+          agentRunId: null,
+          afterRunId: 10,
+          createdAt: 1_700_000_000_000,
+        },
+      ],
+    });
+    const calls: { url: string; method: string }[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+      calls.push({ url, method });
+      if (method === 'POST' && url.endsWith('/checkpoints/5/restore')) {
+        return jsonResponse({ ok: true, checkpointId: 5, restoredFiles: 2 });
+      }
+      return jsonResponse(snapshot);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
+    MockEventSource.instances.length = 0;
+    render(createElement(Workspace, { projectId: PROJECT_ID }));
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /回到此任务前/ }));
+
+    // 确认对话框：明确提示未保存的人工修改将被覆盖
+    expect(await screen.findByRole('alertdialog')).toBeInTheDocument();
+    expect(screen.getByText(/未保存的人工修改将被覆盖/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '确认回滚' }));
+    await waitFor(() =>
+      expect(calls.some((call) => call.method === 'POST' && call.url.endsWith('/checkpoints/5/restore'))).toBe(true),
+    );
+    // 回滚走服务端写路径且不发 file 事件：完成后必须重拉快照对齐 store
+    expect(calls.filter((call) => call.method === 'GET' && call.url.endsWith(`/api/projects/${PROJECT_ID}`)).length).toBeGreaterThan(1);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('时间线回滚前无对应检查点：不弹确认框、不发请求', async () => {
+    const calls: { url: string; method: string }[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: typeof input === 'string' ? input : input.toString(), method: (init?.method ?? 'GET').toUpperCase() });
+      return jsonResponse(makeSnapshot());
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
+    MockEventSource.instances.length = 0;
+    render(createElement(Workspace, { projectId: PROJECT_ID }));
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+
+    const buttons = screen.getAllByRole('button', { name: /回到此任务前/ });
+    fireEvent.click(buttons[0] as HTMLElement);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    expect(calls.some((call) => call.method === 'POST')).toBe(false);
+  });
+});

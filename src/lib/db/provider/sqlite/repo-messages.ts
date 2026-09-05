@@ -6,7 +6,7 @@
 import { and, asc, eq, inArray, isNull } from 'drizzle-orm';
 import { messages } from './schema';
 import type { SqliteDb } from './storage';
-import type { AddMessageInput, Message, MessagesRepo } from '../types';
+import type { AddMessageInput, Message, MessageMeta, MessagesRepo } from '../types';
 
 /** 行 → 领域类型映射：json 列在 drizzle 的 $type 下可能返回 null，统一收敛为 Message.meta 的可空形状 */
 function toMessage(row: typeof messages.$inferSelect): Message {
@@ -71,13 +71,15 @@ export function createMessagesRepo(db: SqliteDb): MessagesRepo {
      * projectId 可选作用域（规则 9：写入强制 project_id 过滤）——编排器/路由应始终传入，
      * 即使批量里混入了他项目 id 也只会动本项目；缺省时按裸 ids 生效，仅限已先行校验归属的调用方
      * （保留以兼容 brief 原签名）。
+     * meta 可选：注入打戳时写回 targetTask（T25——刷新后从快照也能还原「已注入 {文件}」），
+     * 由调用方传入合并后的完整 meta（仓库层不做合并）；不传则保持原值。
      */
-    async markDelivered(messageIds: number[], projectId?: number): Promise<void> {
+    async markDelivered(messageIds: number[], projectId?: number, meta?: MessageMeta): Promise<void> {
       if (messageIds.length === 0) return;
       const scope = inArray(messages.id, messageIds);
       await db
         .update(messages)
-        .set({ deliveredAt: Date.now() })
+        .set(meta === undefined ? { deliveredAt: Date.now() } : { deliveredAt: Date.now(), meta: meta ?? null })
         .where(projectId === undefined ? scope : and(scope, eq(messages.projectId, projectId)));
     },
   };

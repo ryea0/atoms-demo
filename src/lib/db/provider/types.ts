@@ -18,9 +18,10 @@ export interface Project { id:number; sessionId:string; title:string; requiremen
 
 /**
  * 消息元数据：mentions=@ 指定成员；kind 标记特殊聊天卡片（softlock=软锁裁决 / restore=回滚通知）、
- * path 为关联文件路径——随消息落库（T23），刷新后前端仍能还原裁决卡片。
+ * path 为关联文件路径、targetTask 为干预注入边界对应的任务键（`engineer:{path}`，T25）——
+ * 随消息落库（T23/T25），刷新后前端仍能还原裁决卡片与「已注入 {文件}」队列卡。
  */
-export interface MessageMeta { mentions?:AgentRole[]; kind?:string; path?:string; }
+export interface MessageMeta { mentions?:AgentRole[]; kind?:string; path?:string; targetTask?:string; }
 
 export interface Message { id:number; projectId:number; role:'user'|'assistant'|'intervention'|'system';
   content:string; meta?:MessageMeta|null; deliveredAt:number|null; createdAt:number; }
@@ -89,6 +90,8 @@ export type ProjectListItem = Project & {
 /** 项目仓库：全部查询强制 sessionId/projectId 过滤（CLAUDE.md 规则 9） */
 export interface ProjectsRepo {
   createProject(input: CreateProjectInput): Promise<Project>;
+  /** 项目总数（不分会话）：seed 幂等守卫用（projects 表空才插预置项目，T25） */
+  countProjects(): Promise<number>;
   listProjects(sessionId: string): Promise<ProjectListItem[]>;
   getProject(projectId: number): Promise<Project|null>;
   renameProject(projectId: number, title: string): Promise<void>;
@@ -104,8 +107,12 @@ export interface MessagesRepo {
   addMessage(input: AddMessageInput): Promise<Message>;
   listMessages(projectId: number): Promise<Message[]>;
   takePendingInterventions(projectId: number): Promise<Message[]>;
-  /** projectId 提供时强制项目级作用域（规则 9）；缺省则按裸 ids 生效（调用方须已自行校验归属） */
-  markDelivered(messageIds: number[], projectId?: number): Promise<void>;
+  /**
+   * projectId 提供时强制项目级作用域（规则 9）；缺省则按裸 ids 生效（调用方须已自行校验归属）。
+   * meta 提供时一并覆盖该批消息的 meta（注入打戳写回 targetTask 用，T25）——调用方负责带上
+   * 原 meta 字段（仓库层不做合并），不传则 meta 保持原值。
+   */
+  markDelivered(messageIds: number[], projectId?: number, meta?: MessageMeta): Promise<void>;
 }
 
 /** upsertFile 入参（统一写入口：agent/seed 生成、人工新建同走此 API） */
@@ -114,8 +121,12 @@ export interface UpsertFileInput { projectId:number; path:string; content:string
 /** saveHuman 入参：baseVersion 为编辑器打开时的版本号，不匹配即冲突（CAS，DESIGN §3.9） */
 export interface SaveHumanInput { projectId:number; fileId:number; content:string; baseVersion:number; }
 
-/** saveHuman 结果：失败时带回服务端当前内容，前端渲染冲突对话框（用我的版本/用 agent 版本/并排 diff） */
-export type SaveHumanResult = { ok:true; version:number } | { ok:false; conflict:true; current:string };
+/**
+ * saveHuman 结果：失败时带回服务端当前内容与**当前版本号**，前端渲染冲突对话框
+ * （用我的版本/用 agent 版本/并排 diff）。version 让「用我的版本」在 SSE 断连、
+ * 客户端拿不到最新版本号时也能一次重发成功（T25）。
+ */
+export type SaveHumanResult = { ok:true; version:number } | { ok:false; conflict:true; current:string; version:number };
 
 /** file_tree 行（树形 UI 只需路径+版本+最后编辑者，不背内容） */
 export interface FileListItem { path:string; version:number; lastEditor:AgentRole|'human'|'seed'; }

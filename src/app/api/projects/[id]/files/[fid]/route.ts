@@ -1,8 +1,9 @@
 /**
  * 人工编辑保存（Task 16，DESIGN §3.9 人机共编）：PATCH {content,baseVersion} → saveHuman。
  *
- * - CAS 乐观锁：baseVersion 过期 → 409 {conflict:true,current=服务端最新内容}
- *   （前端据此渲染冲突对话框：用我的版本 / 用 agent 版本 / 并排 diff）
+ * - CAS 乐观锁：baseVersion 过期 → 409 {conflict:true,current=服务端最新内容,version=服务端当前版本}
+ *   （前端据此渲染冲突对话框：用我的版本 / 用 agent 版本 / 并排 diff；version 供「用我的版本」
+ *   在 SSE 断连期间就地重发，T25）
  * - saveHuman 把「文件不存在」也归并为冲突（repo 契约），路由在调用前预检
  *   getFileById → 404，让两种失败可区分（ruling 5）
  * - content ≤ 512KB（rules 07 二次约束，与 fs 工具同一 MAX_CONTENT_BYTES 口径）
@@ -54,7 +55,7 @@ export async function PATCH(request: Request, ctx: { params: Promise<{ id: strin
     });
     if (!result.ok) {
       return applySessionCookie(
-        Response.json({ conflict: true, current: result.current }, { status: 409 }),
+        Response.json({ conflict: true, current: result.current, version: result.version }, { status: 409 }),
         owned.session,
       );
     }

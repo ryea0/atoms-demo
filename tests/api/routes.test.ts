@@ -348,7 +348,7 @@ describe('GET stream：Last-Event-ID 重放', () => {
 /* ------------------------------------------------------------------ */
 
 describe('PATCH /api/projects/[id]/files/[fid]', () => {
-  it('③ 成功 200 {version}；过期 baseVersion → 409 {conflict,current}；文件不存在 404；超 512KB 400', async () => {
+  it('③ 成功 200 {version}；过期 baseVersion → 409 {conflict,current,version}；文件不存在 404；超 512KB 400', async () => {
     const { id } = await seedProject();
     const { fileId } = await storage().upsertFile({ projectId: id, path: 'app/a.js', content: 'v1', editor: 'seed' });
 
@@ -364,7 +364,8 @@ describe('PATCH /api/projects/[id]/files/[fid]', () => {
       fileCtx(id, fileId),
     );
     expect(conflict.status).toBe(409);
-    expect(await conflict.json()).toEqual({ conflict: true, current: 'v2 内容' });
+    // 409 体回带服务端当前版本号（T25）：SSE 断连期间「用我的版本」也能一次重发成功
+    expect(await conflict.json()).toEqual({ conflict: true, current: 'v2 内容', version: 2 });
 
     const missing = await FILE_PATCH(
       patchJson(`http://localhost/api/projects/${id}/files/9999`, { content: 'x', baseVersion: 1 }, SESSION_A),
@@ -412,7 +413,7 @@ describe('GET /api/projects/[id]/preview', () => {
     expect(html).toContain('window.fetch'); // 拦截器在位
   });
 
-  it('无 api.js：只注入拦截器占位（/api/ 返回后端未生成）；缺 index.html → 404 中文提示', async () => {
+  it('无 api.js：只注入拦截器占位（/api/ 返回后端未生成）', async () => {
     const onlyIndex = await seedProject();
     await storage().upsertFile({ projectId: onlyIndex.id, path: 'app/frontend/index.html', content: indexHtml, editor: 'engineer' });
     const placeholder = await PREVIEW_GET(makeRequest(`http://localhost/api/projects/${onlyIndex.id}/preview`, {}, SESSION_A), idCtx(onlyIndex.id));
@@ -424,7 +425,24 @@ describe('GET /api/projects/[id]/preview', () => {
     const { id } = await seedProject();
     const missing = await PREVIEW_GET(makeRequest(`http://localhost/api/projects/${id}/preview`, {}, SESSION_A), idCtx(id));
     expect(missing.status).toBe(404);
-    expect(((await missing.json()) as { error: string }).error).toContain('index.html');
+    // 缺入口页与归属不符的错误分支见下一用例（中文 HTML 提示页）
+  });
+
+  it('失败分支回中文 HTML 提示页（iframe 里不再显示裸 404 JSON，T25）', async () => {
+    // 缺 index.html
+    const { id } = await seedProject();
+    const missing = await PREVIEW_GET(makeRequest(`http://localhost/api/projects/${id}/preview`, {}, SESSION_A), idCtx(id));
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get('content-type')).toContain('text/html');
+    const html = await missing.text();
+    expect(html).toContain('预览不可用');
+    expect(html).toContain('index.html');
+
+    // 未授权 / 他人 id（归属不符同样 404）
+    const foreign = await PREVIEW_GET(makeRequest(`http://localhost/api/projects/${id}/preview`, {}, SESSION_B), idCtx(id));
+    expect(foreign.status).toBe(404);
+    expect(foreign.headers.get('content-type')).toContain('text/html');
+    expect(await foreign.text()).toContain('预览不可用');
   });
 });
 

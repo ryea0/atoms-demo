@@ -798,6 +798,119 @@ describe('查看器编辑态（软锁 / 保存 / 冲突）', () => {
     expect(lockBodies).toEqual([{ on: true }, { on: false }]);
   });
 
+  it('SSE 断连期间 409 体回带 version：「用我的版本」用它就地重发一次成功（T25）', async () => {
+    const lockBodies: unknown[] = [];
+    const patchBodies: unknown[] = [];
+    stubFetch([
+      ...baseRoutes(),
+      {
+        method: 'PUT',
+        prefix: `/api/projects/${PROJECT_ID}/files/103/lock`,
+        respond: (body) => {
+          lockBodies.push(body);
+          return jsonResponse({});
+        },
+      },
+      {
+        method: 'PATCH',
+        prefix: `/api/projects/${PROJECT_ID}/files/103`,
+        respond: (body) => {
+          patchBodies.push(body);
+          const patch = body as { content: string; baseVersion: number };
+          // agent 已把服务端推进到 v3，但 SSE 断连：store 始终停在 v2，只能靠 409 体里的 version
+          return patch.baseVersion !== 3
+            ? jsonResponse({ conflict: true, current: 'agent 写的最新内容', version: 3 }, 409)
+            : jsonResponse({ version: 4 });
+        },
+      },
+    ]);
+
+    hydrateStore();
+    await mountViewer({ initialPath: 'app/main.js' });
+    const editButton = await screen.findByRole('button', { name: '编辑文件' });
+    await waitFor(() => expect(editButton).toBeEnabled());
+    fireEvent.click(editButton);
+    const textarea = await screen.findByRole('textbox', { name: '编辑 app/main.js' });
+    fireEvent.change(textarea, { target: { value: '我的修改' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(await screen.findByText('工程师已更新')).toBeInTheDocument();
+    expect(patchBodies).toEqual([{ content: '我的修改', baseVersion: 2 }]);
+
+    // 全程无 SSE（store 版本仍停在 v2）——「用我的版本」以 409 回带的 version=3 重发
+    fireEvent.click(screen.getByRole('button', { name: '用我的版本' }));
+    await waitFor(() => expect(patchBodies).toHaveLength(2));
+    expect(patchBodies[1]).toEqual({ content: '我的修改', baseVersion: 3 });
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: '编辑 app/main.js' })).not.toBeInTheDocument());
+    expect(lockBodies).toEqual([{ on: true }, { on: false }]);
+  });
+
+  it('agent 流式写同文件期间人工保存拒存：不发 PATCH，提示稍候（T25）', async () => {
+    const patchBodies: unknown[] = [];
+    const lockBodies: unknown[] = [];
+    stubFetch([
+      ...baseRoutes(),
+      {
+        method: 'PUT',
+        prefix: `/api/projects/${PROJECT_ID}/files/103/lock`,
+        respond: (body) => {
+          lockBodies.push(body);
+          return jsonResponse({});
+        },
+      },
+      {
+        method: 'PATCH',
+        prefix: `/api/projects/${PROJECT_ID}/files/103`,
+        respond: (body) => {
+          patchBodies.push(body);
+          return jsonResponse({ version: 3 });
+        },
+      },
+    ]);
+
+    hydrateStore();
+    await mountViewer({ initialPath: 'app/main.js' });
+    const editButton = await screen.findByRole('button', { name: '编辑文件' });
+    await waitFor(() => expect(editButton).toBeEnabled());
+    fireEvent.click(editButton);
+    const textarea = await screen.findByRole('textbox', { name: '编辑 app/main.js' });
+    fireEvent.change(textarea, { target: { value: '我的修改' } });
+
+    // 编辑期间工程师开始重写同一文件（file_start → streaming）
+    act(() => {
+      createWorkspaceStore(PROJECT_ID).applyEvent({
+        seq: 1,
+        projectId: PROJECT_ID,
+        runId: null,
+        event: 'file_start',
+        agent: 'engineer',
+        path: 'app/main.js',
+      });
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+
+    // 拒存：PATCH 一次都不发，编辑态与草稿保留，给中文提示
+    expect(patchBodies).toEqual([]);
+    expect(await screen.findByText('该文件正在生成中，请稍候')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '编辑 app/main.js' })).toBeInTheDocument();
+
+    // 生成结束后可正常保存（草稿未丢）
+    act(() => {
+      createWorkspaceStore(PROJECT_ID).applyEvent({
+        seq: 2,
+        projectId: PROJECT_ID,
+        runId: null,
+        event: 'file_end',
+        agent: 'engineer',
+        path: 'app/main.js',
+        meta: { version: 3 },
+      });
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+    await waitFor(() => expect(patchBodies).toHaveLength(1));
+    expect(patchBodies[0]).toEqual({ content: '我的修改', baseVersion: 3 });
+  });
+
   it('409 后选择「用 agent 的版本」：放弃草稿退出编辑，软锁释放', async () => {
     const lockBodies: unknown[] = [];
     stubFetch([

@@ -10,6 +10,8 @@
   /* 产品强调色与面板底色（.claude/rules/04 设计基线） */
   --color-brand: var(--brand);
   --color-panel: var(--panel);
+  /* 人工/预置产物角标绿（文件树 M 角标、查看器角标同一口径） */
+  --color-human: var(--human);
   --font-sans: var(--font-sans);
   --font-mono: var(--font-mono);
   --font-heading: var(--font-sans);
@@ -57,6 +59,8 @@
   /* 蓝 #3B82F6：选中态/链接/M 角标；#F7F7F8：侧栏与面板分层底色 */
   --brand: #3b82f6;
   --panel: #f7f7f8;
+  /* 绿 = 人工/预置（Tailwind emerald-600）；深色模式提到 emerald-500 保对比度 */
+  --human: oklch(0.596 0.145 163.225);
   --card: oklch(1 0 0);
   --card-foreground: oklch(0.145 0 0);
   --popover: oklch(1 0 0);
@@ -92,6 +96,7 @@
 .dark {
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
+  --human: oklch(0.696 0.17 162.48);
   --card: oklch(0.205 0 0);
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);
