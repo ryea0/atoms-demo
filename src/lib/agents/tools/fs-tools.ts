@@ -7,6 +7,8 @@
  */
 import { z } from 'zod';
 import type { AgentRole, StorageProvider } from '@/lib/db/provider/types';
+import { getRetriever } from '@/lib/retrieval/registry';
+import { BadQueryError, type RankedHit } from '@/lib/retrieval/types';
 import { normalizeProjectPath } from './sandbox';
 
 /**
@@ -192,36 +194,33 @@ const listFiles = defineTool({
   },
 });
 
-/** 正则扫全项目文件内容，输出 path:line: 匹配行（上限 50 行，超出给总数提示） */
+/**
+ * 正则扫全项目文件内容，输出 path:line: 匹配行（上限 50 行，超出给总数提示）。
+ * 检索本体经 getRetriever 路由（DESIGN §12：默认 grep，RETRIEVAL_PROVIDER=fts5 时换全文索引），
+ * 工具层只负责展示口径（行数/行宽截断、命中计数、错误回喂）——默认输出与检索层抽取前逐字节一致。
+ */
 const grep = defineTool({
   name:'grep',
-  description:'用 JS 正则在当前项目所有文件内容里逐行检索，输出 path:line: 匹配行（最多 50 行）。适合"这个函数在哪被调用"类问题。',
+  description:'在当前项目所有文件内容里逐行检索，输出 path:line: 匹配行（最多 50 行）。默认按 JS 正则匹配；启用全文索引时按字面短语匹配（大小写不敏感、非正则）。适合"这个函数在哪被调用"类问题。',
   schema:grepSchema,
   async execute(args, ctx) {
-    let regex:RegExp;
+    let hits:RankedHit[];
     try {
-      regex = new RegExp(args.pattern);
+      hits = await getRetriever(ctx.storage).search(args.pattern, { projectId:ctx.projectId });
     } catch (error) {
-      return { ok:false, output:`非法正则 "${args.pattern}"：${error instanceof Error ? error.message : String(error)}` };
-    }
-    const files = await ctx.storage.readAllFiles(ctx.projectId);
-    const hits:string[] = [];
-    let total = 0;
-    for (const file of files) {
-      const lines = toLf(file.content).split('\n');
-      for (let i = 0; i < lines.length; i += 1) {
-        const line = lines[i] ?? '';
-        if (!regex.test(line)) continue;
-        total += 1;
-        if (hits.length < GREP_MAX_LINES) {
-          const shown = line.length > GREP_LINE_CHARS ? `${line.slice(0, GREP_LINE_CHARS)}……[本行超长已截断]` : line;
-          hits.push(`${file.path}:${i + 1}: ${shown}`);
-        }
+      if (error instanceof BadQueryError) {
+        return { ok:false, output:`非法正则 "${args.pattern}"：${error.message}` };
       }
+      throw error;
     }
-    if (total === 0) return { ok:true, output:`未命中：项目内没有匹配 /${args.pattern}/ 的行` };
-    if (total > hits.length) hits.push(`……[共 ${total} 处命中，仅显示前 ${GREP_MAX_LINES} 行，可收窄 pattern]……`);
-    return { ok:true, output:hits.join('\n') };
+    if (hits.length === 0) return { ok:true, output:`未命中：项目内没有匹配 /${args.pattern}/ 的行` };
+    const lines:string[] = [];
+    for (const hit of hits.slice(0, GREP_MAX_LINES)) {
+      const shown = hit.text.length > GREP_LINE_CHARS ? `${hit.text.slice(0, GREP_LINE_CHARS)}……[本行超长已截断]` : hit.text;
+      lines.push(`${hit.path}:${hit.line}: ${shown}`);
+    }
+    if (hits.length > lines.length) lines.push(`……[共 ${hits.length} 处命中，仅显示前 ${GREP_MAX_LINES} 行，可收窄 pattern]……`);
+    return { ok:true, output:lines.join('\n') };
   },
 });
 
