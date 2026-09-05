@@ -488,6 +488,27 @@ describe('openai 兼容客户端', () => {
     expect(lle.status).toBe(401);
   });
 
+  it('complete：200 但响应体非 JSON（网关 HTML/截断）→ LlmError bad_response，附片段且不泄密钥', async () => {
+    stubOpenAiEnv();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response('<html>502 Bad Gateway sk-unit-test-key</html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+          }),
+        ),
+      ),
+    );
+    const err = asError(await getLlmProvider().complete(makeReq()).catch((e: unknown) => e));
+    expect(err).toBeInstanceOf(LlmError); // 不是裸 SyntaxError
+    expect((err as LlmError).code).toBe('bad_response');
+    expect((err as LlmError).status).toBe(200);
+    expect(err.message).toContain('502 Bad Gateway');
+    expect(err.message).not.toContain('sk-unit-test-key');
+  });
+
   it('缺少 LLM_BASE_URL → config_missing（调用时报错，构造不炸）', async () => {
     vi.stubEnv('LLM_PROVIDER', 'openai');
     vi.stubEnv('LLM_API_KEY', 'sk-unit-test-key');

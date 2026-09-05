@@ -238,6 +238,29 @@ function toLlmError(error: unknown, apiKey: string): LlmError {
   return new LlmError('network_error', `LLM 请求失败：${sanitize(String(error), apiKey)}`);
 }
 
+/**
+ * 读取并解析 JSON 响应体（complete 路径）。
+ * 200 但响应非 JSON（网关返回 HTML、响应体截断）→ 结构化 bad_response：
+ * 带 code/status 与脱敏后的响应体片段，不向外抛裸 SyntaxError（V8 会内嵌响应体原文）。
+ */
+async function readJsonBody(response: Response, key: string): Promise<unknown> {
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (error) {
+    throw toLlmError(error, key); // 响应体读取中断（网络/截断）
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new LlmError(
+      'bad_response',
+      `LLM 响应非 JSON（HTTP ${response.status} ${response.headers.get('content-type') ?? ''}）：${clip(sanitize(text, key))}`,
+      response.status,
+    );
+  }
+}
+
 /** 创建 OpenAI 兼容 provider（LLM_PROVIDER=openai） */
 export function createOpenAiProvider(env: NodeJS.ProcessEnv = process.env): LlmProvider {
   const apiKey = (): string => env.LLM_API_KEY?.trim() ?? '';
@@ -284,7 +307,7 @@ export function createOpenAiProvider(env: NodeJS.ProcessEnv = process.env): LlmP
     /** 非流式：一次拿全量结果 */
     async complete(req: LlmRequest): Promise<LlmResult> {
       const response = await post(toRequestBody(req, false), req.signal);
-      const json: unknown = await response.json();
+      const json: unknown = await readJsonBody(response, apiKey());
       const parsed = completionSchema.safeParse(json);
       if (!parsed.success) {
         throw new LlmError('bad_response', `LLM 响应结构无法解析：${clip(parsed.error.message, 300)}`);
