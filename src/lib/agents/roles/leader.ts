@@ -9,6 +9,10 @@
  * 工具是**收集器**：assign_task/reply_to_user/finish 只往内存 collector 里登记，不落库、
  * 不碰虚拟文件系统——agent_runs 落库与 DAG 调度由编排器（Task 10）接手。
  *
+ * 良构 DAG 保证：重复 task_key / 自引用在收集时当场拒绝并回喂（ok=false，模型下一轮自纠）；
+ * 前向引用（同轮内后登记的 task_key）合法；悬空 depends_on 在返回决策前剔除（只删边不删任务），
+ * 编排器拿到的依赖恒指向本轮已登记的任务。
+ *
  * 回退语义（三段式第 3 步，DESIGN §3.4）：
  * - runAgent 抛错（校验重试耗尽 / 步数超限 / provider 失败 / provider 配置缺失）
  *   或「零任务且无 reply」→ 默认流水线：
@@ -166,18 +170,26 @@ function createLeaderTools(collector: LeaderCollector): Tool[] {
       if (collector.closed) {
         return { ok: false, output: '本轮已收口（已回答用户或已宣告结束），该任务不再登记；如需追加请留给下一轮' };
       }
+      // task_key 是 depends_on 的引用锚点，重复会让 DAG 歧义——当场拒绝并回喂，模型下一轮自纠
+      if (collector.tasks.some((task) => task.taskKey === args.task_key)) {
+        return { ok: false, output: `重复的 task_key：${args.task_key}（本轮内必须唯一），请换一个 task_key 重新分派` };
+      }
+      const deps = args.depends_on ?? [];
+      if (deps.includes(args.task_key)) {
+        return { ok: false, output: `任务 ${args.task_key} 的 depends_on 含自身引用：任务不能依赖自己，请去掉后重新分派` };
+      }
       const assignment: TaskAssignment = {
         taskKey: args.task_key,
         agent: args.agent,
         instruction: args.instruction,
         writesPaths: args.writes_paths,
-        dependsOn: args.depends_on ?? [],
+        dependsOn: deps,
       };
       collector.tasks.push(assignment);
-      const deps = assignment.dependsOn.length > 0 ? `，依赖 ${assignment.dependsOn.join('、')}` : '';
+      const depNote = assignment.dependsOn.length > 0 ? `，依赖 ${assignment.dependsOn.join('、')}` : '';
       return {
         ok: true,
-        output: `已登记任务 ${assignment.taskKey}（角色：${assignment.agent}，写路径：${assignment.writesPaths.join('、')}${deps}）`,
+        output: `已登记任务 ${assignment.taskKey}（角色：${assignment.agent}，写路径：${assignment.writesPaths.join('、')}${depNote}）`,
       };
     },
   });
@@ -328,6 +340,17 @@ function isAbort(error: unknown): boolean {
 }
 
 /**
+ * 依赖收口：只保留指向本轮已登记 task_key 的依赖，悬空引用剔除——保证返回给编排器的 DAG 良构
+ * （前向引用合法：同轮内后登记的 task_key 也算已登记；剔除只删边不删任务，任务本身照常分派）。
+ */
+function stripDanglingDeps(tasks: TaskAssignment[]): TaskAssignment[] {
+  const keys = new Set(tasks.map((task) => task.taskKey));
+  return tasks.map((task) =>
+    task.dependsOn.every((dep) => keys.has(dep)) ? task : { ...task, dependsOn: task.dependsOn.filter((dep) => keys.has(dep)) },
+  );
+}
+
+/**
  * 领导路由：@ 覆盖直派 → LLM 工具循环收集 → 失败/空手而归时回退默认流水线。
  * 返回的 TaskAssignment 只描述分派意图，落库与调度由编排器负责。
  */
@@ -378,9 +401,10 @@ export async function routeLeader(input: RouteLeaderInput): Promise<LeaderDecisi
   }
 
   if (collector.tasks.length > 0) {
+    const tasks = stripDanglingDeps(collector.tasks);
     return collector.reply === null
-      ? { kind: 'tasks', tasks: collector.tasks }
-      : { kind: 'tasks', tasks: collector.tasks, reply: collector.reply };
+      ? { kind: 'tasks', tasks }
+      : { kind: 'tasks', tasks, reply: collector.reply };
   }
   if (collector.reply !== null) return { kind: 'reply', reply: collector.reply };
 

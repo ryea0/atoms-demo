@@ -38,6 +38,8 @@ class ScriptExhaustedError extends Error {
 class FakeProvider implements LlmProvider {
   readonly name = 'fake';
   readonly requests: LlmRequest[] = [];
+  /** 钩子：每次 stream 被调用时触发（用于模拟「跑到一半用户点了停止」） */
+  onStream?: (req: LlmRequest) => void;
   private readonly script: ScriptedStep[];
   private cursor = 0;
 
@@ -47,6 +49,7 @@ class FakeProvider implements LlmProvider {
 
   async stream(req: LlmRequest): Promise<LlmResult> {
     this.requests.push({ ...req, messages: req.messages.map((message) => ({ ...message })) });
+    this.onStream?.(req);
     const step = this.script[this.cursor];
     this.cursor += 1;
     if (step === undefined) throw new ScriptExhaustedError();
@@ -115,6 +118,32 @@ function baseInput(
 function taskKeys(decision: Awaited<ReturnType<typeof routeLeader>>): string[] {
   if (decision.kind !== 'tasks') throw new Error(`预期 kind='tasks'，实际 ${decision.kind}`);
   return decision.tasks.map((task) => task.taskKey);
+}
+
+/** 同上，取完整任务列表（供 dependsOn 断言） */
+function tasksOf(decision: Awaited<ReturnType<typeof routeLeader>>) {
+  if (decision.kind !== 'tasks') throw new Error(`预期 kind='tasks'，实际 ${decision.kind}`);
+  return decision.tasks;
+}
+
+/** 第 index 次请求里回喂给模型的 tool 结果文本（断言「拒绝说明」有没有进历史） */
+function toolFeedbackAt(provider: FakeProvider, index: number): string {
+  const req = provider.requests[index];
+  if (req === undefined) throw new Error(`预期 provider 至少被调用 ${index + 1} 次，实际 ${provider.requests.length}`);
+  return req.messages
+    .filter((message) => message.role === 'tool')
+    .map((message) => message.content)
+    .join('\n');
+}
+
+/** 统一捕获：unknown → Error（断言用） */
+async function catchError(promise: Promise<unknown>): Promise<Error> {
+  try {
+    await promise;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  throw new Error('预期 routeLeader 抛错，但正常返回了决策');
 }
 
 /* ------------------------------------------------------------------ */
@@ -363,5 +392,113 @@ describe('领导 system prompt 契约', () => {
     for (const keyword of ['assign_task', 'reply_to_user', 'finish', 'task_key', 'depends_on', '快速模式', '完整模式']) {
       expect(LEADER_SYSTEM_PROMPT).toContain(keyword);
     }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* fix round 1：收集器 DAG 校验 + 停止语义不回退                          */
+/* ------------------------------------------------------------------ */
+
+describe('routeLeader：收集器 DAG 校验', () => {
+  it('重复 task_key 当场拒绝并回喂，模型下一轮换 key 自纠', async () => {
+    const { storage, projectId } = await newProject('full');
+    const provider = new FakeProvider(
+      {
+        toolCalls: [
+          { id: 'c1', name: 'assign_task', args: { task_key: 'eng-fix', agent: 'engineer', instruction: 'A', writes_paths: ['app/'] } },
+          { id: 'c2', name: 'assign_task', args: { task_key: 'eng-fix', agent: 'engineer', instruction: 'B', writes_paths: ['app/'] } },
+        ],
+      },
+      {
+        toolCalls: [
+          { id: 'c3', name: 'assign_task', args: { task_key: 'eng-fix-2', agent: 'engineer', instruction: 'B 改个标识重派', writes_paths: ['app/'] } },
+        ],
+      },
+      { content: '分派完成' },
+    );
+    const decision = await routeLeader(baseInput(storage, projectId, { provider }));
+
+    // 重名的第二次调用未登记；模型换 key 后成功
+    expect(taskKeys(decision)).toEqual(['eng-fix', 'eng-fix-2']);
+    expect(toolFeedbackAt(provider, 1)).toContain('重复的 task_key：eng-fix');
+  });
+
+  it('自引用当场拒绝；前向引用（同轮稍后登记）保留', async () => {
+    const { storage, projectId } = await newProject('full');
+    const provider = new FakeProvider(
+      {
+        toolCalls: [
+          { id: 'c1', name: 'assign_task', args: { task_key: 'a', agent: 'pm', instruction: 'x', writes_paths: ['docs/'], depends_on: ['a'] } },
+          { id: 'c2', name: 'assign_task', args: { task_key: 'eng', agent: 'engineer', instruction: 'y', writes_paths: ['app/'], depends_on: ['arch'] } },
+        ],
+      },
+      {
+        toolCalls: [
+          { id: 'c3', name: 'assign_task', args: { task_key: 'arch', agent: 'architect', instruction: 'z', writes_paths: ['docs/'] } },
+        ],
+      },
+      { content: '分派完成' },
+    );
+    const decision = await routeLeader(baseInput(storage, projectId, { provider }));
+
+    // 自引用的调用整条不登记；eng → arch 的前向引用在 arch 登记后成立
+    expect(tasksOf(decision).map((task) => [task.taskKey, task.dependsOn])).toEqual([
+      ['eng', ['arch']],
+      ['arch', []],
+    ]);
+    expect(toolFeedbackAt(provider, 1)).toContain('不能依赖自己');
+  });
+
+  it('真正未知的依赖在返回前剔除（只删边不删任务，返回的 DAG 恒良构）', async () => {
+    const { storage, projectId } = await newProject('full');
+    const provider = new FakeProvider(
+      {
+        toolCalls: [
+          { id: 'c1', name: 'assign_task', args: { task_key: 'x', agent: 'engineer', instruction: 'y', writes_paths: ['app/'], depends_on: ['ghost'] } },
+        ],
+      },
+      { content: '分派完成' },
+    );
+    const decision = await routeLeader(baseInput(storage, projectId, { provider }));
+
+    expect(tasksOf(decision)).toEqual([
+      { taskKey: 'x', agent: 'engineer', instruction: 'y', writesPaths: ['app/'], dependsOn: [] },
+    ]);
+  });
+});
+
+describe('routeLeader：停止语义不回退', () => {
+  it('预中止的 signal → 抛 name=AbortError，provider 零调用、决策从不产出', async () => {
+    const { storage, projectId } = await newProject('full');
+    const provider = new FakeProvider(); // 空脚本：一旦被调用立即抛错
+    const controller = new AbortController();
+    controller.abort();
+
+    const error = await catchError(routeLeader(baseInput(storage, projectId, { signal: controller.signal, provider })));
+
+    expect(error.name).toBe('AbortError');
+    expect(provider.requests).toHaveLength(0);
+    expect(await storage.usageByProject(projectId)).toEqual([]);
+  });
+
+  it('跑到一半中止 → 抛 AbortError 且不再发起下一次 provider 调用（不烧回退流水线）', async () => {
+    const { storage, projectId } = await newProject('full');
+    const controller = new AbortController();
+    const provider = new FakeProvider(
+      { toolCalls: [{ id: 'c1', name: 'assign_task', args: { task_key: 'eng', agent: 'engineer', instruction: 'y', writes_paths: ['app/'] } }] },
+      { content: '不应到达' },
+    );
+    provider.onStream = () => controller.abort(); // 首次调用返回后立即中止
+
+    const error = await catchError(
+      routeLeader(baseInput(storage, projectId, { signal: controller.signal, provider })),
+    );
+
+    expect(error.name).toBe('AbortError');
+    expect(provider.requests).toHaveLength(1);
+    // 只有一次成功调用的计量，中止后没有为回退再烧 LLM
+    expect(await storage.usageByProject(projectId)).toEqual([
+      { agentRole: 'leader', model: resolveModel('leader'), tokens: expect.any(Number), calls: 1 },
+    ]);
   });
 });
