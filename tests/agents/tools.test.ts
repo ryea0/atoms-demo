@@ -108,7 +108,22 @@ describe('fsTools：write_file', () => {
     const big = 'x'.repeat(512 * 1024 + 1);
     const result = await toolByName('write_file').execute({ path:'a.txt', content:big }, ctx);
     expect(result.ok).toBe(false);
+    expect(result.output).toContain('字节');
     expect(await storage.listFiles(projectId)).toHaveLength(0);
+  });
+
+  it('512KB 上限按 UTF-8 字节数计（多字节字符不被字符数漏过）', async () => {
+    const { ctx, storage, projectId } = await newCtx();
+    // 180000 个汉字：字符数 18 万（远低于 512K），字节数 540000（超过 512KB）
+    const result = await toolByName('write_file').execute({ path:'cjk.txt', content:'中'.repeat(180000) }, ctx);
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('字节');
+    expect(await storage.listFiles(projectId)).toHaveLength(0);
+
+    // 恰好 524288 字节的 ASCII 内容放行（边界）
+    const exact = 'x'.repeat(512 * 1024);
+    const okResult = await toolByName('write_file').execute({ path:'exact.txt', content:exact }, ctx);
+    expect(okResult.ok).toBe(true);
   });
 });
 
@@ -155,6 +170,39 @@ describe('fsTools：read_file', () => {
     expect(result.output).toContain('line-500');
     expect(result.output).not.toContain('line-250'); // 被省略的中段
     expect(result.output).toContain('500'); // 行数提示含总行数
+  });
+
+  it('行数达标但总量超长（100 行 × 1000 字符）仍按首尾字符截断并给诚实提示', async () => {
+    const { ctx } = await newCtx();
+    const content = Array.from({ length:100 }, (_v, i) => {
+      const label = `line-${i + 1}:`;
+      return label + 'x'.repeat(1000 - label.length); // 每行恰好 1000 字符，共 ~100k 字符
+    }).join('\n');
+    await toolByName('write_file').execute({ path:'wide.md', content }, ctx);
+    const result = await toolByName('read_file').execute({ path:'wide.md' }, ctx);
+    expect(result.ok).toBe(true);
+    expect(result.output).toContain('line-1:');
+    expect(result.output).toContain('line-100:');
+    expect(result.output).not.toContain('line-50'); // 中段被省略
+    expect(result.output).toContain('字符'); // 截断提示按字符数说明
+    expect(result.output.length).toBeLessThan(17000);
+  });
+
+  it('单行超长（1 行 50k 字符）也被字符上限截断', async () => {
+    const { ctx } = await newCtx();
+    await toolByName('write_file').execute({ path:'min.js', content:'a'.repeat(50000) }, ctx);
+    const result = await toolByName('read_file').execute({ path:'min.js' }, ctx);
+    expect(result.ok).toBe(true);
+    expect(result.output.startsWith('aaaa')).toBe(true);
+    expect(result.output).toContain('字符');
+    expect(result.output.length).toBeLessThan(17000);
+  });
+
+  it('CRLF 内容按 LF 返回（不漏 \r）', async () => {
+    const { ctx } = await newCtx();
+    await toolByName('write_file').execute({ path:'win.md', content:'l1\r\nl2\r\nl3' }, ctx);
+    const result = await toolByName('read_file').execute({ path:'win.md' }, ctx);
+    expect(result).toEqual({ ok:true, output:'l1\nl2\nl3' });
   });
 
   it('沙箱拒绝的路径返回 ok:false', async () => {
@@ -231,6 +279,14 @@ describe('fsTools：grep', () => {
     expect(result.output).toContain('needle');
     expect(result.output).toContain('本行超长已截断');
     expect(result.output.length).toBeLessThan(400);
+  });
+
+  it('CRLF 文件按 LF 逐行扫，行尾锚点正则能命中', async () => {
+    const { ctx } = await newCtx();
+    await toolByName('write_file').execute({ path:'src/win.ts', content:'const a = 1;\r\n// TODO fix\r\n' }, ctx);
+    const result = await toolByName('grep').execute({ pattern:'fix$' }, ctx);
+    expect(result.ok).toBe(true);
+    expect(result.output).toContain('src/win.ts:2: // TODO fix');
   });
 
   it('非法正则返回 ok:false + 错误信息', async () => {

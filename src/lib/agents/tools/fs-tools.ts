@@ -35,12 +35,18 @@ export interface Tool {
   execute(args:unknown, ctx:ToolContext):Promise<{ok:boolean;output:string}>;
 }
 
-/** write_file 内容上限 512KB（.claude/rules/07：数据库写入前二次约束） */
-const MAX_CONTENT_CHARS = 512 * 1024;
+/** write_file 内容上限 512KB（.claude/rules/07：数据库写入前二次约束，按 UTF-8 字节数计） */
+const MAX_CONTENT_BYTES = 512 * 1024;
 /** read_file 截断保护（DESIGN §4.6）：超过 400 行只回首尾各 200 行 */
 const READ_TRUNCATE_LINES = 400;
 const READ_HEAD_LINES = 200;
 const READ_TAIL_LINES = 200;
+/**
+ * read_file 输出字符兜底（DESIGN §4.6 上下文预算）：
+ * 行数达标（≤400 行）的文件仍可能是压缩 JS/base64 这类超长行，全部吐出会撑爆模型上下文，
+ * 故最终输出超限再按首尾各半截断（保留首尾可见性语义）。
+ */
+const READ_MAX_OUTPUT_CHARS = 16000;
 /** grep 输出行数上限（DESIGN §4.6 工具结果截断） */
 const GREP_MAX_LINES = 50;
 /** grep 单行展示上限（压缩/超长行也占上下文预算） */
@@ -89,7 +95,12 @@ function checkedPath(path:string):{ok:true;path:string}|{ok:false;output:string}
   return result.ok ? result : { ok:false, output:`路径不合法：${result.error}` };
 }
 
-/** read_file 截断：末尾换行不算新行；>400 行 → 首 200 + 省略提示（含总行数）+ 尾 200 */
+/** CRLF 归一：否则行号错位、行尾锚点正则（如 TODO$）会静默失配 */
+function toLf(content:string):string {
+  return content.replace(/\r\n/g, '\n');
+}
+
+/** read_file 行数截断：末尾换行不算新行；>400 行 → 首 200 + 省略提示（含总行数）+ 尾 200 */
 function truncateLines(content:string):string {
   const lines = content.split('\n');
   if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
@@ -98,6 +109,15 @@ function truncateLines(content:string):string {
   const omitted = total - READ_HEAD_LINES - READ_TAIL_LINES;
   const marker = `……[中间省略 ${omitted} 行，文件共 ${total} 行，仅显示首尾各 ${READ_HEAD_LINES} 行]……`;
   return [...lines.slice(0, READ_HEAD_LINES), marker, ...lines.slice(total - READ_TAIL_LINES)].join('\n');
+}
+
+/** read_file 字符兜底：行数达标但总量超长（超长行/压缩 JS）时按首尾各半截断，附诚实提示 */
+function capChars(text:string):string {
+  if (text.length <= READ_MAX_OUTPUT_CHARS) return text;
+  const keep = Math.floor(READ_MAX_OUTPUT_CHARS / 2);
+  const omitted = text.length - keep * 2;
+  const marker = `……[中段省略 ${omitted} 字符，内容共 ${text.length} 字符，仅显示首尾各 ${keep} 字符]……`;
+  return `${text.slice(0, keep)}${marker}${text.slice(-keep)}`;
 }
 
 const writeFileSchema = z.object({
@@ -123,8 +143,9 @@ const writeFile = defineTool({
   async execute(args, ctx) {
     const path = checkedPath(args.path);
     if (!path.ok) return path;
-    if (args.content.length > MAX_CONTENT_CHARS) {
-      return { ok:false, output:`内容 ${args.content.length} 字符超过上限 ${MAX_CONTENT_CHARS}（512KB），请精简或拆分文件` };
+    const bytes = Buffer.byteLength(args.content, 'utf8');
+    if (bytes > MAX_CONTENT_BYTES) {
+      return { ok:false, output:`内容 ${bytes} 字节超过上限 ${MAX_CONTENT_BYTES} 字节（512KB），请精简或拆分文件` };
     }
     const { version } = await ctx.storage.upsertFile({
       projectId:ctx.projectId,
@@ -146,8 +167,9 @@ const readFile = defineTool({
     if (!path.ok) return path;
     const row = await ctx.storage.getFile(ctx.projectId, path.path);
     if (!row) return { ok:false, output:'文件不存在' };
-    if (row.content.length === 0) return { ok:true, output:'（空文件）' };
-    return { ok:true, output:truncateLines(row.content) };
+    const content = toLf(row.content);
+    if (content.length === 0) return { ok:true, output:'（空文件）' };
+    return { ok:true, output:capChars(truncateLines(content)) };
   },
 });
 
@@ -179,7 +201,7 @@ const grep = defineTool({
     const hits:string[] = [];
     let total = 0;
     for (const file of files) {
-      const lines = file.content.split('\n');
+      const lines = toLf(file.content).split('\n');
       for (let i = 0; i < lines.length; i += 1) {
         const line = lines[i] ?? '';
         if (!regex.test(line)) continue;
