@@ -383,6 +383,45 @@ describe('useWorkspaceFile 细粒度订阅', () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* fileId 透传（T21 查看器编辑保存 / 软锁声明按 fileId 定位文件）           */
+/* ------------------------------------------------------------------ */
+
+describe('文件 fileId 透传', () => {
+  it('快照 hydrate 带上 fileId；SSE 流式路径在落库前 fileId 为 null，后续快照补齐后 delta 不丢', () => {
+    const store = createWorkspaceStore(PROJECT_ID);
+    store.hydrate(
+      makeSnapshot({
+        files: [snapFile({ id: 101, path: 'index.html', version: 1, content: '<!doctype html>' })],
+      }),
+    );
+    expect(store.getState().files.get('index.html')?.id).toBe(101);
+
+    // 在流路径（尚未落库/fileId 未知）：delta 累积期间 id 保持 null
+    act(() => {
+      store.applyEvent(ev({ event: 'file_start', agent: 'engineer', path: 'app/live.js' }, PROJECT_ID));
+      store.applyEvent(ev({ event: 'delta', agent: 'engineer', path: 'app/live.js', content: 'const' }, PROJECT_ID));
+    });
+    expect(store.getState().files.get('app/live.js')?.id).toBeNull();
+
+    // 重新 hydrate（快照里已有该文件行）补上 id；其后的 delta 不应把 id 冲掉
+    store.hydrate(
+      makeSnapshot({
+        files: [
+          snapFile({ id: 101, path: 'index.html', version: 1, content: '<!doctype html>' }),
+          snapFile({ id: 205, path: 'app/live.js', version: 2, content: 'const live' }),
+        ],
+        streamingFiles: [{ path: 'app/live.js', content: 'const live' }],
+      }),
+    );
+    expect(store.getState().files.get('app/live.js')?.id).toBe(205);
+    act(() => {
+      store.applyEvent(ev({ event: 'delta', agent: 'engineer', path: 'app/live.js', content: ' x' }, PROJECT_ID));
+    });
+    expect(store.getState().files.get('app/live.js')).toMatchObject({ id: 205, content: 'const live x' });
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* store 单例与订阅                                                     */
 /* ------------------------------------------------------------------ */
 

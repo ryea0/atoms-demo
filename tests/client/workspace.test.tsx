@@ -120,6 +120,8 @@ const { pushMock } = vi.hoisted(() => ({ pushMock: vi.fn() }));
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: pushMock, replace: vi.fn(), refresh: vi.fn() }),
   usePathname: () => '/projects',
+  // T21 ViewerTabs 从 /p/[id] 路由自取项目 id（工作台页签不需要布局层透传）
+  useParams: () => ({ id: String(PROJECT_ID) }),
 }));
 
 beforeEach(() => {
