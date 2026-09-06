@@ -148,7 +148,8 @@ async function readFrames(
       const parts = buffer.split('\n\n');
       buffer = parts.pop() ?? '';
       for (const part of parts) {
-        if (part.trim() !== '') frames.push(parseFrame(part));
+        // 注释帧（: connect / : ping）不是事件，跳过——只收 id/event/data 帧
+        if (part.trim() !== '' && !part.startsWith(':')) frames.push(parseFrame(part));
       }
     }
   } finally {
@@ -301,11 +302,16 @@ describe('GET stream：Last-Event-ID 重放', () => {
     const invalidBody = invalid.body;
     if (invalidBody === null) throw new Error('SSE 响应缺少 body');
     const invalidReader = invalidBody.getReader();
-    const firstChunk = await Promise.race([
+    // 首帧是 start() 的 `: connect` 注释帧（刷响应头用，2026-09-06 /p/7 事故修复契约）
+    const connectChunk = await invalidReader.read();
+    expect(connectChunk.done).toBe(false);
+    expect(new TextDecoder().decode(connectChunk.value)).toBe(': connect\n\n');
+    // 注释帧之后、心跳之前：全新订阅不重放缓冲里的 1、2、3（只等实时）
+    const secondChunk = await Promise.race([
       invalidReader.read(),
       new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 300)),
     ]);
-    expect(firstChunk).toBe('timeout'); // 全新订阅：缓冲里的 1、2、3 不重放
+    expect(secondChunk).toBe('timeout');
     await invalidReader.cancel().catch(() => undefined);
 
     // 头优先于 query：断线重连时浏览器原生 Last-Event-ID 必须压过 URL 里的旧值
@@ -315,6 +321,32 @@ describe('GET stream：Last-Event-ID 重放', () => {
     );
     const tail = await readFrames(headerWins, (list) => list.length >= 1);
     expect(tail.map((frame) => frame.id)).toEqual(['3']);
+  }, 10000);
+
+  it('②c 空重放连接（lastEventId=最新 seq）首字节立即到达，不等心跳/事件（/p/7 事故回归）', async () => {
+    const { id } = await seedProject();
+    // 模拟首连常态：快照 lastSeq 恰好是总线最新 seq——重放为空
+    projectEventBus.emit(id, { runId: null, event: 'message', content: '一' });
+    const latest = projectEventBus.snapshotBuffer(id, 0).at(-1);
+    if (latest === undefined) throw new Error('前置事件未入缓冲');
+
+    const response = await STREAM_GET(
+      makeRequest(`http://localhost/api/projects/${id}/stream?lastEventId=${latest.seq}`, {}, SESSION_A),
+      idCtx(id),
+    );
+    expect(response.status).toBe(200);
+    const body = response.body;
+    if (body === null) throw new Error('SSE 响应缺少 body');
+    const reader = body.getReader();
+    // 修复前：无重放即无字节，连接无头挂起（真机要干等 20s 心跳，长跑 dev 进程里永不送达，
+    // 页面冻结在挂载时快照——用户「输入任务后很久没响应」的根因）。修复后：连接帧同步可读。
+    const first = await Promise.race([
+      reader.read(),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 500)),
+    ]);
+    expect(first).not.toBe('timeout');
+    expect(new TextDecoder().decode((first as { value: Uint8Array }).value)).toBe(': connect\n\n');
+    await reader.cancel().catch(() => undefined);
   }, 10000);
 
   it('心跳 20s 发 `: ping` 注释帧；客户端 abort 后流关闭', async () => {
@@ -329,6 +361,11 @@ describe('GET stream：Last-Event-ID 重放', () => {
       const body = response.body;
       if (body === null) throw new Error('SSE 响应缺少 body');
       const reader = body.getReader();
+
+      // 连接帧不等心跳、立即可读（/p/7 事故修复：空重放连接也必须立刻有首字节刷响应头）
+      const connect = await reader.read();
+      expect(connect.done).toBe(false);
+      expect(new TextDecoder().decode(connect.value)).toBe(': connect\n\n');
 
       await vi.advanceTimersByTimeAsync(20_000);
       const ping = await reader.read();

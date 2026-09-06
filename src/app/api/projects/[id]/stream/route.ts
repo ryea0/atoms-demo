@@ -4,6 +4,8 @@
  * 本路由是纯订阅者：编排器/服务层把事件发到 projectEventBus，这里只负责
  * 把 StreamEvent 转成 text/event-stream 帧。
  * - 立即返回 Response（流式工作在 ReadableStream 回调内）
+ * - start() 即发 `: connect` 注释帧：平台等首字节才提交响应头，空重放连接靠它立刻刷头
+ *   （否则首连要干等 20s 心跳，长跑进程里可能永不送达——2026-09-06 /p/7 事故根因）
  * - 头：text/event-stream + no-cache,no-transform + keep-alive + X-Accel-Buffering:no
  * - 帧格式严格：`id: <seq>\nevent: <type>\ndata: <单行JSON>\n\n`（JSON.stringify 已转义换行）
  * - Last-Event-ID → subscribe(afterSeq)：同步重放环形缓冲缺失事件后进入实时推送
@@ -52,6 +54,13 @@ export async function GET(request: Request, ctx: { params: Promise<{ id: string 
           // 消费者已断开且 cancel 尚未触达：吞掉，等 cleanup 收口
         }
       };
+
+      // 首帧强制刷头（2026-09-06 /p/7 事故）：平台对流式响应**等到第一个字节才提交响应头**——
+      // 空重放连接（首连时 lastEventId=快照 lastSeq=最新值，重放为空是常态）在此之前无头挂起，
+      // EventSource 一直停在「连接已断开」，事件全部堆在流里不送达；长跑 dev 进程里甚至 20s
+      // 心跳也不到达（enqueue 失败被 send 的 catch 静默吞掉），页面冻结在挂载时的快照。
+      // 连接建立即发一帧注释（客户端按 SSE 规范忽略）：响应头立刻提交、onopen 立刻触发。
+      send(': connect\n\n');
 
       // 先重放（subscribe 同步回放 seq>afterSeq 的缓冲事件）再挂实时订阅，不漏不乱序
       unsubscribe = projectEventBus.subscribe(
