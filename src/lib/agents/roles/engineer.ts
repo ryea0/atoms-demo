@@ -15,7 +15,7 @@
 import { assembleContext } from '@/lib/agents/context';
 import { runAgent } from '@/lib/agents/runner';
 import { AgentAbortError, type RunnerCallbacks } from '@/lib/agents/types';
-import { fsTools } from '@/lib/agents/tools';
+import { bashTool, fsTools, type Tool } from '@/lib/agents/tools';
 import type { FileTree, FileTreeNode } from './file-tree';
 import { renderApiJs, renderIndexHtml, renderStartSh } from './samples/app-skeleton';
 import { resolveModel } from '@/lib/llm/client';
@@ -69,6 +69,12 @@ const MAX_ATTEMPTS = 2;
 
 /** 自审是廉价调用：一次检查 + 一次覆写即止，步数收紧防失控 */
 const REVIEW_MAX_STEPS = 4;
+
+/**
+ * 单文件任务工具集：FS 工具 + bash 自检（每次调用前物化工作区，per-run 预算 5 次）。
+ * 仅用于生成任务闭环；写后自审（runEngineerReview）保持 fsTools 不扩执行面。
+ */
+const engineerTools: Tool[] = [...fsTools, bashTool];
 
 /* ------------------------------------------------------------------ */
 /* 快速模式确定性文件树（D3）                                             */
@@ -157,6 +163,7 @@ export const ENGINEER_SYSTEM_PROMPT = [
   '- 每个任务只实现一个目标文件；依赖文件全文已注入上下文，其他已生成文件可用 read_file 按需查阅。',
   '- 目标文件必须由你调用 write_file 写入完整内容（整体覆盖）；发现写错可再次 write_file 覆写修正。',
   '- 写完目标文件即任务完成：输出一句简短结论即可，不要复述全文。',
+  '- 写完 JS 文件后可用 bash 自检：node --check <文件> 验语法、node -e "require + handle 冒烟" 验行为；单任务最多 5 次、每次 ≤30s；不要用 bash 启动长驻服务、安装依赖或改文件（写文件一律走 write_file）。',
 ].join('\n');
 
 /** 写后自审 system prompt：一次廉价 review（语法/逻辑/遗漏/XSS），覆写一次即止 */
@@ -314,7 +321,7 @@ export async function runEngineerFile(ctx: EngineerFileContext): Promise<Enginee
         role: 'engineer',
         systemPrompt: assembled.system,
         userPrompt: assembled.user,
-        tools: fsTools,
+        tools: engineerTools,
         model,
         ctx: { storage: ctx.storage, projectId: ctx.projectId, role: 'engineer' },
         provider: wrapMetered({
