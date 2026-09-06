@@ -59,9 +59,10 @@ systemctl enable --now atoms
 
 echo "==> 8/8 nginx 反代（SSE 直通 + basic auth 防刷 LLM 账单）"
 if [[ ! -f /etc/nginx/.atoms_htpasswd ]]; then
-  pw=$(openssl rand -hex 8)
+  # demo 固定口令（可用环境变量 ATOMS_DEMO_PASSWORD 覆盖；仅限演示，勿公网长期使用）
+  pw="${ATOMS_DEMO_PASSWORD:-123}"
   htpasswd -bcB /etc/nginx/.atoms_htpasswd atoms "$pw" >/dev/null
-  echo "    [demo 访问口令，仅此一次显示] 用户名 atoms  密码 $pw"
+  echo "    [demo 访问口令] 用户名 atoms  密码 $pw"
 fi
 cp "$APP_DIR/deploy/nginx-atoms.conf" /etc/nginx/sites-available/atoms
 ln -sf /etc/nginx/sites-available/atoms /etc/nginx/sites-enabled/atoms

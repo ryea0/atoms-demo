@@ -45,7 +45,7 @@ journalctl -u atoms -n 50 --no-pager   # 启动日志（env 加载/端口）
 curl -s -o /dev/null -w '%{http_code}\' http://127.0.0.1/   # 401（basic auth 生效）
 ```
 
-浏览器打开 `http://<IP>/` → 输入口令（bootstrap 首次运行输出，忘了就重置：
+浏览器打开 `http://<IP>/` → 输入口令（bootstrap 默认 `atoms / 123`，可用 `ATOMS_DEMO_PASSWORD` 覆盖；忘了就重置：
 `htpasswd -bB /etc/nginx/.atoms_htpasswd atoms <新密码>`）→ 建项目跑一轮 mock/真实流式 → 预览。
 
 ## 代码合入后重新部署
