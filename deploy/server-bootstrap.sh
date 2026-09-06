@@ -11,7 +11,7 @@ APP_USER=atoms
 echo "==> 1/8 系统依赖（nginx / 编译工具 / htpasswd）"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y nginx apache2-utils build-essential python3 ca-certificates git curl
+apt-get install -y nginx apache2-utils build-essential python3 ca-certificates git curl sudo
 
 echo "==> 2/8 Node.js 22（NodeSource；已装 20+ 则跳过）"
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | sed 's/^v\([0-9]*\).*/\1/')" -lt 20 ]]; then
