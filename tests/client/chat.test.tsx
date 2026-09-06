@@ -234,6 +234,30 @@ describe('消息流渲染', () => {
     expect(screen.queryByText('📊')).not.toBeInTheDocument();
     expect(screen.queryByText(/领导汇报/)).not.toBeInTheDocument();
   });
+
+  it('agent-report 失败通报红色调呈现（T33），成功通报不受影响', () => {
+    render(
+      createElement(MessageList, {
+        messages: [
+          msg('assistant', '❌ 工程师：代码实现未完成——单文件任务执行失败。', {
+            meta: { kind: 'agent-report', agent: 'engineer', status: 'failed' },
+          }),
+          msg('assistant', '✅ 产品经理：PRD 撰写已完成。', { meta: { kind: 'agent-report', agent: 'pm' } }),
+        ],
+        files: new Map<string, WorkspaceFile>(),
+        runs: [],
+        finished: false,
+        running: false,
+        onSend: async () => true,
+      }),
+    );
+    // 失败气泡：destructive 红色调（与顶层失败红条同一 token 口径）
+    const failedBubble = screen.getByText(/❌ 工程师：代码实现未完成/).closest('div');
+    expect(failedBubble?.className).toContain('destructive');
+    // 成功通报仍是中性气泡
+    const okBubble = screen.getByText(/✅ 产品经理：PRD 撰写已完成/).closest('div');
+    expect(okBubble?.className).not.toContain('destructive');
+  });
 });
 
 /* ------------------------------------------------------------------ */

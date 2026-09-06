@@ -34,7 +34,7 @@ import { PRD_PATH, runPm } from '@/lib/agents/roles/pm';
 import { FILE_TREE_PATH, parseFileTree, runArchitect } from '@/lib/agents/roles/architect';
 import { buildFastFileTree, runEngineerFile, runEngineerReview, type FileTree } from '@/lib/agents/roles/engineer';
 import { EXPERT_REPORT_PATHS, runExpert, type ExpertRole } from '@/lib/agents/roles/experts';
-import { runCloser } from '@/lib/agents/roles/closer';
+import { runCloser, type CloserRoundOutcome } from '@/lib/agents/roles/closer';
 import { AgentAbortError } from '@/lib/agents/types';
 import type { AgentRole, Message, MessageMeta, Project, StorageProvider } from '@/lib/db/provider/types';
 
@@ -578,6 +578,44 @@ async function emitAgentReport(
   });
 }
 
+/** 错误信息首句（聊天区失败通报用）：取首个非空行，按句读截到第一句，超长再截断 */
+function errorFirstSentence(message: string): string {
+  const firstLine = message
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line !== '');
+  if (firstLine === undefined) return '原因未知';
+  const sentenceEnd = /[。；;！!？?]/.exec(firstLine);
+  const sentence = sentenceEnd === null ? firstLine : firstLine.slice(0, sentenceEnd.index + 1);
+  return sentence.length > AGENT_REPORT_SUMMARY_CAP ? `${sentence.slice(0, AGENT_REPORT_SUMMARY_CAP)}…` : sentence;
+}
+
+/**
+ * @直派任务失败 → 承接成员以**自身名义**落一条失败通报并 emit（T33 B2，emitAgentReport 的失败变体）。
+ * 背景（实证缺陷链）：前置失败（如工程师无树抛错）发生在角色自建 run 行之前，任务级 catch
+ * 只发 error 事件——直播块闪一下即被收尾清场，时间线无 run 行、聊天区无任何失败痕迹，
+ * 用户全程看不到失败。这条 ❌ 是失败的第一现场；meta.status=failed 供前端红色调呈现。
+ */
+async function emitAgentFailureReport(
+  storage: StorageProvider,
+  projectId: number,
+  emit: (e: Omit<StreamEvent, 'seq' | 'projectId'>) => StreamEvent,
+  task: TaskAssignment,
+  message: string,
+  runId: number | null,
+): Promise<void> {
+  const content = `❌ ${roleRegistry[task.agent].name}：${AGENT_TASK_NOUN[task.agent]}未完成——${errorFirstSentence(message)}`;
+  const meta: MessageMeta = { kind: 'agent-report', agent: task.agent, status: 'failed' };
+  const row = await storage.addMessage({ projectId, role: 'assistant', content, meta });
+  emit({
+    runId,
+    event: 'message',
+    agent: task.agent,
+    content,
+    meta: { role: 'assistant', messageId: row.id, ...meta },
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* 主流程                                                               */
 /* ------------------------------------------------------------------ */
@@ -586,9 +624,12 @@ async function emitAgentReport(
  * 任务前基线打点（DESIGN §3.10）。检查点在任务开跑**前**打——此刻该任务的 run 行
  * 尚不存在，因此用 afterRunId=当前最大 run id 捕获回滚边界：restore 后
  * id > afterRunId 的任务（= 打点之后发生的全部工作）标 rolled_back。
+ * 返回该基线（T33 B）：任务失败时据此判断「角色是否来得及自建 run 行」。
  */
-async function checkpointBefore(storage: StorageProvider, projectId: number, label: string): Promise<void> {
-  await storage.createCheckpoint(projectId, label, null, await storage.latestRunId(projectId));
+async function checkpointBefore(storage: StorageProvider, projectId: number, label: string): Promise<number> {
+  const afterRunId = await storage.latestRunId(projectId);
+  await storage.createCheckpoint(projectId, label, null, afterRunId);
+  return afterRunId;
 }
 
 async function executeGeneration(input: StartGenerationInput, signal: AbortSignal): Promise<void> {
@@ -638,6 +679,8 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
     for (const warning of topo.warnings) await note(`- ⚠ ${warning.message}`);
     const taskByKey = new Map(decision.tasks.map((task) => [task.taskKey, task]));
     const taskOutcome = new Map<string, 'done' | 'failed' | 'skipped'>();
+    /** 本轮失败任务的原因（taskKey → 错误信息；closer 反谎报上下文的数据源，T33 C） */
+    const failedReasons = new Map<string, string>();
     const round: RoundState = { producedThisRound: new Set(), tree: null, architectRan: false };
 
     for (const taskKey of topo.order) {
@@ -663,8 +706,8 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
         continue;
       }
 
-      // 检查点：任务前基线（DESIGN §3.10；短事务在 repo 层保证）
-      await checkpointBefore(storage, projectId, `任务前:${taskKey}`);
+      // 检查点：任务前基线（DESIGN §3.10；短事务在 repo 层保证）；基线同时是「run 行是否已建」的判据
+      const runBaseline = await checkpointBefore(storage, projectId, `任务前:${taskKey}`);
 
       // 干预队列：任务边界取待注入消息（DESIGN §3.5 必检级）→ 事件 → 打戳 → 拼进任务文本
       c.interventions = await takeInterventions(storage, projectId, taskKey, emit);
@@ -695,8 +738,32 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
         if (isAbortError(error)) throw error; // 停止语义交给顶层统一收口
         const message = errorMessage(error);
         taskOutcome.set(taskKey, 'failed');
-        emit({ runId: null, event: 'error', agent: task.agent, error: message, meta: { taskKey } });
+        failedReasons.set(taskKey, message);
+
+        // 前置失败也有 run 行（T33 B1）：角色抛错发生在自建 run 行之前时，agent_start 事件
+        // 撑起的直播块会被收尾清场、时间线无 run 行——用户全程看不到失败。编排器补插一条
+        // failed run（agent/task_key/error 摘要），时间线/快照/客户端失败收口全链路可见。
+        let failedRunId: number | null = null;
+        if ((await storage.latestRunId(projectId)) <= runBaseline) {
+          const run = await storage.createAgentRun({
+            projectId,
+            taskKey,
+            agent: task.agent,
+            task: task.instruction,
+          });
+          await storage.updateAgentRun(
+            run.id,
+            { status: 'failed', startedAt: Date.now(), endedAt: Date.now(), error: message },
+            projectId,
+          );
+          failedRunId = run.id;
+        }
+        emit({ runId: failedRunId, event: 'error', agent: task.agent, error: message, meta: { taskKey } });
         await note(taskFailedLine(task.agent, taskKey, message));
+        // @直派任务失败也要出声（T33 B2）：失败通报是用户在聊天区看到失败的第一现场
+        if (taskKey.startsWith(USER_DISPATCH_PREFIX)) {
+          await emitAgentFailureReport(storage, projectId, emit, task, message, failedRunId);
+        }
         // 失败不中断无依赖任务：继续下一个
       }
     }
@@ -712,12 +779,20 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
     const closingInterventions = await takeInterventions(storage, projectId, 'leader-closing', emit);
 
     emit({ runId: null, event: 'agent_start', agent: 'leader', meta: { taskKey: 'leader-closing' } });
+    // 本轮结果显式注入收尾上下文（T33 C 反谎报）：closer 只看文件清单时，读到 PROGRESS 的
+    // ❌ 行仍会谎报「所有角色任务均执行完毕」——成败统计由编排器给权威口径，M>0 时 prompt
+    // 侧要求如实汇报失败项
+    const roundOutcome: CloserRoundOutcome = {
+      succeeded: [...taskOutcome.values()].filter((status) => status === 'done').length,
+      failed: [...failedReasons].map(([taskKey, message]) => ({ taskKey, reason: errorFirstSentence(message) })),
+    };
     const closer = await runCloser({
       storage,
       projectId,
       signal,
       onReasoning: reasoningEmitOf(emit, 'leader'),
       interventions: closingInterventions.map((item) => item.content),
+      roundOutcome,
     });
     emit({ runId: closer.runId, event: 'agent_end', agent: 'leader', summary: (await runSummaryOf(storage, projectId, closer.runId)) ?? undefined });
     const assistant = await storage.addMessage({ projectId, role: 'assistant', content: closer.report });
@@ -812,7 +887,7 @@ async function dispatchArchitect(c: TaskContext, round: RoundState): Promise<Tas
 
 /**
  * 工程师树解析：本轮架构师树 → 库里持久化树（迭代轮次）→ 快速模式内置模板树；
- * 完整模式全无 → null（该任务失败，其余任务照常，控制器裁决 7）。
+ * 完整模式全无 → null（由 dispatchEngineer 走降级兜底，T33 A）。
  */
 async function resolveEngineerTree(c: TaskContext, round: RoundState): Promise<FileTree | null> {
   if (round.architectRan) {
@@ -825,6 +900,25 @@ async function resolveEngineerTree(c: TaskContext, round: RoundState): Promise<F
     if (parsed.ok && parsed.tree.length > 0) return parsed.tree;
   }
   return c.mode === 'fast' ? buildFastFileTree(c.project.requirement) : null;
+}
+
+/**
+ * 树降级兜底（T33 A）：架构师没给出树（真模型在 @直派单发语境会跳过 docs/file_tree.json）
+ * 时不再让整轮无声地死掉——按内置模板树（buildFastFileTree）补缺派发。
+ *
+ * 语义（安全关键）：
+ * - 模板树是**通用骨架**，直接 upsert 会把迭代轮里已生成的应用文件整个毁掉——所以只补
+ *   「库里还没有的路径」，files 表已存在的路径一律跳过（幂等，不覆盖既有产出）；
+ * - 过滤后为空 → 任务正常完成、summary 写「目标文件均已存在，无需新写」（幂等语义，
+ *   重跑同轮不再有副作用）；
+ * - 非空 → 正常逐文件派发，PROGRESS 留 ⚠ 行说明降级事实（不静默吞，CLAUDE.md 编码约定）。
+ *
+ * 降级是编排器的确定性兜底（CLAUDE.md 规则 1：执行侧的可靠性代码，不是替模型做设计决策）；
+ * 架构师产出 file_tree 的硬保证（输出后校验+带错重试）另行挂账，不在此处。
+ */
+async function fallbackEngineerTree(c: TaskContext): Promise<FileTree> {
+  const existing = new Set((await c.storage.listFiles(c.projectId)).map((row) => row.path));
+  return buildFastFileTree(c.project.requirement).filter((node) => !existing.has(node.path));
 }
 
 /**
@@ -841,9 +935,21 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
   const { storage, projectId, task } = c;
   c.emit({ runId: null, event: 'agent_start', agent: 'engineer', meta: { taskKey: task.taskKey } });
 
-  const tree = await resolveEngineerTree(c, round);
+  let tree = await resolveEngineerTree(c, round);
   if (tree === null) {
-    throw new Error('工程师任务没有可用 file_tree（架构师未产出且非快速模式），无法逐文件派发');
+    // 降级兜底（T33 A）：full 模式全无树 → 内置模板树补缺（只写库里还没有的路径）
+    tree = await fallbackEngineerTree(c);
+    if (tree.length === 0) {
+      // 模板文件全部已存在：幂等完成，不写任何文件（避免迭代轮被骨架覆盖）
+      const summary = '目标文件均已存在，无需新写（架构师未产出 file_tree，内置模板树全部命中既有文件）';
+      c.emit({ runId: null, event: 'agent_end', agent: 'engineer', summary });
+      return { runId: null, summary, files: [] };
+    }
+    await appendProgressLine(
+      storage,
+      projectId,
+      `- ⚠ 架构师未产出 file_tree，按内置模板树降级（新写 ${tree.length} 个文件）`,
+    );
   }
 
   // 交接摘要基线：PM/架构师 run.summary + 任务边界干预指令（规则 7：summary 是唯一交接物）

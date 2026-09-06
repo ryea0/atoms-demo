@@ -299,6 +299,72 @@ describe('runCloser：MEMORY + PROGRESS 领导汇报段', () => {
     expect(result.report).toContain('本轮已完成');
   });
 
+  it('本轮结果注入收尾上下文（T33 反谎报）：失败项逐条列出并要求如实汇报', async () => {
+    const { storage, projectId } = await newProject();
+    const prompts: string[] = [];
+    const captureProvider: LlmProvider = {
+      name: 'capture',
+      async complete(req: LlmRequest): Promise<LlmResult> {
+        prompts.push(req.messages.map((m) => m.content).join('\n'));
+        return { content: '', toolCalls: [], usage: { promptTokens: 1, completionTokens: 1 } };
+      },
+      async stream(req: LlmRequest): Promise<LlmResult> {
+        prompts.push(req.messages.map((m) => m.content).join('\n'));
+        return {
+          content: '===== MEMORY =====\n## 选型与关键决策\n- 零依赖\n===== 汇报 =====\n- 本轮已完成',
+          toolCalls: [],
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+
+    await runCloser({
+      storage,
+      projectId,
+      provider: captureProvider,
+      roundOutcome: {
+        succeeded: 2,
+        failed: [{ taskKey: 'user-engineer-0', reason: '单文件任务执行失败：provider 连续两次不可用。' }],
+      },
+    });
+
+    const joined = prompts.join('\n');
+    expect(joined).toContain('【本轮结果】');
+    expect(joined).toContain('成功 2 项、失败 1 项');
+    expect(joined).toContain('user-engineer-0——单文件任务执行失败');
+    // 反谎报要求：存在失败项时必须如实列出，不得声称所有任务均已成功完成
+    expect(joined).toContain('如实');
+    expect(joined).toContain('不得声称所有任务均已成功完成');
+  });
+
+  it('本轮结果无失败项：只注入成功计数，不附失败清单与如实汇报要求', async () => {
+    const { storage, projectId } = await newProject();
+    const prompts: string[] = [];
+    const captureProvider: LlmProvider = {
+      name: 'capture',
+      async complete(req: LlmRequest): Promise<LlmResult> {
+        prompts.push(req.messages.map((m) => m.content).join('\n'));
+        return { content: '', toolCalls: [], usage: { promptTokens: 1, completionTokens: 1 } };
+      },
+      async stream(req: LlmRequest): Promise<LlmResult> {
+        prompts.push(req.messages.map((m) => m.content).join('\n'));
+        return {
+          content: '===== MEMORY =====\n## 选型与关键决策\n- 零依赖\n===== 汇报 =====\n- 本轮已完成',
+          toolCalls: [],
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+
+    await runCloser({ storage, projectId, provider: captureProvider, roundOutcome: { succeeded: 3, failed: [] } });
+
+    const joined = prompts.join('\n');
+    expect(joined).toContain('【本轮结果】');
+    expect(joined).toContain('成功 3 项、失败 0 项');
+    expect(joined).not.toContain('失败：');
+    expect(joined).not.toContain('不得声称所有任务均已成功完成');
+  });
+
   it('brief 用例：closer 写 MEMORY 且汇报文本非空（PROGRESS.md 缺失时创建）', async () => {
     const { storage, projectId } = await newProject();
     await storage.upsertFile({

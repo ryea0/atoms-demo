@@ -38,10 +38,17 @@ interface MessageMetaView {
   agent: AgentRole | null;
   /** 干预注入边界对应的任务键（收尾边界 leader-closing 的措辞分支靠它判定，T32 M4） */
   targetTask: string | null;
+  /** agent-report 的成败（T33：failed=失败通报，红色调呈现） */
+  status: 'done' | 'failed' | null;
 }
 
 function isAgentRole(value: unknown): value is AgentRole {
   return typeof value === 'string' && value in roleRegistry;
+}
+
+/** agent-report 成败标记的防御性收窄（库里 json 反序列化结果是 unknown） */
+function isReportStatus(value: unknown): value is 'done' | 'failed' {
+  return value === 'done' || value === 'failed';
 }
 
 function metaViewOf(meta: Message['meta']): MessageMetaView {
@@ -52,12 +59,14 @@ function metaViewOf(meta: Message['meta']): MessageMetaView {
   const rawPath = record['path'];
   const rawAgent = record['agent'];
   const rawTargetTask = record['targetTask'];
+  const rawStatus = record['status'];
   return {
     mentions: rawMentions.filter(isAgentRole),
     kind: typeof rawKind === 'string' && rawKind !== '' ? rawKind : null,
     path: typeof rawPath === 'string' && rawPath !== '' ? rawPath : null,
     agent: isAgentRole(rawAgent) ? rawAgent : null,
     targetTask: typeof rawTargetTask === 'string' && rawTargetTask !== '' ? rawTargetTask : null,
+    status: isReportStatus(rawStatus) ? rawStatus : null,
   };
 }
 
@@ -247,10 +256,12 @@ export function MessageList({
           return <RestoreCard key={message.id} message={message} />;
         }
         // @直派成员的自身汇报（T32）：普通消息气泡 + 角色归属徽章，先于收尾卡启发式返回，
-        // 避免「收尾后最后一条 assistant」的判定把它误标成领导汇报卡
+        // 避免「收尾后最后一条 assistant」的判定把它误标成领导汇报卡。
+        // 失败通报（T33）红色调呈现，与顶层失败红条同一 destructive token 口径
         if (message.role === 'assistant' && view.kind === 'agent-report') {
           const reporter = view.agent;
           const reporterMeta = reporter === null ? null : roleRegistry[reporter];
+          const failed = view.status === 'failed';
           return (
             <div key={message.id} className="flex flex-col items-start gap-1">
               {reporterMeta !== null && (
@@ -262,7 +273,14 @@ export function MessageList({
                   {reporterMeta.name}
                 </span>
               )}
-              <div className="max-w-[88%] rounded-2xl rounded-bl-sm border border-border bg-background px-3 py-2 text-sm break-words whitespace-pre-wrap text-foreground">
+              <div
+                className={cn(
+                  'max-w-[88%] rounded-2xl rounded-bl-sm border px-3 py-2 text-sm break-words whitespace-pre-wrap',
+                  failed
+                    ? 'border-destructive/30 bg-destructive/10 text-destructive'
+                    : 'border-border bg-background text-foreground',
+                )}
+              >
                 {message.content}
               </div>
             </div>

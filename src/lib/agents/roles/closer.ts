@@ -42,7 +42,7 @@ export const CLOSING_SECTION_HEADING = '## 领导汇报';
  * 措辞改动需同步 src/lib/llm/mock.ts 的 ROLE_MARKERS；刻意不出现其他角色名（避免场景误判）。
  */
 export const CLOSER_SYSTEM_PROMPT = [
-  '你是「团队领导」。所有成员的任务已执行完毕，现在由你做项目收尾：沉淀长期记忆（MEMORY.md）并向用户做领导汇报。',
+  '你是「团队领导」。各成员任务已执行（本轮成败以下方【本轮结果】统计为准），现在由你做项目收尾：沉淀长期记忆（MEMORY.md）并向用户做领导汇报。',
   '',
   '输出契约（严格遵守，两部分都要有，用分隔行隔开，顺序如下）：',
   '===== .atoms/reports/MEMORY.md =====',
@@ -64,6 +64,18 @@ export const PROGRESS_HEADER = [
   '> 每个任务边界由编排器追加状态行（✅/🔄/⏸/❌）；项目收尾时由团队领导追加领导汇报段。',
 ].join('\n');
 
+/**
+ * 本轮任务结果（T33 反谎报）：编排器统计的确定性口径——成功 N 项 + 失败清单（任务键 + 原因首句）。
+ * 背景是实证缺陷链：closer 只看文件清单，读到 PROGRESS 的 ❌ 行仍谎报「所有角色任务均执行完毕」；
+ * 把成败统计显式注入上下文后，模型不再需要从间接痕迹里推断本轮成败。
+ */
+export interface CloserRoundOutcome {
+  /** 本轮成功（done）的任务数 */
+  succeeded: number;
+  /** 本轮失败的任务（任务键 + 失败原因首句） */
+  failed: ReadonlyArray<{ taskKey: string; reason: string }>;
+}
+
 /** runCloser 入参（brief 契约：存储出口 + 项目 + 停止信号） */
 export interface RunCloserInput {
   storage: StorageProvider;
@@ -76,6 +88,8 @@ export interface RunCloserInput {
   onReasoning?: (text: string) => void;
   /** 收尾边界取到的待注入干预（T31）：编排器在 leader-closing 边界消费后传入，进【干预指令】小节 */
   interventions?: readonly string[];
+  /** 本轮任务结果（T33 反谎报）：编排器传入，进【本轮结果】小节；缺省不注入（行为不变） */
+  roundOutcome?: CloserRoundOutcome;
 }
 
 /** runCloser 结果：任务记录 id + 记忆文件路径 + 汇报文本（由调用方作为 assistant message 落库） */
@@ -221,6 +235,22 @@ function fallbackReport(fileCount: number, humanEditedPaths: readonly string[]):
 }
 
 /**
+ * 本轮结果段（T33 反谎报）：成功 N 项、失败 M 项（失败：taskKey——原因首句）。
+ * M>0 时附「如实汇报失败项」的纪律要求——只给数据不给要求，模型仍可能顺着
+ * system prompt 的「任务已执行完毕」惯性说出「全部完成」。
+ */
+export function renderRoundOutcomeSection(outcome: CloserRoundOutcome): string {
+  const lines = ['【本轮结果】', `- 成功 ${outcome.succeeded} 项、失败 ${outcome.failed.length} 项`];
+  for (const item of outcome.failed) {
+    lines.push(`- 失败：${item.taskKey}——${item.reason}`);
+  }
+  if (outcome.failed.length > 0) {
+    lines.push('- 汇报纪律：以上失败项必须逐条如实写进汇报（任务与原因），不得声称所有任务均已成功完成。');
+  }
+  return lines.join('\n');
+}
+
+/**
  * 维护 PROGRESS.md 的「领导汇报」段（幂等）：已有该段则从段首覆盖到文末——
  * 最新一次汇报生效（编排器每轮完成都会收尾，追加语义会导致标题重复与无限增长）；
  * 没有该段则追加在进度行之后；文件缺失则创建带标题。
@@ -279,13 +309,15 @@ export async function runCloser(ctx: RunCloserInput): Promise<RunCloserResult> {
 
     const fileList = rows.map((row) => `- ${row.path}（last_editor=${row.lastEditor}）`).join('\n');
     const humanList = humanEditedPaths.map((path) => `- ${path}`).join('\n');
-    const task = [
+    let task = [
       '收尾：请基于以下项目全貌产出 MEMORY 与领导汇报。',
       '【项目文件清单】',
       fileList === '' ? '-（暂无文件）' : fileList,
       '【人工修改清单（必须原样保留其意图）】',
       humanList === '' ? '- 无' : humanList,
     ].join('\n');
+    // 本轮结果（T33 反谎报）：编排器的确定性统计是成败的权威口径，显式进上下文
+    if (ctx.roundOutcome !== undefined) task = `${task}\n${renderRoundOutcomeSection(ctx.roundOutcome)}`;
 
     const model = resolveModel(role);
     // 计量装饰器与内核共用同一 model；注入的 provider 只替换底层模型出口（测试桩/编排器装配）

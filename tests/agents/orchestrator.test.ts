@@ -30,6 +30,8 @@ import type { TaskAssignment } from '@/lib/agents/roles/leader';
 const pmRequirements: string[] = [];
 /** 这些路径的 runEngineerFile 直接返回 ok=false 结果（模拟 hard×2 重试耗尽） */
 const engineerFailPaths = new Set<string>();
+/** 这些路径的 runEngineerFile 直接抛错且不建 run 行（T33 B：前置失败=任务级 catch 看到的形状） */
+const engineerThrowPaths = new Set<string>();
 /** 记录写后自审被调用的文件路径（接线断言用） */
 const reviewPaths: string[] = [];
 /** 这些路径的写后自审直接抛错（自审失败不阻断的断言用） */
@@ -38,6 +40,8 @@ const reviewFailPaths = new Set<string>();
 let cycleTasks: TaskAssignment[] | null = null;
 /** 非空则在 PM 任务执行中途调用（模拟「任务跑着的时候用户发来干预」，T31 Commit C） */
 let midRoundEnqueue: ((ctx: { storage: StorageProvider; projectId: number }) => Promise<void>) | null = null;
+/** 捕获每次 runCloser 收到的入参（T33 C：编排器是否把本轮结果传给收尾上下文） */
+const closerInputs: import('@/lib/agents/roles/closer').RunCloserInput[] = [];
 
 vi.mock('@/lib/agents/roles/pm', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/agents/roles/pm')>();
@@ -66,6 +70,9 @@ vi.mock('@/lib/agents/roles/engineer', async (importOriginal) => {
           errors: [`${ctx.target.path}：硬性违规 dangerous_api——出现 eval 用法`],
         });
       }
+      if (engineerThrowPaths.has(ctx.target.path)) {
+        return Promise.reject(new Error('单文件任务执行失败：provider 连续两次不可用。文件未写入'));
+      }
       return actual.runEngineerFile(ctx);
     },
     runEngineerReview: (ctx: import('@/lib/agents/roles/engineer').EngineerReviewContext) => {
@@ -82,6 +89,17 @@ vi.mock('@/lib/agents/roles/leader', async (importOriginal) => {
     ...actual,
     routeLeader: (input: import('@/lib/agents/roles/leader').RouteLeaderInput) =>
       cycleTasks === null ? actual.routeLeader(input) : Promise.resolve({ kind: 'tasks' as const, tasks: cycleTasks }),
+  };
+});
+
+vi.mock('@/lib/agents/roles/closer', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/agents/roles/closer')>();
+  return {
+    ...actual,
+    runCloser: (ctx: import('@/lib/agents/roles/closer').RunCloserInput) => {
+      closerInputs.push(ctx);
+      return actual.runCloser(ctx);
+    },
   };
 });
 
@@ -122,10 +140,12 @@ beforeEach(() => {
   vi.stubEnv('LLM_MOCK_DELAY_MS', '0'); // 离线快速：mock 流式延迟置 0
   pmRequirements.length = 0;
   engineerFailPaths.clear();
+  engineerThrowPaths.clear();
   reviewPaths.length = 0;
   reviewFailPaths.clear();
   cycleTasks = null;
   midRoundEnqueue = null;
+  closerInputs.length = 0;
 });
 
 afterEach(() => {
@@ -743,4 +763,168 @@ describe('startGeneration（mock 全链路）', () => {
     expect(events.some((e) => e.agent === 'ads')).toBe(false); // 第二轮未做任何工作
     expect(await storage.getFile(projectId, 'docs/seo_report.md')).not.toBeNull();
   }, 20000);
+});
+
+/* ------------------------------------------------------------------ */
+/* T33 A：工程师树降级兜底                                                */
+/* ------------------------------------------------------------------ */
+
+/** 只派工程师、不派架构师的轮次（真模型 @直派单发语境跳过 docs/file_tree.json 的确定性复现） */
+function engineerOnlyTasks(): TaskAssignment[] {
+  return [
+    { taskKey: 'eng-implement', agent: 'engineer', instruction: '开始实施', writesPaths: ['docs/', 'app/'], dependsOn: [] },
+  ];
+}
+
+/** 内置降级模板树的全部路径（buildFastFileTree 的固定 4 节点） */
+const FALLBACK_PATHS = ['app/backend/api.js', 'app/frontend/index.html', 'app/README.md', 'start_app.sh'];
+
+describe('T33 A：工程师树降级（full 模式无 file_tree 不再整轮失败）', () => {
+  it('无树 + 空项目：按内置模板树降级逐文件派发，PROGRESS ⚠ 留痕', async () => {
+    cycleTasks = engineerOnlyTasks();
+    const { storage, projectId } = await newProject('full');
+    const { events, stop } = collectEvents(projectId);
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: REQUIREMENT,
+      mode: 'full',
+      mentions: [],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    // 模板树 4 个文件全部照常生成（不再抛「工程师任务没有可用 file_tree」）
+    for (const path of FALLBACK_PATHS) {
+      expect(await storage.getFile(projectId, path)).not.toBeNull();
+    }
+    expect(mustFind(events, (e) => e.event === 'file_end' && e.path === 'app/backend/api.js').agent).toBe('engineer');
+    expect(events.some((e) => e.event === 'error')).toBe(false);
+    expect(events.at(-1)?.event).toBe('done');
+    expect((await storage.getProject(projectId))?.status).toBe('done');
+
+    // 降级语义显式留痕：PROGRESS ⚠ 行（新写 N 个文件）
+    const progress = await progressRow(storage, projectId);
+    expect(progress.content).toContain('架构师未产出 file_tree');
+    expect(progress.content).toContain('按内置模板树降级（新写 4 个文件）');
+  }, 30000);
+
+  it('无树 + app 文件已存在（迭代轮）：不覆盖既有文件，只补缺', async () => {
+    cycleTasks = engineerOnlyTasks();
+    const { storage, projectId } = await newProject('full');
+    // 已生成的应用文件（迭代轮防模板覆盖：直接 upsert 会毁掉既有应用）
+    await storage.upsertFile({ projectId, path: 'app/backend/api.js', content: '// 已生成的应用后端，勿动', editor: 'engineer' });
+    await storage.upsertFile({ projectId, path: 'start_app.sh', content: '#!/bin/sh\necho 已有脚本', editor: 'engineer' });
+    const { events, stop } = collectEvents(projectId);
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: REQUIREMENT,
+      mode: 'full',
+      mentions: [],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    // 既有文件原样保留（版本不涨 = 未被覆写）
+    const api = await storage.getFile(projectId, 'app/backend/api.js');
+    expect(api?.content).toBe('// 已生成的应用后端，勿动');
+    expect(api?.version).toBe(1);
+    const script = await storage.getFile(projectId, 'start_app.sh');
+    expect(script?.content).toBe('#!/bin/sh\necho 已有脚本');
+    expect(script?.version).toBe(1);
+    // 缺的补上
+    expect(await storage.getFile(projectId, 'app/frontend/index.html')).not.toBeNull();
+    expect(await storage.getFile(projectId, 'app/README.md')).not.toBeNull();
+
+    const progress = await progressRow(storage, projectId);
+    expect(progress.content).toContain('按内置模板树降级（新写 2 个文件）');
+    expect(events.at(-1)?.event).toBe('done');
+  }, 30000);
+
+  it('无树 + 模板文件全部已存在：幂等完成，不写任何文件', async () => {
+    cycleTasks = engineerOnlyTasks();
+    const { storage, projectId } = await newProject('full');
+    for (const path of FALLBACK_PATHS) {
+      await storage.upsertFile({ projectId, path, content: `// ${path} 已存在`, editor: 'engineer' });
+    }
+    const { events, stop } = collectEvents(projectId);
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: REQUIREMENT,
+      mode: 'full',
+      mentions: [],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    // 过滤后为空：任务正常完成（幂等语义），无单文件派发、无写入
+    expect(events.some((e) => e.event === 'file_start' && e.agent === 'engineer')).toBe(false);
+    for (const path of FALLBACK_PATHS) {
+      const row = await storage.getFile(projectId, path);
+      expect(row?.version).toBe(1);
+      expect(row?.content).toBe(`// ${path} 已存在`);
+    }
+    expect(mustFind(events, (e) => e.event === 'agent_end' && e.agent === 'engineer').summary ?? '').toContain(
+      '目标文件均已存在，无需新写',
+    );
+    expect(events.at(-1)?.event).toBe('done');
+    const progress = await progressRow(storage, projectId);
+    expect(progress.content).toContain('目标文件均已存在，无需新写');
+  }, 30000);
+});
+
+/* ------------------------------------------------------------------ */
+/* T33 B/C：任务失败可见化 + closer 反谎报                                 */
+/* ------------------------------------------------------------------ */
+
+describe('T33 B/C：任务失败可见化（run 行 + ❌ 通报）与 closer 反谎报上下文', () => {
+  it('@直派工程师前置失败：补插 failed run 行 + ❌ agent-report 通报 + closer 上下文带失败项', async () => {
+    engineerThrowPaths.add('app/backend/api.js'); // 单文件任务开跑即抛、不建 run 行（前置失败形状）
+    const { storage, projectId } = await newProject('fast');
+    const { events, stop } = collectEvents(projectId);
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: '把应用做出来',
+      mode: 'fast',
+      mentions: ['engineer'],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    // ① failed run 行：此前该路径无任何 run 行（时间线/快照无痕，用户看不到失败）
+    const failedRun = (await storage.listAgentRuns(projectId)).find(
+      (run) => run.taskKey === 'user-engineer-0' && run.agent === 'engineer',
+    );
+    expect(failedRun?.status).toBe('failed');
+    expect(failedRun?.error ?? '').toContain('单文件任务执行失败');
+
+    // ② ❌ 失败通报（T32 成功通报的失败变体）：agent 归属 + messageId 回带 + 失败标记
+    const report = mustFind(events, (e) => e.event === 'message' && e.meta?.kind === 'agent-report');
+    expect(report.agent).toBe('engineer');
+    expect(report.meta?.messageId).toBeGreaterThan(0);
+    expect(report.meta?.status).toBe('failed');
+    expect(report.content ?? '').toContain('❌ 工程师：代码实现未完成——');
+    expect(report.content ?? '').toContain('单文件任务执行失败');
+    // 落库行同口径：assistant + kind/status，刷新后仍可还原
+    const persisted = (await storage.listMessages(projectId)).find((m) => m.id === report.meta?.messageId);
+    expect(persisted?.role).toBe('assistant');
+    expect(persisted?.meta?.kind).toBe('agent-report');
+    expect(persisted?.meta?.status).toBe('failed');
+
+    // ③ 整轮仍收口 done（失败不中断），closer 上下文带结构化本轮结果
+    expect(events.at(-1)?.event).toBe('done');
+    const closerInput = closerInputs.at(-1);
+    expect(closerInput?.roundOutcome).toBeDefined();
+    expect(closerInput?.roundOutcome?.succeeded).toBe(0);
+    expect(closerInput?.roundOutcome?.failed).toHaveLength(1);
+    expect(closerInput?.roundOutcome?.failed[0]?.taskKey).toBe('user-engineer-0');
+    expect(closerInput?.roundOutcome?.failed[0]?.reason).toContain('单文件任务执行失败');
+  }, 30000);
 });
