@@ -24,7 +24,8 @@
  * 服务端专用（读 env + 计量落库），不得进入客户端 bundle。
  */
 import { z } from 'zod';
-import { resolveModel } from '@/lib/llm/client';
+import { createOpenAiProvider } from '@/lib/llm/client';
+import { resolveRoleModel } from '@/lib/llm/resolve';
 import { wrapMetered } from '@/lib/llm/metered-provider';
 import type { LlmProvider } from '@/lib/llm/types';
 import type { AgentRole, StorageProvider } from '@/lib/db/provider/types';
@@ -375,14 +376,27 @@ export async function routeLeader(input: RouteLeaderInput): Promise<LeaderDecisi
 
   const collector: LeaderCollector = { tasks: [], reply: null, closed: false };
   try {
-    // model 单一来源：runAgent 实际使用与 llm_calls 记账必须是同一个值（CLAUDE.md 规则 10）
-    const model = resolveModel('leader');
+    // model 单一来源（三级路由，DESIGN §5①）：DB 绑定命中时连 provider 一并切到绑定
+    // 服务商（2026-09-07 接线：此前设置页绑定只写库、编排器不读，leader 永远走 env）；
+    // 未命中/读库失败回落 env（resolveRoleModel 内部兜底）。测试注入的 provider 优先，
+    // 桩不被 DB 绑定劫持。
+    const resolution = await resolveRoleModel('leader', process.env, input.storage);
+    const model = resolution.model;
+    const boundProvider =
+      resolution.providerConfig === undefined
+        ? undefined
+        : createOpenAiProvider({
+            ...process.env,
+            LLM_PROVIDER: 'openai',
+            LLM_BASE_URL: resolution.providerConfig.baseUrl,
+            LLM_API_KEY: resolution.providerConfig.apiKey,
+          });
     const provider = wrapMetered({
       storage: input.storage,
       projectId: input.projectId,
       agentRole: 'leader',
       model,
-      provider: input.provider,
+      provider: input.provider ?? boundProvider,
     });
 
     const ctx: ToolContext = { storage: input.storage, projectId: input.projectId, role: 'leader' };

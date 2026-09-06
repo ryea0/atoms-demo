@@ -193,5 +193,16 @@ export class ProjectEventBus {
   }
 }
 
-/** 模块级单例：编排器与 SSE 路由共用同一份（跨模块 import 本实例，勿各自 new） */
-export const projectEventBus = new ProjectEventBus();
+/**
+ * 单例：编排器与 SSE 路由共用同一份（跨模块 import 本实例，勿各自 new）。
+ *
+ * 挂 globalThis（split-brain 加固，2026-09-07 /p/20-21 事故）：Turbopack dev 按
+ * 路由模块图惰性重编译——events.ts 只被 stream 路由依赖时，其他路由的图被源码改动
+ * 失效重编译后会同时存活两代实例（旧 stream 图一份、新编排器图一份）：编排器往新
+ * 实例发事件，SSE 订阅挂在旧实例上永远收不到（页面冻结、回复只在库里）。globalThis
+ * 锚点让模块重评估后两代图共享同一总线（与 db 连接单例同一手法）；生产 next start
+ * 单模块实例，行为不变。测试侧由 tests/setup.ts 每文件复位，隔离语义与旧版一致。
+ */
+const busAnchor = globalThis as typeof globalThis & { __atomsProjectEventBus?: ProjectEventBus };
+export const projectEventBus: ProjectEventBus = busAnchor.__atomsProjectEventBus ?? new ProjectEventBus();
+busAnchor.__atomsProjectEventBus = projectEventBus;
