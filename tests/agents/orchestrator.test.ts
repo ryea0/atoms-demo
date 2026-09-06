@@ -675,6 +675,39 @@ describe('startGeneration（mock 全链路）', () => {
     expect(events.some((e) => e.event === 'message' && (e.content ?? '').includes('领导汇报'))).toBe(true);
   }, 30000);
 
+  it('⑭ @工程师直派汇报不虚构产物路径（T32 R1）：多文件交付且跳过 docs/，无主产出时省略路径子句', async () => {
+    const { storage, projectId } = await newProject('fast');
+    const { events, stop } = collectEvents(projectId);
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: '把应用做出来',
+      mode: 'fast',
+      mentions: ['engineer'],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    const report = mustFind(events, (e) => e.event === 'message' && e.meta?.kind === 'agent-report');
+    expect(report.agent).toBe('engineer');
+    expect(report.content ?? '').toContain('✅');
+    expect(report.content ?? '').toContain('工程师');
+    // 关键：直派任务的 writesPaths 是 ['docs/','app/']，而工程师只写 app/*——
+    // 不得拿前缀拼出「产物已写入 docs/」这种事实错误，也没有单一主产出可指
+    expect(report.content ?? '').not.toContain('产物已写入');
+    expect(report.content ?? '').not.toContain('docs/');
+    expect(report.meta?.path).toBeUndefined();
+
+    // 落库行同口径：不带 path
+    const persisted = (await storage.listMessages(projectId)).find((m) => m.id === report.meta?.messageId);
+    expect(persisted?.meta?.kind).toBe('agent-report');
+    expect(persisted?.meta?.agent).toBe('engineer');
+    expect(persisted?.meta?.path).toBeUndefined();
+    // 正文仍有信息量：聚合摘要（成功 N 个）进了要点
+    expect(report.content ?? '').toContain('要点：');
+  }, 30000);
+
   it('⑨ 排队轮的请求断开不越界：只停本轮，在跑轮照常完成到 done', async () => {
     vi.stubEnv('LLM_MOCK_DELAY_MS', '20'); // 放慢在跑轮的流式，保证第二轮处于排队态时打断它
     const { storage, projectId } = await newProject('fast');

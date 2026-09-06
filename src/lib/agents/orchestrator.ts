@@ -546,9 +546,11 @@ function reportSummaryClause(summary: string): string {
  * 「@ 了 PM、出来讲话的却是领导」——这里补一条该成员的完成通报，让 @ 谁谁出声。
  * 领导收尾汇报保留不动（它承担多任务轮的聚合视角）。
  *
- * 主产出路径取值优先级：先取该 run 实际写的首个文件（任务结果带回的是落库真路径，最可靠，
- * 如 PM 的 docs/prd.md）；工程师聚合任务的结果不带文件清单（files 恒空），退回任务的
- * writesPaths[0]（领导预估的路径前缀，如 app/）；两者皆缺则不带 path。
+ * 主产出路径取值：**只认该 run 实际写的首个文件**（任务结果带回的是落库真路径，如 PM 的
+ * docs/prd.md、专家的 docs/seo_report.md、架构师的首个产物）。任务结果不带文件清单时
+ * **省略路径子句**、不退回 writesPaths 前缀（T32 R1 评审）：@工程师直派的 writesPaths 是
+ * ['docs/','app/']，而工程师明确跳过 docs/ 只写 app/*，退回前缀会说出「产物已写入 docs/」
+ * 这种事实错误；且多文件交付本就没有单一「主产出」可指。
  */
 async function emitAgentReport(
   storage: StorageProvider,
@@ -557,7 +559,7 @@ async function emitAgentReport(
   task: TaskAssignment,
   result: TaskDispatchResult,
 ): Promise<void> {
-  const primaryPath = result.files[0] ?? task.writesPaths[0];
+  const primaryPath = result.files[0];
   const pathClause = primaryPath === undefined ? '' : `产物已写入 ${primaryPath}。`;
   const content = `✅ ${roleRegistry[task.agent].name}：${AGENT_TASK_NOUN[task.agent]}已完成。${pathClause}${reportSummaryClause(result.summary)}`;
   // meta 随消息落库：刷新后徽章（agent）与产物路径（path）仍可还原（kind 区别于领导收尾卡）

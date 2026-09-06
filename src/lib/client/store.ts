@@ -378,6 +378,17 @@ export class WorkspaceStore {
     this.patch({ connected });
   }
 
+  /**
+   * agent_start 自校正（T32 R1 Finding 2）：收到 agent_start 即「确有一轮在跑」的确定性信号——
+   * 若本地还停在收尾态（例：上一轮 done 尚在 SSE 在途/重放中、POST 已被服务端判为新一轮，
+   * beginRound 的取号守卫因此保守跳过复位），按事件单调序在这里把 finished 重开，
+   * 停止钮/干预黄条不会缺席到整轮结束。已运行态返回空补丁（不产生多余渲染）。
+   */
+  private reopenPatch(): Partial<WorkspaceState> {
+    if (this.state.finished !== true) return {};
+    return { finished: false, project: withStatus(this.state.project, 'running') };
+  }
+
   /** 快照加载失败等非流错误也走 error 通道（用户可见，不静默吞） */
   patchError(message: string): void {
     this.patch({ error: message });
@@ -400,7 +411,7 @@ export class WorkspaceStore {
         this.applyFileEnd(event);
         break;
       case 'agent_start':
-        this.patch({ ...this.runsPatchForStart(event), ...this.liveAgentStartPatch(event) });
+        this.patch({ ...this.runsPatchForStart(event), ...this.liveAgentStartPatch(event), ...this.reopenPatch() });
         break;
       case 'agent_end':
         this.patch({ ...this.runsPatchForEnd(event), ...this.liveAgentEndPatch(event) });
@@ -761,11 +772,13 @@ export class WorkspaceStore {
    * 下一轮从发送到首个 agent_start 之间，停止钮 / 干预黄条 / 直播块全部缺席——
    * 正是用户「以为卡死」的黑盒来源。已在运行态则静默（不产生多余渲染）。
    *
-   * ticket（T32 I2 竞态守卫）：fire-and-forget 轮在服务端先起跑、HTTP 响应后到——轮次
-   * 可能在响应返回前就已 done（短轮/极快场景）。发送前取的号与当前计数不一致 = 本轮已经
-   * 收口，此刻再复位 finished 会把「已完成的背景轮」拉回 running，UI 假运行（停止钮、
-   * 干预黄条、直播块全部空转）。此时保持收尾态不动。同项目串行队列保证：空闲时发出的
-   * POST 只会起这一轮，取号到响应之间到达的终态事件必然属于本轮，不会误伤真正在跑的轮。
+   * ticket（T32 I2 竞态守卫；措辞经 T32 R1 修正使其实）：fire-and-forget 轮在服务端先起跑、
+   * HTTP 响应后到——轮次可能在响应返回前就已 done（短轮/极快场景）。发送前取的号与当前
+   * 计数不一致 = 「取号到响应之间有轮次收口」，此刻再复位 finished 有把已完成的轮拉回
+   * running 的风险（UI 假运行：停止钮、干预黄条、直播块全部空转），故保守跳过复位。
+   * 已知代价（毫秒窗）：ticket 在 POST 前取、服务端的空闲判定是更晚的独立观察——若那次
+   * 收口其实属于上一轮（done 尚在 SSE 在途/重放中），复位会被错过；该缺口由 agent_start
+   * 的自校正重开（reopenPatch）按事件单调序兜回，轮次开跑后控制件即恢复。
    */
   beginRound(projectId: number, ticket?: number): void {
     if (this.state.projectId !== projectId) return;

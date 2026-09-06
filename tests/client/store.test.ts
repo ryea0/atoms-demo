@@ -644,6 +644,36 @@ describe('workspaceStore 本地乐观补登（T31 Commit B）', () => {
     expect(store.getState().finished).toBe(true);
     expect(store.getState().project?.status).toBe('failed');
   });
+
+  it('agent_start 自校正重开（T32 R1）：上一轮 done 在途导致复位被守卫跳过时，新轮 agent_start 兜回运行态', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot({ project: makeProject({ status: 'done' }) }));
+    expect(store.getState().finished).toBe(true);
+
+    // 上一轮的 done 恰在 SSE 在途：POST 已被服务端判为新一轮，但取号到响应之间收到了旧轮 done
+    const ticket = store.roundTicket();
+    store.applyEvent(ev({ event: 'done' }));
+    store.beginRound(PROJECT_ID, ticket); // 号对不上 → 保守不复位
+    expect(store.getState().finished).toBe(true);
+
+    // 新轮 agent_start 到达：按事件单调序自校正，停止钮/干预黄条不缺席到整轮结束
+    store.applyEvent(ev({ event: 'agent_start', agent: 'pm', meta: { taskKey: 'pm-prd' } }));
+    expect(store.getState().finished).toBe(false);
+    expect(store.getState().project?.status).toBe('running');
+    // 同一事件的其余补丁照常生效（直播块、时间线）
+    expect(store.getState().liveAgents['pm']?.status).toBe('thinking');
+    expect(store.getState().runs.at(-1)).toMatchObject({ agent: 'pm', status: 'running' });
+  });
+
+  it('agent_start 在运行态不产生收尾翻转（finished 已 false 时不动 project 之外的语义）', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot({ project: makeProject({ status: 'running' }) }));
+    expect(store.getState().finished).toBe(false);
+
+    store.applyEvent(ev({ event: 'agent_start', agent: 'architect', meta: { taskKey: 'arch-design' } }));
+    expect(store.getState().finished).toBe(false);
+    expect(store.getState().project?.status).toBe('running');
+  });
 });
 
 describe('workspaceStore hydrate', () => {
