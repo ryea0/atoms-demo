@@ -119,6 +119,11 @@ function makeFetchMock(preferences: unknown = { editing_enabled: true, default_m
   return { calls, fetchMock };
 }
 
+/** 消息气泡匹配（排除输入框：jsdom 把 textarea 的值也当子文本节点，getByText 会误中） */
+function bubbleTexts(text: string): HTMLElement[] {
+  return screen.getAllByText(text).filter((element): element is HTMLElement => element.tagName !== 'TEXTAREA');
+}
+
 /** 最近一次请求（url 结尾匹配；stop 请求无 body） */
 function lastPost(calls: readonly RecordedCall[], suffix: string): RecordedCall | undefined {
   return [...calls].reverse().find((call) => call.url.endsWith(suffix));
@@ -684,6 +689,99 @@ describe('输入区', () => {
     expect(calls.filter((call) => call.url.endsWith('/messages'))).toHaveLength(1);
 
     unsubscribe();
+  });
+
+  it('发送即时反馈（T31）：乐观气泡即现、在途发送钮禁用；持久化行到达后不出现双气泡', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    /** POST /messages 挂起在 gate 上，便于断言「在途」窗口 */
+    const fetchImpl = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : String(input);
+      if (url.endsWith('/messages')) {
+        await gate;
+        const payload = { delivered: 'round' };
+        return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' } as unknown as Response;
+    };
+    vi.stubGlobal('fetch', vi.fn(fetchImpl) as unknown as typeof fetch);
+
+    const store = createWorkspaceStore(PROJECT_ID);
+    // store 需先持有项目态（生产里由 useWorkspace 快照 hydrate）：beginRound 依赖它复位 finished
+    store.hydrate({
+      project: makeProject({ status: 'done' }),
+      lastSeq: 0,
+      messages: [],
+      files: [],
+      agentRuns: [],
+      checkpoints: [],
+      usage: [],
+      streamingFiles: [],
+      softLockedFiles: [],
+    });
+    let current = makeState({ finished: true, project: makeProject({ status: 'done' }) });
+    const mounted = render(createElement(ChatPanel, { state: current }));
+    const unsubscribe = store.subscribe(() => {
+      current = makeState({
+        finished: store.getState().finished,
+        project: store.getState().project,
+        messages: store.getState().messages,
+      });
+      mounted.rerender(createElement(ChatPanel, { state: current }));
+    });
+
+    const input = screen.getByRole('textbox', { name: '输入消息' }) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '给列表加个搜索框' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+
+    // 在途窗口：话已上屏（乐观气泡）、发送钮禁用（防黑盒期重复提交）
+    expect(store.getState().messages.some((m) => m.id < 0 && m.role === 'user' && m.content === '给列表加个搜索框')).toBe(true);
+    expect(bubbleTexts('给列表加个搜索框')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: '停止生成' })).not.toBeInTheDocument();
+
+    release();
+    // 新一轮开跑：finished 复位 → 停止钮立即出现（不再等 agent_start）；
+    // 发送钮随输入被清空保持禁用（空文本本就不可发），不作为在途判据
+    await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeInTheDocument());
+
+    // 持久化 user 行（SSE message 事件）到达：同内容的本地气泡被收编，仍只有一句
+    act(() => {
+      store.applyEvent({
+        seq: 1,
+        projectId: PROJECT_ID,
+        runId: null,
+        event: 'message',
+        content: '给列表加个搜索框',
+        meta: { role: 'user', messageId: 61 },
+      });
+    });
+    expect(bubbleTexts('给列表加个搜索框')).toHaveLength(1);
+    expect(store.getState().messages.map((message) => message.id)).toEqual([61]);
+
+    unsubscribe();
+  });
+
+  it('发送失败（T31）：乐观气泡回滚、输入保留，可重试', async () => {
+    const fetchImpl = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : String(input);
+      if (url.endsWith('/messages')) {
+        return { ok: false, status: 500, json: async () => ({ error: { message: '服务器开小差' } }), text: async () => '' } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' } as unknown as Response;
+    };
+    vi.stubGlobal('fetch', vi.fn(fetchImpl) as unknown as typeof fetch);
+
+    mount(makeState());
+    const input = screen.getByRole('textbox', { name: '输入消息' }) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '会失败的请求' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+
+    await waitFor(() => expect(bubbleTexts('会失败的请求')).toHaveLength(0));
+    expect(input.value).toBe('会失败的请求'); // 输入不清空，可直接重试
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
   });
 
   it('快照未就绪（projectId=null）：输入区禁用，不误发请求', () => {

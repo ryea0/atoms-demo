@@ -633,7 +633,19 @@ export class WorkspaceStore {
       deliveredAt: now,
       createdAt: now,
     };
-    return { messages: [...this.state.messages, message] };
+
+    // 乐观气泡收编（T31）：发送瞬间本地补登的用户消息（负数合成 id）在持久化行到达时让位——
+    // 按「同角色 + 同内容」匹配移除，防止同一句话出现两个气泡（合成 id 与正数 id 互不命中，
+    // 上面的 messageId 去重管不到它）
+    let base = this.state.messages;
+    if (role === 'user' && id > 0) {
+      const content = event.content ?? '';
+      const localIndex = base.findIndex((item) => item.id < 0 && item.role === 'user' && item.content === content);
+      if (localIndex >= 0) {
+        base = base.filter((_, index) => index !== localIndex);
+      }
+    }
+    return { messages: [...base, message] };
   }
 
   /**
@@ -661,6 +673,48 @@ export class WorkspaceStore {
       createdAt: Date.now(),
     };
     this.patch({ messages: [...this.state.messages, message] });
+  }
+
+  /**
+   * 本地乐观补登用户消息（T31）：POST 返回前先把「我说的话」上屏（合成负数 id），
+   * 消除发送后的黑盒空窗。返回合成 id 供失败回滚（removeLocalMessage）；成功路径由
+   * messagesPatchFor 的收编逻辑用持久化行顶替（同内容匹配），不产生双气泡。
+   */
+  appendLocalUserMessage(input: { projectId: number; content: string; mentions: readonly AgentRole[] }): number {
+    if (this.state.projectId !== null && this.state.projectId !== input.projectId) return 0;
+    const id = (this.syntheticId -= 1);
+    const now = Date.now();
+    const message: Message = {
+      id,
+      projectId: input.projectId,
+      role: 'user',
+      content: input.content,
+      meta: input.mentions.length > 0 ? { mentions: [...input.mentions] } : null,
+      deliveredAt: now,
+      createdAt: now,
+    };
+    this.patch({ messages: [...this.state.messages, message] });
+    return id;
+  }
+
+  /** 回滚本地乐观消息（发送失败时调用）：只删自己刚补登的合成行（正数 id 不归本地管） */
+  removeLocalMessage(projectId: number, id: number): void {
+    if (id >= 0) return;
+    if (this.state.projectId !== null && this.state.projectId !== projectId) return;
+    if (!this.state.messages.some((message) => message.id === id)) return;
+    this.patch({ messages: this.state.messages.filter((message) => message.id !== id) });
+  }
+
+  /**
+   * 新一轮开跑（POST delivered='round' 成功后调用）：复位 finished + 项目状态置 running。
+   * 修复「上一轮 done 之后 finished 恒真」的陈旧收尾态（T30 遗留）：不复位的话，
+   * 下一轮从发送到首个 agent_start 之间，停止钮 / 干预黄条 / 直播块全部缺席——
+   * 正是用户「以为卡死」的黑盒来源。已在运行态则静默（不产生多余渲染）。
+   */
+  beginRound(projectId: number): void {
+    if (this.state.projectId !== projectId) return;
+    if (this.state.finished === false && this.state.project?.status === 'running') return;
+    this.patch({ finished: false, project: withStatus(this.state.project, 'running') });
   }
 
   /**

@@ -499,6 +499,57 @@ describe('workspaceStore 直播转录（liveAgents）', () => {
 /* workspaceStore：快照 hydrate                                         */
 /* ------------------------------------------------------------------ */
 
+describe('workspaceStore 本地乐观补登（T31 Commit B）', () => {
+  it('appendLocalUserMessage：合成负数 id 的用户气泡即时上屏；removeLocalMessage 只删自己那一条', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+
+    const localId = store.appendLocalUserMessage({ projectId: PROJECT_ID, content: '把按钮改成蓝色', mentions: ['pm'] });
+    expect(localId).toBeLessThan(0);
+    const messages = store.getState().messages;
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ id: localId, role: 'user', content: '把按钮改成蓝色' });
+
+    // 回滚：只删指定合成行，其他消息不动
+    store.appendLocalUserMessage({ projectId: PROJECT_ID, content: '另一条', mentions: [] });
+    store.removeLocalMessage(PROJECT_ID, localId);
+    const after = store.getState().messages;
+    expect(after).toHaveLength(1);
+    expect(after[0]?.content).toBe('另一条');
+    // 正数 id（库里的行）不归本地回滚管
+    store.removeLocalMessage(PROJECT_ID, 5);
+    expect(store.getState().messages).toHaveLength(1);
+  });
+
+  it('持久化 user 行到达：同内容的本地气泡被收编（不出现双气泡），id 换成真实行 id', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+    const localId = store.appendLocalUserMessage({ projectId: PROJECT_ID, content: '把按钮改成蓝色', mentions: [] });
+
+    store.applyEvent(ev({ event: 'message', content: '把按钮改成蓝色', meta: { role: 'user', messageId: 55 } }));
+
+    const messages = store.getState().messages;
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ id: 55, role: 'user' });
+    expect(messages.some((message) => message.id === localId)).toBe(false);
+  });
+
+  it('beginRound：复位上一轮遗留的 finished（停止钮/干预黄条重新生效）；已在运行态则不动', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot({ project: makeProject({ status: 'done' }) }));
+    expect(store.getState().finished).toBe(true);
+
+    store.beginRound(PROJECT_ID);
+    expect(store.getState().finished).toBe(false);
+    expect(store.getState().project?.status).toBe('running');
+
+    // 已在运行态：不再产生新引用/通知（幂等）
+    const before = store.getState();
+    store.beginRound(PROJECT_ID);
+    expect(store.getState()).toBe(before);
+  });
+});
+
 describe('workspaceStore hydrate', () => {
   it('快照重建：files/messages/runs/checkpoints/usage/软锁全部就位，live 转 streaming 占位', () => {
     const run: AgentRun = {
