@@ -4,7 +4,7 @@
  * CSP 头 ruling 7 逐字；缺 index.html / 归属不符等失败分支 → 404 **中文 HTML 提示页**
  * （T25：本路由的响应直接进 iframe，裸 JSON 无样式且读不懂，体验差）。
  */
-import { assemblePreview, PREVIEW_CSP } from '@/lib/preview/assemble';
+import { assemblePreview } from '@/lib/preview/assemble';
 import { applySessionCookie, idParamsSchema, parseRouteParams, requireProject } from '@/lib/api/route-support';
 
 /** 预览错误页 CSP：静态自绘页，无脚本无外链（rules 07 同源收紧） */
@@ -65,7 +65,7 @@ export async function GET(request: Request, ctx: { params: Promise<{ id: string 
       new Response(result.html, {
         headers: {
           'Content-Type': 'text/html; charset=utf-8',
-          'Content-Security-Policy': PREVIEW_CSP,
+          'Content-Security-Policy': result.csp,
           'Cache-Control': 'no-store',
         },
       }),

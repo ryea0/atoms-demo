@@ -17,6 +17,7 @@ import { assembleContext } from '@/lib/agents/context';
 import { runAgent } from '@/lib/agents/runner';
 import { AgentAbortError, AgentValidationError, type RunnerCallbacks } from '@/lib/agents/types';
 import { bashTool, fsTools, type Tool } from '@/lib/agents/tools';
+import { javascriptProfile, resolveProfileByPaths } from '@/lib/languages';
 import type { FileTree, FileTreeNode } from './file-tree';
 import { renderApiJs, renderIndexHtml, renderStartSh } from './samples/app-skeleton';
 import { resolveModel } from '@/lib/llm/client';
@@ -151,21 +152,30 @@ export function buildFastFileTree(requirement: string): FileTree {
 /**
  * 工程师 system prompt：含 mock 角色标记「工程师」与全栈契约（D2）。
  * 刻意避开其他角色的标记词（如「系统设计」「PRD」「file_tree」），防 mock 场景误路由。
+ * 契约第 1 条与 bash 自检行按语言档案注入（DESIGN §12），其余段全语言共用。
  */
-export const ENGINEER_SYSTEM_PROMPT = [
-  '你是全栈工程师（engineer），负责把上游设计可靠地落成可运行代码——当前是单文件任务，应用的质量下限由你守住。',
-  '',
-  '【全栈契约（必须逐条遵守）】',
-  '1. 后端 app/backend/api.js：无框架同构 CommonJS 模块，必须导出 module.exports = { handle }，其中 handle(method, path, body) 返回 { code, data?, message? }；数据一律存内存数组/对象；禁止任何 fs/net/进程/timer API；REST 语义与正确状态码（200/201/400/404/405）。',
-  '2. 前端 app/frontend/index.html：单页，样式仅允许 Tailwind CDN（https://cdn.tailwindcss.com）；一律 fetch(\'/api/...\') 调用后端；禁用 localStorage 与 cookie（预览 iframe 无 same-origin，状态放后端内存）；禁止 eval、new Function、字符串 setTimeout、postMessage。',
-  '3. UI 基线：#F7F7F8 面板分层、蓝色 #3B82F6 强调、8-12px 圆角、1px 细灰线分隔、空态与加载态、中文文案；渲染用户数据一律用 textContent（禁止 innerHTML 拼接，防 XSS）。',
-  '',
-  '【单文件任务纪律】',
-  '- 每个任务只实现一个目标文件；依赖文件全文已注入上下文，其他已生成文件可用 read_file 按需查阅。',
-  '- 目标文件必须由你调用 write_file 写入完整内容（整体覆盖）；发现写错可再次 write_file 覆写修正。',
-  '- 写完目标文件即任务完成：输出一句简短结论即可，不要复述全文。',
-  '- 写完 JS 文件后可用 bash 自检：node --check <文件> 验语法、node -e "require + handle 冒烟" 验行为；单任务最多 5 次、每次 ≤30s、命令 ≤500 字符（超长会被直接拒绝——过长自检拆成多条短命令，或只跑 node --check）；不要用 bash 启动长驻服务、安装依赖或改文件（写文件一律走 write_file）。',
-].join('\n');
+export function buildEngineerSystemPrompt(contract: readonly string[], selfCheckHint: string): string {
+  return [
+    '你是全栈工程师（engineer），负责把上游设计可靠地落成可运行代码——当前是单文件任务，应用的质量下限由你守住。',
+    '',
+    '【全栈契约（必须逐条遵守）】',
+    ...contract,
+    '2. 前端 app/frontend/index.html：单页，样式仅允许 Tailwind CDN（https://cdn.tailwindcss.com）；一律 fetch(\'/api/...\') 调用后端；禁用 localStorage 与 cookie（预览 iframe 无 same-origin，状态放后端内存）；禁止 eval、new Function、字符串 setTimeout、postMessage。',
+    '3. UI 基线：#F7F7F8 面板分层、蓝色 #3B82F6 强调、8-12px 圆角、1px 细灰线分隔、空态与加载态、中文文案；渲染用户数据一律用 textContent（禁止 innerHTML 拼接，防 XSS）。',
+    '',
+    '【单文件任务纪律】',
+    '- 每个任务只实现一个目标文件；依赖文件全文已注入上下文，其他已生成文件可用 read_file 按需查阅。',
+    '- 目标文件必须由你调用 write_file 写入完整内容（整体覆盖）；发现写错可再次 write_file 覆写修正。',
+    '- 写完目标文件即任务完成：输出一句简短结论即可，不要复述全文。',
+    selfCheckHint,
+  ].join('\n');
+}
+
+/** 兼容常量（js 语义不变；新消费方一律走 buildEngineerSystemPrompt + 项目语言档案） */
+export const ENGINEER_SYSTEM_PROMPT = buildEngineerSystemPrompt(
+  javascriptProfile.engineerContract,
+  javascriptProfile.selfCheckHint,
+);
 
 /** 写后自审 system prompt：一次廉价 review（语法/逻辑/遗漏/XSS），覆写一次即止 */
 export const ENGINEER_REVIEW_SYSTEM_PROMPT = [
@@ -305,13 +315,15 @@ export async function runEngineerFile(ctx: EngineerFileContext): Promise<Enginee
   await ctx.storage.updateAgentRun(run.id, { status: 'running', startedAt: Date.now() }, ctx.projectId);
 
   try {
+    // 语言档案按文件树解析（后端入口在册即中，无入口回退 js）：契约与自检行随项目语言注入
+    const profile = resolveProfileByPaths(ctx.fileTree.map((node) => node.path));
     let feedback: string[] | undefined;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       const assembled = await assembleContext({
         storage: ctx.storage,
         projectId: ctx.projectId,
         role: 'engineer',
-        systemPrompt: ENGINEER_SYSTEM_PROMPT,
+        systemPrompt: buildEngineerSystemPrompt(profile.engineerContract, profile.selfCheckHint),
         task: buildTaskText(ctx.target, ctx.fileTree, feedback),
         upstreamSummaries: ctx.designSummary.trim() === '' ? [] : [ctx.designSummary],
         interventions: [],
