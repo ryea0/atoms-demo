@@ -271,6 +271,21 @@ describe('干预队列卡片', () => {
     expect(screen.getByText('已注入下一步骤')).toBeInTheDocument();
   });
 
+  it('收尾边界消费的干预卡显示「已注入收尾汇报」（targetTask=leader-closing，T32 M4）', () => {
+    mount(
+      makeState({
+        messages: [
+          msg('intervention', '汇报里补一句下一步迭代方向', {
+            deliveredAt: Date.now(),
+            meta: { targetTask: 'leader-closing' },
+          }),
+        ],
+      }),
+    );
+    expect(screen.getByText('已注入收尾汇报')).toBeInTheDocument();
+    expect(screen.queryByText('已注入下一步骤')).not.toBeInTheDocument();
+  });
+
   it('运行中：输入框上方出现干预黄条；发送走 POST messages（干预入队）', async () => {
     const { calls, fetchMock } = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
@@ -479,6 +494,20 @@ describe('直播转录块', () => {
     expect(screen.getByText('已完成')).toBeInTheDocument();
     expect(screen.getByText('设计完成')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /思考/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '打开文件' })).not.toBeInTheDocument();
+  });
+
+  it('failed 块（T32 I1）：「已失败」徽章，不再显示进行中徽章与脉冲点', () => {
+    mount(
+      makeState({
+        liveAgents: {
+          pm: { reasoning: '想了半截', outputPath: 'docs/prd.md', outputTail: '# PRD', status: 'failed' },
+        },
+      }),
+    );
+    expect(screen.getByText('已失败')).toBeInTheDocument();
+    expect(screen.queryByText('思考中…')).not.toBeInTheDocument();
+    expect(screen.queryByText(/正在写/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '打开文件' })).not.toBeInTheDocument();
   });
 

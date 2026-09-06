@@ -52,8 +52,8 @@ export interface WorkspaceFile {
  */
 export type WorkspaceSnapshot = ProjectSnapshot;
 
-/** 直播块的成员状态（T31）：思考中 → 写文件中 → 完成 */
-export type LiveAgentStatus = 'thinking' | 'writing' | 'done';
+/** 直播块的成员状态（T31）：思考中 → 写文件中 → 完成；failed=该成员本轮任务以错误收口（T32 I1） */
+export type LiveAgentStatus = 'thinking' | 'writing' | 'done' | 'failed';
 
 /** 单个活跃成员的直播转录（聊天区 LiveAgentBlock 的数据源；键=agent） */
 export interface LiveAgentState {
@@ -76,6 +76,11 @@ const OUTPUT_TAIL_CAP = 600;
 /** 取文本尾段（超长丢头部——直播块只关心「此刻写到哪」） */
 function tailOf(text: string, cap: number): string {
   return text.length <= cap ? text : text.slice(text.length - cap);
+}
+
+/** 直播块是否已到终态（done=正常完成 / failed=任务级 error 收口，T32 I1） */
+function isTerminalLiveStatus(status: LiveAgentStatus): boolean {
+  return status === 'done' || status === 'failed';
 }
 
 /** 工作台聚合状态（组件层通过 useWorkspace 订阅） */
@@ -197,6 +202,10 @@ function messageMetaOf(event: StreamEvent, mentions: AgentRole[]): MessageMeta |
       if (candidate !== '') meta.path = candidate;
     }
   }
+  // targetTask 原样保留（T32 M4）：收尾边界（leader-closing）解析不出文件路径，
+  // 措辞分支「已注入收尾汇报」靠它判定；落库行本就带该字段（T25），此处对齐同一口径
+  const rawTargetTask = event.meta?.targetTask;
+  if (typeof rawTargetTask === 'string' && rawTargetTask !== '') meta.targetTask = rawTargetTask;
   if (mentions.length > 0) meta.mentions = mentions;
   return Object.keys(meta).length === 0 ? null : meta;
 }
@@ -231,6 +240,13 @@ export class WorkspaceStore {
 
   /** 合成节点 id（负向递减，不与库里自增 id 冲突） */
   private syntheticId = 0;
+
+  /**
+   * 已收口的轮次计数（done/stopped/顶层 error 各 +1）。
+   * beginRound 竞态守卫（T32 I2）的依据：发送前取号，响应回来后号对不上 = 本轮已提前收口。
+   * 属运行时簿记（不进 WorkspaceState、不参与渲染）。
+   */
+  private settledRounds = 0;
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -267,15 +283,16 @@ export class WorkspaceStore {
 
   /**
    * agent_start：开一块直播（或续上同角色既有块）。
-   * 清理时机取舍（T31 取简）：若现有块**全部** done 则先整体清空再开新块——选「保留到下一块
-   * 开始」而非「最后一个完成即清空」，串行 DAG 的任务间隙不会整块闪烁消失；轮次收口（done/stopped）
-   * 另有整体清空。历史交接由时间线与消息流负责，直播块只管当下。
+   * 清理时机取舍（T31 取简）：若现有块**全部已终态**（done/failed，T32 I1 把 failed 也算收口）
+   * 则先整体清空再开新块——选「保留到下一块开始」而非「最后一个完成即清空」，串行 DAG 的任务
+   * 间隙不会整块闪烁消失；轮次收口（done/stopped/顶层 error）另有整体清空。
+   * 历史交接由时间线与消息流负责，直播块只管当下。
    */
   private liveAgentStartPatch(event: StreamEvent): Partial<WorkspaceState> {
     const agent = event.agent ?? 'leader';
     const existing = Object.values(this.state.liveAgents);
     const base: Record<string, LiveAgentState> =
-      existing.length > 0 && existing.every((item) => item.status === 'done') ? {} : this.state.liveAgents;
+      existing.length > 0 && existing.every((item) => isTerminalLiveStatus(item.status)) ? {} : this.state.liveAgents;
     const prev = base[agent];
     return {
       liveAgents: {
@@ -338,6 +355,23 @@ export class WorkspaceStore {
     }));
   }
 
+  /**
+   * 任务级 error{agent}（无 path）= 该成员本轮 run 的错误终态（协议见 events.ts 头部约定，
+   * T32 I1）：块标 failed——脉冲停止、徽章显示「已失败」，不再挂着「思考中/正在写」假在线
+   * （修复前任务级失败后块会一直脉冲到轮次收口）。
+   */
+  private liveAgentFailedPatch(event: StreamEvent): Partial<WorkspaceState> {
+    const agent = event.agent;
+    if (agent === undefined) return {};
+    return this.patchLiveAgent(agent, (prev) => ({
+      reasoning: prev?.reasoning ?? '',
+      outputPath: prev?.outputPath ?? null,
+      outputTail: prev?.outputTail ?? '',
+      status: 'failed',
+      summary: prev?.summary,
+    }));
+  }
+
   /** SSE 连接状态（onopen/onerror/卸载；值不变时不通知，避免渲染抖动） */
   setConnected(connected: boolean): void {
     if (this.state.connected === connected) return;
@@ -381,6 +415,7 @@ export class WorkspaceStore {
         this.patch(this.messagesPatchFor(event, 'intervention'));
         break;
       case 'done':
+        this.settledRounds += 1; // 轮次收口计数（beginRound 竞态守卫，T32 I2）
         this.patch({
           files: withStreamingCleared(this.state.files),
           livePaths: [],
@@ -390,6 +425,7 @@ export class WorkspaceStore {
         });
         break;
       case 'stopped':
+        this.settledRounds += 1;
         this.patch({
           files: withStreamingCleared(this.state.files),
           livePaths: [],
@@ -458,7 +494,8 @@ export class WorkspaceStore {
     const path = event.path;
     const patch: Partial<WorkspaceState> = { error: event.error ?? '生成过程出现错误' };
     if (path !== undefined && this.state.files.get(path)?.streaming === true) {
-      // 文件级失败：清该路径在流标记（服务端同时清 liveBuffer）
+      // 文件级失败：清该路径在流标记（服务端同时清 liveBuffer）；不是该 run 的终态，
+      // 直播块保持原状（工程师继续下一个文件）
       return {
         ...patch,
         ...this.upsertFile(path, (prev) => ({
@@ -471,15 +508,17 @@ export class WorkspaceStore {
       };
     }
     // 无 path 且无 agent 的 error 是编排器的顶层失败（运行终止）：置 failed 并收尾，
-    // 避免前端把项目永远停留在「生成中」；任务级/文件级失败（带 agent 或 path）不算收尾
+    // 避免前端把项目永远停留在「生成中」；任务级/文件级失败（带 agent 或 path）不算收尾。
+    // 直播块与 done/stopped 同口径整体清场（T32 I1）：顶层终止后不再有「在场成员」。
     if (path === undefined && event.agent === undefined) {
-      return { ...patch, finished: true, project: withStatus(this.state.project, 'failed') };
+      this.settledRounds += 1; // 顶层失败也是轮次收口（beginRound 竞态守卫，T32 I2）
+      return { ...patch, liveAgents: {}, finished: true, project: withStatus(this.state.project, 'failed') };
     }
     // 任务级失败（带 agent、无 path）：该 agent 当前 run 视为终态（协议见 events.ts）。
     // 编排器任务失败只发 error{agent,taskKey} 不发 agent_end——若不在此收口，时间线的
-    // 合成 run 会一直「进行中」（蓝点脉冲到刷新）。
+    // 合成 run 会一直「进行中」（蓝点脉冲到刷新）；直播块同样收口为 failed（T32 I1）。
     if (path === undefined && event.agent !== undefined) {
-      return { ...patch, ...this.failedRunPatchFor(event) };
+      return { ...patch, ...this.failedRunPatchFor(event), ...this.liveAgentFailedPatch(event) };
     }
     return patch;
   }
@@ -709,13 +748,28 @@ export class WorkspaceStore {
   }
 
   /**
+   * 发送前取号（T32 I2）：返回当前「已收口轮次」计数。POST /messages 响应回来后把它传给
+   * beginRound——响应返回前若有 done/stopped/顶层 error 到达，号必然对不上。
+   */
+  roundTicket(): number {
+    return this.settledRounds;
+  }
+
+  /**
    * 新一轮开跑（POST delivered='round' 成功后调用）：复位 finished + 项目状态置 running。
    * 修复「上一轮 done 之后 finished 恒真」的陈旧收尾态（T30 遗留）：不复位的话，
    * 下一轮从发送到首个 agent_start 之间，停止钮 / 干预黄条 / 直播块全部缺席——
    * 正是用户「以为卡死」的黑盒来源。已在运行态则静默（不产生多余渲染）。
+   *
+   * ticket（T32 I2 竞态守卫）：fire-and-forget 轮在服务端先起跑、HTTP 响应后到——轮次
+   * 可能在响应返回前就已 done（短轮/极快场景）。发送前取的号与当前计数不一致 = 本轮已经
+   * 收口，此刻再复位 finished 会把「已完成的背景轮」拉回 running，UI 假运行（停止钮、
+   * 干预黄条、直播块全部空转）。此时保持收尾态不动。同项目串行队列保证：空闲时发出的
+   * POST 只会起这一轮，取号到响应之间到达的终态事件必然属于本轮，不会误伤真正在跑的轮。
    */
-  beginRound(projectId: number): void {
+  beginRound(projectId: number, ticket?: number): void {
     if (this.state.projectId !== projectId) return;
+    if (ticket !== undefined && ticket !== this.settledRounds) return;
     if (this.state.finished === false && this.state.project?.status === 'running') return;
     this.patch({ finished: false, project: withStatus(this.state.project, 'running') });
   }

@@ -178,6 +178,13 @@ describe('mock 全链路（fast）', () => {
     expect(regenDelta).toBeLessThan(regenFileEnd);
     expect(regenFileEnd).toBeLessThan(regenEnd);
     expect(regenEvents[regenFileEnd]?.meta?.version).toBe(regenResult.version);
+    // 思考流与轮次行为一致（T32 M3）：重试也透传 reasoning（agent=engineer、落在任务窗口内）
+    const reasoningIndexes = regenEvents
+      .map((event, index) => (event.event === 'reasoning' && event.agent === 'engineer' ? index : -1))
+      .filter((index) => index >= 0);
+    expect(reasoningIndexes.length).toBeGreaterThanOrEqual(1);
+    expect(reasoningIndexes[0]).toBeGreaterThan(regenStart);
+    expect(reasoningIndexes.at(-1)).toBeLessThan(regenEnd);
 
     /* ---------------- ⑦ 检查点回滚：内容恢复 + 任务标 rolled_back ---------------- */
     // docs/prd.md 在 pm 任务后定版且不再被改写：取工程师任务前的检查点即可校验内容恢复
