@@ -55,7 +55,12 @@ export function resolveSession(request: Request): ResolvedSession {
   return { sessionId: newSessionId(), isNew: true };
 }
 
-/** 序列化 Set-Cookie 值（secure 仅生产——本地 http 下 Secure 会让 cookie 被浏览器丢弃） */
+/**
+ * 序列化 Set-Cookie 值（secure 仅生产——本地 http 下 Secure 会让 cookie 被浏览器丢弃）。
+ *
+ * COOKIE_SECURE=false 显式降级开关：无域名/无法上 HTTPS 的裸 IP http demo 部署用
+ * （生产默认仍带 Secure；仅字面量 "false" 生效，防误配宽进）。
+ */
 export function sessionCookieHeader(sessionId: string, env: NodeJS.ProcessEnv = process.env): string {
   const attrs = [
     `${SESSION_COOKIE}=${sessionId}`,
@@ -64,7 +69,7 @@ export function sessionCookieHeader(sessionId: string, env: NodeJS.ProcessEnv = 
     'SameSite=Lax',
     `Max-Age=${SESSION_MAX_AGE_SECONDS}`,
   ];
-  if (env.NODE_ENV === 'production') attrs.push('Secure');
+  if (env.NODE_ENV === 'production' && env.COOKIE_SECURE !== 'false') attrs.push('Secure');
   return attrs.join('; ');
 }
 
