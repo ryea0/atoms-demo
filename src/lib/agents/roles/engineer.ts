@@ -153,7 +153,7 @@ export function buildFastFileTree(requirement: string): FileTree {
     {
       path: 'app/frontend/index.html',
       desc: `${TEMPLATE_LABEL[kind]}单页（Tailwind CDN + fetch 调 ${primary}，禁 localStorage）`,
-      depends: ['app/backend/api.js'],
+      depends: [FAST_ENTRY[lang]],
     },
     {
       path: 'app/README.md',
