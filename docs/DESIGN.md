@@ -238,7 +238,7 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 
 *LLM 自审*=工程师写完文件后一次廉价 review 调用（质量+安全清单），可覆写修复（agent 版 lint）。不做：完整 eslint 规则集、AST 级重构、跨文件类型推断。
 
-**⑥ mock provider 行为规格**（P1 交付物）：按角色返回固定优质样例（PM→样例 PRD；架构师→样例设计+图+file_tree；工程师→按模板骨架逐文件吐码），流式 chunk 吐出、延迟可配（默认 30ms/chunk）；`LLM_PROVIDER=mock` 启用。真实模型冒烟：本机 `DASHSCOPE_API_KEY`（OpenAI 兼容）dev 冒烟，密钥不进 git。
+**⑥ mock provider 行为规格**（P1 交付物）：按角色返回固定优质样例（PM→样例 PRD；架构师→样例设计+图+file_tree；工程师→按模板骨架逐文件吐码），流式 chunk 吐出、延迟 env 可配（`LLM_MOCK_DELAY_MS`，默认 5ms/chunk；原定 30ms，随实现按 plan 裁决收敛为 5ms——测试/离线可置 0）；`LLM_PROVIDER=mock` 启用。真实模型冒烟：本机 `DASHSCOPE_API_KEY`（OpenAI 兼容）dev 冒烟，密钥不进 git。
 
 ## 6. 技术栈
 
