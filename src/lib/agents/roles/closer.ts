@@ -72,6 +72,8 @@ export const PROGRESS_HEADER = [
 export interface CloserRoundOutcome {
   /** 本轮成功（done）的任务数 */
   succeeded: number;
+  /** 本轮被级联跳过（skipped：前置失败/被跳过）的任务数（T34：与根因失败分开陈述） */
+  skipped: number;
   /** 本轮失败的任务（任务键 + 失败原因首句） */
   failed: ReadonlyArray<{ taskKey: string; reason: string }>;
 }
@@ -235,17 +237,24 @@ function fallbackReport(fileCount: number, humanEditedPaths: readonly string[]):
 }
 
 /**
- * 本轮结果段（T33 反谎报）：成功 N 项、失败 M 项（失败：taskKey——原因首句）。
- * M>0 时附「如实汇报失败项」的纪律要求——只给数据不给要求，模型仍可能顺着
- * system prompt 的「任务已执行完毕」惯性说出「全部完成」。
+ * 本轮结果段（T33 反谎报 / T34 跳过口径）：成功 N 项、失败 M 项、跳过 K 项。
+ * 失败=根因（taskKey——原因首句）；跳过=被失败级联波及而未执行的任务，单独陈述、
+ * 不与失败混算也不计成功。M>0 时附「如实汇报失败项」的纪律要求——只给数据不给要求，
+ * 模型仍可能顺着 system prompt 的「任务已执行完毕」惯性说出「全部完成」。
  */
 export function renderRoundOutcomeSection(outcome: CloserRoundOutcome): string {
-  const lines = ['【本轮结果】', `- 成功 ${outcome.succeeded} 项、失败 ${outcome.failed.length} 项`];
+  const skippedNote = outcome.skipped > 0 ? `、跳过 ${outcome.skipped} 项` : '';
+  const lines = ['【本轮结果】', `- 成功 ${outcome.succeeded} 项、失败 ${outcome.failed.length} 项${skippedNote}`];
   for (const item of outcome.failed) {
     lines.push(`- 失败：${item.taskKey}——${item.reason}`);
   }
+  if (outcome.skipped > 0) {
+    lines.push(
+      `- 跳过：${outcome.skipped} 项是上述失败的级联后果（未执行），不是失败也不算成功，须与失败分开陈述。`,
+    );
+  }
   if (outcome.failed.length > 0) {
-    lines.push('- 汇报纪律：以上失败项必须逐条如实写进汇报（任务与原因），不得声称所有任务均已成功完成。');
+    lines.push('- 汇报纪律：以上失败项必须逐条如实写进汇报（任务与原因），不得声称所有任务均已成功完成；跳过项只能作为失败的级联后果提及。');
   }
   return lines.join('\n');
 }
