@@ -90,7 +90,10 @@ npm run seed                                      # 预置演示项目（幂等�
 
 > 交付说明：开发机 Docker daemon 不可用，以下为**交付物级验证**——Dockerfile/compose 已按规范编写并做语法自查（`docker compose config` 语义对照人工核对），容器冒烟留待有 daemon 的环境执行。若 musl 下 better-sqlite3 无预编译产物，把 base 换 `node:22-bookworm-slim`。
 
+**首跑前（宿主，必做）**：`mkdir -p ./data && chown 1001:1001 ./data`。干净 clone 上 `./data` 不存在时，Docker 以 root:root 创建 bind mount，容器内非 root 用户 `nextjs(1001)` 无权写 `app.db`/`-wal` → better-sqlite3 直接失败（症状：容器 crash loop，日志 `SQLITE_CANTOPEN`/`EACCES`）；镜像内 `mkdir + chown` 会被 bind mount 覆盖，救不了这条路径。
+
 ```bash
+mkdir -p ./data && chown 1001:1001 ./data
 docker compose up --build
 ```
 

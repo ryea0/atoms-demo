@@ -4,7 +4,7 @@
 # - runner 只跑 `next start`，不携带任何构建工具链（typescript/tailwind/drizzle-kit 等被裁剪）
 # - better-sqlite3 优先用 prebuilt 二进制；alpine(musl) 若无匹配预编译产物则需源码编译，
 #   因此 deps 阶段补 python3/make/g++，并保留 node-gyp（.npmrc 已把 node-gyp 指到项目内版本）
-#   ——先全量 `npm ci` 再 `npm prune --omit=dev`，保证兜底路径可用且产物体积接近生产依赖
+#   ——先全量 `npm ci` 再 `npm prune --omit=dev --ignore-scripts`，保证兜底路径可用且产物体积接近生产依赖
 # - schema 在首次连接时自举（src/lib/db/provider/sqlite/ddl.ts 的 ensureSchema），容器内无需 db:push
 # - mock 样例按 process.cwd()/src/lib/agents/roles/samples 读取（src/lib/llm/mock.ts readSample），
 #   runner 阶段按相同 WORKDIR 布局拷贝该目录；改 standalone 输出或 WORKDIR 时必须一并调整
@@ -31,7 +31,9 @@ WORKDIR /app
 RUN apk add --no-cache python3 make g++
 COPY package.json package-lock.json .npmrc ./
 COPY --from=deps /app/node_modules ./node_modules
-RUN npm prune --omit=dev
+# --ignore-scripts：.node 产物在 deps 阶段已编译好；prune 移除 node-gyp（.npmrc 指向的 devDependency）
+# 后，若 npm reify 重跑 better-sqlite3 install 脚本会因找不到 node-gyp 而失败，直接禁掉该路径
+RUN npm prune --omit=dev --ignore-scripts
 
 # ---------- runner：仅运行时 ----------
 FROM node:22-alpine AS runner

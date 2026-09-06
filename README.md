@@ -76,6 +76,7 @@ docker compose up --build      # 构建并启动，映射 3000 端口，数据�
 
 - **Dockerfile**：multi-stage `node:22-alpine`——`deps`（全量装依赖，保留 node-gyp 以便 better-sqlite3 无预编译产物时源码兜底）→ `build`（`next build`）→ `runner`（生产依赖 + `.next`，仅 `next start`，非 root 用户运行）
 - **数据持久化**：compose 把 `./data` 挂进容器（`DB_FILE=/app/data/app.db`），重建容器数据不丢；schema 在首次连接时自举（`ensureSchema`），容器内无需手工 `db:push`
+- **首跑卷属主（必做）**：干净 clone 上 `./data` 不存在时，Docker 会以 root:root 创建 bind mount，容器内非 root 用户 `nextjs(1001)` 无权写 `app.db`/`-wal`（症状：容器 crash loop，日志 `SQLITE_CANTOPEN`/`EACCES`）。先 `mkdir -p ./data && chown 1001:1001 ./data` 再 `docker compose up --build`
 - **mock 样例目录（重要）**：mock provider 的黄金样例按 `process.cwd()/src/lib/agents/roles/samples` 读取，镜像内已把该目录拷到同一相对路径（见 Dockerfile 注释）；若改用 standalone 输出或自定义 WORKDIR，务必保留这一布局
 - **SSE 过网关**：stream 路由已带 `X-Accel-Buffering: no`；若前面还有 nginx，需 `proxy_buffering off`
 - **已知限制**：单实例内存态（事件环形缓冲 / 写锁 / 干预队列），水平扩容前需外置（见 [DESIGN §12](docs/DESIGN.md#12-扩展性架构provider--registry-模式)）
