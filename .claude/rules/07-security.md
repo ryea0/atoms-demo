@@ -27,6 +27,7 @@
 - preview 响应加 CSP：`script-src 'self' https://cdn.tailwindcss.com; connect-src 'none'`（堵数据外传）
 - 生成物落库前过危险 API AST 扫描（eval/new Function/字符串 setTimeout/postMessage to parent → 硬拒绝重试；死循环/外部 fetch → 软警告）
 - 已知限制写明：无 same-origin → 生成应用不可用 localStorage/cookie（prompt 引导内存态）
+- 多语言预览（2026-09-06）：TS 经服务端进程内转译（devDep typescript）走既有 JS 管线，CSP 不变；Python 预览加载 Pyodide（固定版本 jsDelivr CDN），CSP 增量仅 script-src 追加该 CDN + 'wasm-unsafe-eval'、connect-src 由 'none' 放开为该 CDN 单域（composePreviewCsp 合成，JS 项目逐字节不变）。已知限制：Python 首载 ~10MB 需外网；语法校验降级放行（boot 失败横幅 + fetch 500 信封兜底）
 
 ## 会话
 - 匿名 session cookie：httpOnly、SameSite=Lax、secure(生产)；projectId 归属校验（他人 id 404）

@@ -150,3 +150,10 @@ docker compose up --build
 **7. 用量与成本**
 
 - 预期：项目页按 agent/模型分组的用量卡片数值合理；模型单价可在设置页维护；缺 usage 的调用被标 `estimated` 并按中文校准公式估算。
+
+## 多语言演示（TS + Python，2026-09-06 增补）
+
+1. 新建项目，需求输入「用 Python 写一个待办清单」→ 快速模式关键词命中 → 文件树后端入口为 app/backend/api.py
+2. 生成完成后打开预览：首载拉取 Pyodide（~10MB，需外网），随后浏览器内跑真 Python 后端，CRUD 全通
+3. 再建一个「用 TypeScript 写一个待办清单」→ 入口 api.ts → 预览为转译后 JS（无 Pyodide、CSP 不变）
+4. 话题点：语言维 = LanguageProfile 注册表（§12）；预览沙箱 = PreviewSandboxProvider（js/pyodide 两实现）

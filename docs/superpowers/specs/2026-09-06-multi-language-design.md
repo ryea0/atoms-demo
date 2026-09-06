@@ -140,7 +140,7 @@ TS 项目物化时转译产物投 `__atoms/backend.js`，`__atoms/server.js` req
 | 故障 | 行为 |
 |---|---|
 | ts 转译失败 | file_end 校验期拦 → 带错重试 → 仍败则单文件任务失败落 agent_runs.error + SSE error |
-| py 语法错误 | 校验放行 → 预览 boot 时 pyodide 抛 SyntaxError → 预览页中文错误横幅 + SSE error → 单文件重试修 |
+| py 语法错误 | 校验放行 → 预览 boot 时 pyodide 抛 SyntaxError → 预览页中文错误横幅 + /api/ 请求 500 信封（修订：iframe 禁 postMessage、connect-src 'none'，SSE error 不可达）→ 单文件重试修 |
 | pyodide import 禁止模块 | 同上路径，错误信息透传 |
 | CDN 加载失败（离线） | previewErrorPage 中文提示页（现先例） |
 | 未知后缀 / 入口缺失 | 回退 javascript + 软警告，不炸 |

@@ -344,7 +344,8 @@ DB 决策：本机无 Postgres/docker；编排器单写者，SQLite 够用零配
 | 认证 | `AuthProvider` | 匿名 session cookie | 用户账户（user 级偏好/配额随之启用） |
 | 导出/发布 | `ExportProvider` | zip 下载 | GitHub 推送、一键部署（Zeabur/Vercel API） |
 | 计量 | `MeteringSink`（usage 事件） | llm_calls 表 | 计费 hooks（Quota/Ledger 启用） |
-| 预览沙箱 | `PreviewSandboxProvider` | iframe srcDoc + fetch 拦截 | WebContainer（浏览器跑 Node）、服务端容器沙箱 |
+| 预览沙箱 | `PreviewSandboxProvider` | iframe srcDoc + fetch 拦截（browser-js / browser-pyodide 两沙箱已落地，src/lib/preview/sandbox/） | WebContainer（浏览器跑 Node）、服务端容器沙箱 |
+| 语言 | `LanguageProfile`（契约/构建/校验/运行时） | javascript + typescript（转译）+ python（Pyodide） | cpp（browser-wasm）、java（server-process，需重估安全姿态） |
 
 **StorageProvider 落地形态**（P1 实现，其余接口按 YAGNI 在用到时抽取，避免过度设计——只预留命名与目录）：
 ```
