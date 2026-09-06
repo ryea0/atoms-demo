@@ -115,7 +115,11 @@ function clip(text: string, max = 500): string {
   return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max)}…（截断）`;
 }
 
-/** args → OpenAI arguments 字符串（对象序列化；原始字符串原样透传） */
+/**
+ * args → OpenAI arguments 字符串（对象序列化；原始字符串原样透传）。
+ * 字符串透传是 T35 round-trip 的另一半：parseArgs 解双层/兜底得到的字符串若在这里
+ * 被 JSON.stringify 二次编码，历史里会重新出现模型那层多余编码，错误被固化而非纠正。
+ */
 function stringifyArgs(args: unknown): string {
   if (typeof args === 'string') return args;
   try {
@@ -126,12 +130,28 @@ function stringifyArgs(args: unknown): string {
   }
 }
 
-/** arguments 字符串 → args（解析失败保留原文，不丢工具调用） */
+/**
+ * arguments 字符串 → args（解析失败保留原文，不丢工具调用）。
+ * 双层编码兜底（T35，真机 ARK doubao 实证）：偶发把整个参数对象再当字符串编码一次
+ * （arguments 形如 "{\"path\":...}"），只解一层得到 string → 上层 zod 根级校验失败
+ * （expected object, received string）→ 回喂重试后模型仍双层 → 任务终止。
+ * 故第一层解出 string 时再 parse 一次；**至多两层**（三层以上属病态输入，停手不解，
+ * 交上层校验回喂）——固定两次尝试、不递归，杜绝病态嵌套拖垮解析。
+ * 二层仍失败保留一层解码结果：比原文少一层转义噪音，且与 stringifyArgs 的字符串透传
+ * 配合后回喂历史不再二次编码（round-trip 不断）。
+ */
 function parseArgs(raw: string): unknown {
+  let first: unknown;
   try {
-    return JSON.parse(raw) as unknown;
+    first = JSON.parse(raw) as unknown;
   } catch {
     return raw;
+  }
+  if (typeof first !== 'string') return first;
+  try {
+    return JSON.parse(first) as unknown;
+  } catch {
+    return first;
   }
 }
 
