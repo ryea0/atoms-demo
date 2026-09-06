@@ -9,7 +9,7 @@ import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import { ProjectCard } from '@/components/projects/ProjectCard';
 import { listProjects } from '@/lib/client/session';
-import type { ProjectListItem } from '@/lib/db/provider/types';
+import type { ProjectCardItem } from '@/lib/db/provider/types';
 
 interface ProjectsGridProps {
   /** 项目被删除时通知父级（如同步清理侧栏最近列表） */
@@ -17,7 +17,7 @@ interface ProjectsGridProps {
 }
 
 export function ProjectsGrid({ onDeleted }: ProjectsGridProps) {
-  const [projects, setProjects] = useState<ProjectListItem[] | null>(null);
+  const [projects, setProjects] = useState<ProjectCardItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
@@ -77,6 +77,7 @@ export function ProjectsGrid({ onDeleted }: ProjectsGridProps) {
         <ProjectCard
           key={project.id}
           project={project}
+          isSeed={project.isSeed === true}
           onChanged={refresh}
           onDeleted={handleDeleted}
         />

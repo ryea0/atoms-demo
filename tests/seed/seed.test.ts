@@ -8,7 +8,7 @@
  *   可被 assemblePreview 装配，lastEditor/producedBy = 'seed'（文件树绿角标「预置文件」）
  */
 import { describe, expect, it } from 'vitest';
-import { seedDemoProjects, SEED_SESSION_ID } from '@/lib/seed';
+import { openProjectOrTemplate, seedDemoProjects, SEED_SESSION_ID } from '@/lib/seed';
 import { assemblePreview } from '@/lib/preview/assemble';
 import { newTestStorage } from '@/lib/db/test-util';
 import type { StorageProvider } from '@/lib/db/provider/types';
@@ -91,5 +91,77 @@ describe('seedDemoProjects', () => {
     expect(result.skipped).toBe(true);
     expect(result.created).toHaveLength(0);
     expect(await storage.countProjects()).toBe(1);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 模板画廊：打开即克隆（T25 R1，评审 Finding 1）                          */
+/* ------------------------------------------------------------------ */
+
+describe('openProjectOrTemplate', () => {
+  it('seed 模板 → 克隆到当前会话：新 id、sessionId=调用方、标题带后缀、文件齐全、原 seed 不动', async () => {
+    const storage = newTestStorage();
+    const [seed] = (await seedDemoProjects(storage)).created;
+    if (seed === undefined) throw new Error('seed 项目缺失');
+
+    const outcome = await openProjectOrTemplate(storage, 'session-a', seed.id);
+    if (outcome === null) throw new Error('openProjectOrTemplate 返回 null');
+    expect(outcome.cloned).toBe(true);
+    expect(outcome.projectId).not.toBe(seed.id);
+
+    const copy = await storage.getProject(outcome.projectId);
+    expect(copy?.sessionId).toBe('session-a');
+    expect(copy?.status).toBe('done');
+    expect(copy?.title).toBe(`${seed.title}（示例副本）`);
+    expect(copy?.requirement).toBe(seed.requirement);
+
+    // 文件逐份对齐（内容与编辑者标记一致），且原 seed 项目完全不被占用
+    const seedFiles = await storage.readAllFiles(seed.id);
+    const copyFiles = await storage.readAllFiles(outcome.projectId);
+    expect(copyFiles.map((f) => [f.path, f.content, f.lastEditor])).toEqual(
+      seedFiles.map((f) => [f.path, f.content, f.lastEditor]),
+    );
+    expect((await storage.getProject(seed.id))?.sessionId).toBe(SEED_SESSION_ID);
+    expect((await storage.readAllFiles(seed.id)).map((f) => f.content)).toEqual(seedFiles.map((f) => f.content));
+  });
+
+  it('同会话重复打开同一模板 → 复用已有副本（不堆积）', async () => {
+    const storage = newTestStorage();
+    const [seed] = (await seedDemoProjects(storage)).created;
+    if (seed === undefined) throw new Error('seed 项目缺失');
+
+    const first = await openProjectOrTemplate(storage, 'session-a', seed.id);
+    const second = await openProjectOrTemplate(storage, 'session-a', seed.id);
+    // 同一副本（cloned 只在真正克隆的那次为 true），库里不新增行
+    expect(second?.projectId).toBe(first?.projectId);
+    expect(second?.cloned).toBe(false);
+    expect(await storage.countProjects()).toBe(3); // 2 seed + 1 副本
+  });
+
+  it('其他会话打开同一模板 → 各得一份副本', async () => {
+    const storage = newTestStorage();
+    const [seed] = (await seedDemoProjects(storage)).created;
+    if (seed === undefined) throw new Error('seed 项目缺失');
+
+    const a = await openProjectOrTemplate(storage, 'session-a', seed.id);
+    const b = await openProjectOrTemplate(storage, 'session-b', seed.id);
+    if (a === null || b === null) throw new Error('openProjectOrTemplate 返回 null');
+    expect(a.projectId).not.toBe(b.projectId);
+    expect((await storage.getProject(a.projectId))?.sessionId).toBe('session-a');
+    expect((await storage.getProject(b.projectId))?.sessionId).toBe('session-b');
+  });
+
+  it('普通项目原样返回（不克隆不写库）；项目不存在返回 null', async () => {
+    const storage = newTestStorage();
+    const mine = await storage.createProject({ sessionId: 'session-a', title: '我的项目', requirement: 'r', mode: 'fast' });
+    const before = await storage.countProjects();
+
+    await expect(openProjectOrTemplate(storage, 'session-b', mine.id)).resolves.toEqual({
+      projectId: mine.id,
+      cloned: false,
+    });
+    expect(await storage.countProjects()).toBe(before);
+
+    await expect(openProjectOrTemplate(storage, 'session-a', 424242)).resolves.toBeNull();
   });
 });

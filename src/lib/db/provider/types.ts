@@ -87,6 +87,13 @@ export type ProjectListItem = Project & {
   lastMessage:string|null;
 };
 
+/**
+ * 卡片墙行（路由层 DTO）：用户项目 + seed 模板行（isSeed=true，T25 R1 模板画廊）。
+ * 仓库层 listProjects 恒不置 isSeed；由 GET /api/projects 追加 seed 行时标记——
+ * 前端据此显示「示例」角标并把打开动作改走 /api/projects/[id]/open（打开即克隆）。
+ */
+export type ProjectCardItem = ProjectListItem & { isSeed?: boolean };
+
 /** 项目仓库：全部查询强制 sessionId/projectId 过滤（CLAUDE.md 规则 9） */
 export interface ProjectsRepo {
   createProject(input: CreateProjectInput): Promise<Project>;

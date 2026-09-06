@@ -6,7 +6,7 @@
  */
 import { useState } from 'react';
 import Link from 'next/link';
-import { Download, LogIn, MoreVertical, Trash2 } from 'lucide-react';
+import { Download, LogIn, MoreVertical, Sparkles, Trash2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -25,23 +25,22 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Input } from '@/components/ui/input';
-import {
-  deleteProject,
-  openProjectExport,
-  renameProject,
-} from '@/lib/client/session';
+import { openProjectExport } from '@/lib/client/session';
+import { deleteProject, renameProject } from '@/lib/client/session';
 import { formatRelativeTime, formatTokens, modeLabel, statusBadgeVariant, statusLabel } from '@/lib/client/format';
 import type { ProjectListItem } from '@/lib/db/provider/types';
 
 interface ProjectCardProps {
   project: ProjectListItem;
+  /** seed 模板行（模板画廊，T25 R1）：打开即克隆到当前会话，不提供重命名/导出/删除 */
+  isSeed?: boolean;
   /** 标题重命名/删除成功后通知父级刷新列表 */
   onChanged: () => void;
   /** 删除成功回调（父级可同步清理侧栏最近列表） */
   onDeleted: (projectId: number) => void;
 }
 
-export function ProjectCard({ project, onChanged, onDeleted }: ProjectCardProps) {
+export function ProjectCard({ project, isSeed = false, onChanged, onDeleted }: ProjectCardProps) {
   const [renaming, setRenaming] = useState(false);
   const [draftTitle, setDraftTitle] = useState(project.title);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -68,6 +67,7 @@ export function ProjectCard({ project, onChanged, onDeleted }: ProjectCardProps)
   };
 
   const confirmDelete = (): void => {
+    if (isSeed) return; // 模板行不可删（服务端归属校验也会拒绝）
     setDeleting(true);
     void deleteProject(project.id)
       .then(() => onDeleted(project.id))
@@ -99,9 +99,9 @@ export function ProjectCard({ project, onChanged, onDeleted }: ProjectCardProps)
           />
         ) : (
           <Link
-            href={`/p/${project.id}`}
-            title="双击重命名"
-            onDoubleClick={startRename}
+            href={isSeed ? `/api/projects/${project.id}/open` : `/p/${project.id}`}
+            title={isSeed ? '打开示例：会复制一份到你的项目里' : '双击重命名'}
+            onDoubleClick={isSeed ? undefined : startRename}
             className="min-w-0 flex-1 truncate text-sm font-medium"
           >
             {project.title}
@@ -115,21 +115,32 @@ export function ProjectCard({ project, onChanged, onDeleted }: ProjectCardProps)
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-40">
-            <DropdownMenuItem asChild>
-              <Link href={`/p/${project.id}`}>
-                <LogIn aria-hidden />
-                进入工作台
-              </Link>
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => openProjectExport(project.id)}>
-              <Download aria-hidden />
-              导出 zip
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem variant="destructive" onSelect={() => setConfirmOpen(true)}>
-              <Trash2 aria-hidden />
-              删除项目
-            </DropdownMenuItem>
+            {isSeed ? (
+              <DropdownMenuItem asChild>
+                <Link href={`/api/projects/${project.id}/open`}>
+                  <Sparkles aria-hidden />
+                  打开示例
+                </Link>
+              </DropdownMenuItem>
+            ) : (
+              <>
+                <DropdownMenuItem asChild>
+                  <Link href={`/p/${project.id}`}>
+                    <LogIn aria-hidden />
+                    进入工作台
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => openProjectExport(project.id)}>
+                  <Download aria-hidden />
+                  导出 zip
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem variant="destructive" onSelect={() => setConfirmOpen(true)}>
+                  <Trash2 aria-hidden />
+                  删除项目
+                </DropdownMenuItem>
+              </>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
@@ -141,7 +152,14 @@ export function ProjectCard({ project, onChanged, onDeleted }: ProjectCardProps)
       )}
 
       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-        <Badge variant={statusBadgeVariant(project.status)}>{statusLabel(project.status)}</Badge>
+        {isSeed ? (
+          <Badge className="gap-1">
+            <Sparkles className="size-3" aria-hidden />
+            示例
+          </Badge>
+        ) : (
+          <Badge variant={statusBadgeVariant(project.status)}>{statusLabel(project.status)}</Badge>
+        )}
         <Badge variant="outline">{modeLabel(project.mode)}</Badge>
         <span className="font-mono">{project.fileCount} 个文件</span>
         <span className="font-mono">{formatTokens(project.totalTokens)} tokens</span>

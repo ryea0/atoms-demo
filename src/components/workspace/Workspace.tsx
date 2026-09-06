@@ -61,8 +61,12 @@ export function Workspace({ projectId }: { projectId: number }) {
     if (isMobilePane(value)) setPane(value);
   }, []);
 
-  // 文件树点击 / 产物卡点击 → 打开并激活查看器页签
-  const handleOpenFile = useCallback((path: string) => setActivePath(path), []);
+  // 文件树点击 / 产物卡点击 → 打开并激活查看器页签；<lg 单栏下同时切到查看栏
+  // （否则页签在隐藏栏里打开，移动端毫无反馈——T25 R1 评审 Finding 2）
+  const handleOpenFile = useCallback((path: string) => {
+    setActivePath(path);
+    setPane('viewer');
+  }, []);
   // 查看器页签切换/关闭 → 回写选中态（文件树高亮跟随，双向不回环：同值 setState 不触发渲染）
   const handleActivePathChange = useCallback((path: string | null) => setActivePath(path), []);
 

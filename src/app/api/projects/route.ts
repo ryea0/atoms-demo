@@ -10,6 +10,8 @@ import { z } from 'zod';
 import { createStorage } from '@/lib/db';
 import { applySessionCookie, resolveSession } from '@/lib/session';
 import { startRoundInBackground } from '@/lib/projects/service';
+import { SEED_SESSION_ID } from '@/lib/seed';
+import type { ProjectCardItem } from '@/lib/db/provider/types';
 import { agentRoleSchema, badRequest, internalError, invalidBody } from '@/lib/api/route-support';
 
 const createProjectSchema = z.object({
@@ -38,10 +40,17 @@ export async function GET(request: Request): Promise<Response> {
     if (recentLimit === null) return badRequest('recent 必须是不超过 3 位的正整数');
 
     const storage = createStorage();
-    const [projects, recentSessions] = await Promise.all([
+    const [own, templates, recentSessions] = await Promise.all([
       storage.listProjects(session.sessionId),
+      // 模板画廊（T25 R1）：seed 演示项目不属于任何会话，卡片墙对所有访客可见（排在用户项目之后）
+      storage.listProjects(SEED_SESSION_ID),
       storage.getRecentSessions(session.sessionId, recentLimit),
     ]);
+    // isSeed 交给前端做「示例」角标，并把打开动作改走 /api/projects/[id]/open（打开即克隆）
+    const projects: ProjectCardItem[] = [
+      ...own,
+      ...templates.map((project) => ({ ...project, isSeed: true })),
+    ];
     // 新访客在此拿到 session cookie（首次进入首页即可建项目）
     return applySessionCookie(Response.json({ projects, recentSessions }), session);
   } catch (error) {

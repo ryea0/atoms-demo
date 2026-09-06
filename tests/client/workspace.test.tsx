@@ -376,6 +376,8 @@ describe('跨面板接线（T25）', () => {
     // 查看器出现对应页签与文件面板（头部显示完整路径）
     expect(await screen.findByRole('tab', { selected: true, name: /prd\.md/ })).toBeInTheDocument();
     expect(screen.getByText('docs/prd.md')).toBeInTheDocument();
+    // <lg 单栏模式：打开文件同时切到「查看」栏（页签在隐藏栏打开 = 移动端无反馈，T25 R1）
+    expect(screen.getByRole('tab', { name: '查看' })).toHaveAttribute('data-state', 'active');
     // 文件树选中态由查看器激活页签回写（单一选中状态）
     expect(screen.getByRole('treeitem', { name: /prd\.md/ })).toHaveAttribute('aria-selected', 'true');
   });

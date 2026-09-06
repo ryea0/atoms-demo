@@ -9,7 +9,7 @@
  * 另存平台自身的会话级本地偏好（公告条关闭标记；注意：localStorage 禁令针对生成的应用，
  * 平台页面不受限，但仍用 sessionStorage 保持「关一次、本次会话不再打扰」的轻语义）。
  */
-import type { AgentRole, Project, ProjectListItem } from '@/lib/db/provider/types';
+import type { AgentRole, Project, ProjectCardItem } from '@/lib/db/provider/types';
 import type { WorkspaceSnapshot } from '@/lib/client/store';
 
 /** 结构化 API 错误（message 来自服务端 code/message，可直接展示给用户） */
@@ -72,9 +72,12 @@ export function createProject(body: CreateProjectBody): Promise<{ project: Proje
   return requestJson<{ project: Project }>('/api/projects', { method: 'POST', body: JSON.stringify(body) });
 }
 
-/** GET /api/projects → {projects: ProjectListItem[]}（updatedAt 倒序，服务端一次聚合） */
-export function listProjects(): Promise<{ projects: ProjectListItem[] }> {
-  return requestJson<{ projects: ProjectListItem[] }>('/api/projects');
+/**
+ * GET /api/projects → {projects: ProjectCardItem[]}（用户项目 updatedAt 倒序在前，
+ * seed 模板行（isSeed=true）追加在末尾——模板画廊，打开即克隆）。
+ */
+export function listProjects(): Promise<{ projects: ProjectCardItem[] }> {
+  return requestJson<{ projects: ProjectCardItem[] }>('/api/projects');
 }
 
 /** PATCH /api/projects/[id] → 200（标题重命名） */
