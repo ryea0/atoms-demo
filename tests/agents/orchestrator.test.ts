@@ -36,13 +36,16 @@ const reviewPaths: string[] = [];
 const reviewFailPaths = new Set<string>();
 /** 非空则 routeLeader 返回这份 DAG（环依赖注入用） */
 let cycleTasks: TaskAssignment[] | null = null;
+/** 非空则在 PM 任务执行中途调用（模拟「任务跑着的时候用户发来干预」，T31 Commit C） */
+let midRoundEnqueue: ((ctx: { storage: StorageProvider; projectId: number }) => Promise<void>) | null = null;
 
 vi.mock('@/lib/agents/roles/pm', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/agents/roles/pm')>();
   return {
     ...actual,
-    runPm: (ctx: import('@/lib/agents/roles/pm').PmContext) => {
+    runPm: async (ctx: import('@/lib/agents/roles/pm').PmContext) => {
       pmRequirements.push(ctx.requirement);
+      if (midRoundEnqueue !== null) await midRoundEnqueue({ storage: ctx.storage, projectId: ctx.projectId });
       return actual.runPm(ctx);
     },
   };
@@ -122,6 +125,7 @@ beforeEach(() => {
   reviewPaths.length = 0;
   reviewFailPaths.clear();
   cycleTasks = null;
+  midRoundEnqueue = null;
 });
 
 afterEach(() => {
@@ -579,6 +583,36 @@ describe('startGeneration（mock 全链路）', () => {
     const prdEndSeq = mustFind(events, (e) => e.event === 'file_end' && e.path === 'docs/prd.md').seq;
     expect(firstReasoningSeq).toBeGreaterThan(prdStartSeq);
     expect(firstReasoningSeq).toBeLessThan(prdEndSeq);
+  }, 30000);
+
+  it('⑪ 收尾边界也消费干预（T31）：任务执行期间到达的指令不再滞留队列', async () => {
+    const { storage, projectId } = await newProject('full');
+    const { events, stop } = collectEvents(projectId);
+    // @ 直派 PM：本轮唯一任务 pm-prd 的边界检查先于任务执行——执行期间到达的干预，
+    // 在修复前没有任何后续边界去取它（delivered_at 恒 null，用户侧永远「排队中」）
+    midRoundEnqueue = async ({ storage: target, projectId: pid }) => {
+      await target.addMessage({ projectId: pid, role: 'intervention', content: '汇报里请补一句下一步迭代方向' });
+    };
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: '@产品经理 出一份 PRD',
+      mode: 'full',
+      mentions: ['pm'],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    // 收尾边界取走并注入：事件带 targetTask=leader-closing，队列打戳清空
+    const closing = mustFind(
+      events,
+      (e) => e.event === 'intervention_injected' && e.meta?.targetTask === 'leader-closing',
+    );
+    expect((closing.content ?? '')).toContain('下一步迭代方向');
+    const messages = await storage.listMessages(projectId);
+    const pending = messages.filter((m) => m.role === 'intervention' && m.deliveredAt === null);
+    expect(pending).toHaveLength(0);
   }, 30000);
 
   it('⑨ 排队轮的请求断开不越界：只停本轮，在跑轮照常完成到 done', async () => {

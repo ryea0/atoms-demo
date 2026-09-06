@@ -622,12 +622,21 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
 
     // 收尾：领导汇报（一次 LLM 调用）→ assistant message → done
     await checkpointBefore(storage, projectId, '任务前:leader-closing');
+
+    // 收尾也是任务边界（T31 修复）：任务执行期间排队的干预在此兜底消费。
+    // 单任务轮次（如 @直派 PM 出 PRD）之后不再有任何任务边界——缺这一步，干预将永久滞留
+    // 队列（delivered_at 恒 null，用户侧永远「排队中」，真机 DB 实证）。T23 R1 的顺序约束
+    // （先软锁裁决、后取干预）在此不受影响：收尾没有文件任务、没有软锁裁决可等待，
+    // 取到的干预直接进领导收尾上下文（不重跑工程任务；要落地改动仍需用户再发一轮）。
+    const closingInterventions = await takeInterventions(storage, projectId, 'leader-closing', emit);
+
     emit({ runId: null, event: 'agent_start', agent: 'leader', meta: { taskKey: 'leader-closing' } });
     const closer = await runCloser({
       storage,
       projectId,
       signal,
       onReasoning: reasoningEmitOf(emit, 'leader'),
+      interventions: closingInterventions.map((item) => item.content),
     });
     emit({ runId: closer.runId, event: 'agent_end', agent: 'leader', summary: (await runSummaryOf(storage, projectId, closer.runId)) ?? undefined });
     const assistant = await storage.addMessage({ projectId, role: 'assistant', content: closer.report });

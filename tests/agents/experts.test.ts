@@ -268,6 +268,37 @@ describe('assessOutput / stripOuterFence：落库前裁决（纯函数）', () =
 /* ------------------------------------------------------------------ */
 
 describe('runCloser：MEMORY + PROGRESS 领导汇报段', () => {
+  it('收尾边界取到的干预进收尾上下文（T31）：user prompt 带【干预指令】小节', async () => {
+    const { storage, projectId } = await newProject();
+    const prompts: string[] = [];
+    const captureProvider: LlmProvider = {
+      name: 'capture',
+      async complete(req: LlmRequest): Promise<LlmResult> {
+        prompts.push(req.messages.map((m) => m.content).join('\n'));
+        return { content: '', toolCalls: [], usage: { promptTokens: 1, completionTokens: 1 } };
+      },
+      async stream(req: LlmRequest): Promise<LlmResult> {
+        prompts.push(req.messages.map((m) => m.content).join('\n'));
+        return {
+          content: '===== MEMORY =====\n## 选型与关键决策\n- 零依赖\n===== 汇报 =====\n- 本轮已完成',
+          toolCalls: [],
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+
+    const result = await runCloser({
+      storage,
+      projectId,
+      provider: captureProvider,
+      interventions: ['汇报里补一句下一步迭代方向'],
+    });
+
+    expect(prompts.join('\n')).toContain('【干预指令】');
+    expect(prompts.join('\n')).toContain('汇报里补一句下一步迭代方向');
+    expect(result.report).toContain('本轮已完成');
+  });
+
   it('brief 用例：closer 写 MEMORY 且汇报文本非空（PROGRESS.md 缺失时创建）', async () => {
     const { storage, projectId } = await newProject();
     await storage.upsertFile({
