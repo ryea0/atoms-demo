@@ -1,7 +1,8 @@
 /**
  * FS 工具集（write_file / read_file / list_files / grep）——DESIGN §4.5/§4.6。
  * 边界：工具只操作虚拟文件系统（files 表，经 StorageProvider，全部强制 project_id），
- * 不碰宿主磁盘、不做 bash/exec（.claude/rules/07 红线）。
+ * 不直接碰宿主磁盘；命令执行走受控执行层 src/lib/exec/（bash.ts，2026-09-06 增补，
+ * 守卫见 .claude/rules/07-security.md「受控执行层」）。
  * 每个工具自带 zod schema（execute 前校验，失败回喂给模型重试）与由 schema 派生的
  * JSON Schema parameters（给 LLM 的 function calling 声明），二者同源不漂移。
  */

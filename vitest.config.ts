@@ -8,7 +8,7 @@ export default defineConfig({
     setupFiles: ['./tests/setup.ts'],
     globals: true,
     // 排除 SDD 并行 worktree（否则会把在途分支的测试文件扫进主干套件）
-    exclude: ['**/node_modules/**', '**/dist/**', '.superpowers/**'],
+    exclude: ['**/node_modules/**', '**/dist/**', '.superpowers/**', '.claude/worktrees/**'],
   },
   resolve: { alias: { '@': path.resolve(__dirname, './src') } },
 });
