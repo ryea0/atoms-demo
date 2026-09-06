@@ -5,10 +5,11 @@
  */
 import type { LanguageProfile } from './types';
 import { javascriptProfile } from './profiles/javascript';
+import { typescriptProfile } from './profiles/typescript';
 
 export type { LanguageProfile, LanguageId, PreviewRuntime } from './types';
 
-export const LANGUAGE_PROFILES: readonly LanguageProfile[] = [javascriptProfile];
+export const LANGUAGE_PROFILES: readonly LanguageProfile[] = [javascriptProfile, typescriptProfile];
 
 const BY_EXTENSION = new Map<string, LanguageProfile>(
   LANGUAGE_PROFILES.map((profile) => [profile.backendExtension, profile]),
