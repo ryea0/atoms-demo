@@ -53,10 +53,13 @@ export const FETCH_SHIM = [
   '  if(nativeFetch===null)return Promise.reject(new Error("非 /api/ 请求且原生 fetch 不可用"));',
   '  return nativeFetch(input,init);',
   '};',
+  // 用 Object.defineProperty 设为不可写，防止模型生成的前端代码（window.fetch = mockFetch）覆盖。
+  // 兼容性：IE 不支持但我们不考虑；Safari/Chrome/Firefox 全部支持。
+  'try{Object.defineProperty(window,"fetch",{value:window.fetch,writable:false,configurable:false});}catch(e){}',
   '})();',
 ].join('\n');
 
-/** 组装注入块（先装后端，再装拦截器） */
+/** 组装注入块（先装后端，再装拦截器；都放 head 顶部，保证页面脚本执行前 fetch 已被替换且不可覆盖） */
 function injectionBlock(apiJsSource: string | null): string {
   return `<script>\n${backendWrapper(apiJsSource)}\n${FETCH_SHIM}\n</script>`;
 }
@@ -90,12 +93,10 @@ export function injectBeforeBodyEnd(indexHtml: string, injection: string): strin
 }
 
 /** 纯函数装配（保留原导出名，seed/测试若有引用不断）
- *  后端模块注入到 <head> 顶部（提前暴露），fetch 拦截器注入到 </body> 前（保证最后生效，
- *  覆盖模型生成的前端代码自行设置的 window.fetch）。 */
+ *  后端模块 + fetch 拦截器一并注入到 <head> 顶部——保证页面任何脚本执行前 fetch 已被替换。
+ *  拦截器通过 Object.defineProperty 设为不可写，防止模型代码（window.fetch = mockFetch）覆盖。 */
 export function assemblePreviewHtml(indexHtml: string, apiJsSource: string | null): string {
-  const headInjection = `<script>\n${backendWrapper(apiJsSource)}\n</script>`;
-  const bodyInjection = `<script>\n${FETCH_SHIM}\n</script>`;
-  return injectBeforeBodyEnd(injectIntoHtml(indexHtml, headInjection), bodyInjection);
+  return injectIntoHtml(indexHtml, injectionBlock(apiJsSource));
 }
 
 export const browserJsSandbox: PreviewSandboxProvider = {

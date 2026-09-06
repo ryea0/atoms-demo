@@ -44,27 +44,28 @@ const FETCH_SHIM_LOCK = [
   '  if(nativeFetch===null)return Promise.reject(new Error("非 /api/ 请求且原生 fetch 不可用"));',
   '  return nativeFetch(input,init);',
   '};',
+  'try{Object.defineProperty(window,"fetch",{value:window.fetch,writable:false,configurable:false});}catch(e){}',
   '})();',
 ].join('\n');
 
 describe('预览装配（js 项目 byte 级回归）', () => {
-  it('后端模块注入 head 顶部 + FETCH_SHIM 注入 </body> 前（保证拦截器最后生效）', async () => {
+  it('后端模块 + FETCH_SHIM 一并注入 head 顶部（页面脚本执行前生效 + 不可写保护）', async () => {
     const result = await assemblePreview(fakeStorage({ [PREVIEW_INDEX_PATH]: INDEX, 'app/backend/api.js': API_JS }), 1);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const wrapper = `window.__ATOMS_BACKEND__=(function(){const module={exports:{}};${API_JS};return module.exports;})();` +
       '(function(){ if(typeof window.module===\'undefined\'){window.module={exports:window.__ATOMS_BACKEND__};}else{Object.assign(window.module.exports,window.__ATOMS_BACKEND__);} })();';
-    const expectedHead = `<html><head><script>\n${wrapper}\n</script><title>t</title></head><body>`;
-    const expectedBody = `<script>\n${FETCH_SHIM_LOCK}\n</script></body></html>`;
-    expect(result.html).toBe(expectedHead + expectedBody);
+    // 后端垫片 + FETCH_SHIM 在同一个 <script> 里，紧跟 <head> 之后
+    const expected = `<html><head><script>\n${wrapper}\n${FETCH_SHIM_LOCK}\n</script><title>t</title></head><body></body></html>`;
+    expect(result.html).toBe(expected);
     expect(result.csp).toBe(PREVIEW_CSP);
   });
 
   it('缺 api.js → 占位分支（后端空 + 拦截器仍注入）；缺 index.html → missing_index', async () => {
     const placeholder = await assemblePreview(fakeStorage({ [PREVIEW_INDEX_PATH]: INDEX }), 1);
-    // 后端为空串时 head 里只有 <script>\n\n</script>，拦截器在 body 末尾
+    // 后端为空串时中间多一个空行（wrapper 为空 + \n + FETCH_SHIM）
     expect(placeholder.ok && placeholder.html).toBe(
-      `<html><head><script>\n\n</script><title>t</title></head><body><script>\n${FETCH_SHIM_LOCK}\n</script></body></html>`,
+      `<html><head><script>\n\n${FETCH_SHIM_LOCK}\n</script><title>t</title></head><body></body></html>`,
     );
     const missing = await assemblePreview(fakeStorage({ 'app/backend/api.js': API_JS }), 1);
     expect(missing).toEqual({ ok: false, reason: 'missing_index' });

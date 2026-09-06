@@ -6,7 +6,7 @@
  * 桥接用 JSON 字符串双向序列化：避开 JsProxy（JS 对象进 python）与 Map（dict 出 python）陷阱。
  */
 import type { PreviewInput, PreviewOutput, PreviewSandboxProvider } from './types';
-import { escapeClosingScriptTag, injectBeforeBodyEnd, injectIntoHtml } from './browser-js';
+import { escapeClosingScriptTag, injectIntoHtml } from './browser-js';
 
 const PYODIDE_VERSION = 'v0.26.4';
 const PYODIDE_BASE = `https://cdn.jsdelivr.net/pyodide/${PYODIDE_VERSION}/full/`;
@@ -86,6 +86,8 @@ const FETCH_SHIM_LAZY = [
   '  if(nativeFetch===null)return Promise.reject(new Error("非 /api/ 请求且原生 fetch 不可用"));',
   '  return nativeFetch(input,init);',
   '};',
+  // 用 Object.defineProperty 设为不可写，防止模型生成的前端代码（window.fetch = mockFetch）覆盖。
+  'try{Object.defineProperty(window,"fetch",{value:window.fetch,writable:false,configurable:false});}catch(e){}',
   '})();',
 ].join('\n');
 
@@ -93,12 +95,11 @@ export const browserPyodideSandbox: PreviewSandboxProvider = {
   kind: 'browser-pyodide',
   assemble(input: PreviewInput): PreviewOutput {
     const boot = input.backendSource === null ? '' : pyodideBoot(input.backendSource);
-    // CDN loader + boot 块放 head 顶部（尽早启动异步加载）
-    const headInjection = `<script src="${PYODIDE_BASE}pyodide.js"></script>\n${boot}`;
-    // lazy fetch 拦截器放 </body> 前（最后生效，覆盖前端代码自行设置的 window.fetch）
-    const bodyInjection = `<script>\n${FETCH_SHIM_LAZY}\n</script>`;
+    // 全部放 head 顶部：CDN loader + boot 块（尽早启动异步加载）+ lazy fetch 拦截器
+    // （拦截器通过 Object.defineProperty 设为不可写，模型代码覆盖不了）
+    const headInjection = `<script src="${PYODIDE_BASE}pyodide.js"></script>\n${boot}<script>\n${FETCH_SHIM_LAZY}\n</script>`;
     return {
-      html: injectBeforeBodyEnd(injectIntoHtml(input.indexHtml, headInjection), bodyInjection),
+      html: injectIntoHtml(input.indexHtml, headInjection),
       cspExtras: {
         scriptSrc: ['https://cdn.jsdelivr.net', "'wasm-unsafe-eval'"],
         connectSrc: ['https://cdn.jsdelivr.net'],
