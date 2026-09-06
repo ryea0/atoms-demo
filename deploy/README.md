@@ -48,16 +48,27 @@ curl -s -o /dev/null -w '%{http_code}\' http://127.0.0.1/   # 401（basic auth �
 浏览器打开 `http://<IP>/` → 输入口令（bootstrap 首次运行输出，忘了就重置：
 `htpasswd -bB /etc/nginx/.atoms_htpasswd atoms <新密码>`）→ 建项目跑一轮 mock/真实流式 → 预览。
 
+## 代码合入后重新部署
+
+代码 push 到 `origin/main` 后，服务器上一条命令更新（三档速度，按需选）：
+
+```bash
+bash /opt/atoms-demo/deploy/update.sh             # 全量：npm ci + build + 重启（最稳，2-3 分钟）
+bash /opt/atoms-demo/deploy/update.sh --fast      # 快速：跳过 npm ci，仅 build + 重启（依赖未变时）
+bash /opt/atoms-demo/deploy/update.sh --skip-build # 极速：纯后端改动，只拉代码 + 重启（秒级）
+```
+
+脚本幂等，跑完会自检 `active` + 200。挂了看 `journalctl -u atoms -n 50`。
+
 ## 常用运维
 
 ```bash
 systemctl restart atoms                # 重启应用
 journalctl -u atoms -f                 # 跟日志
-# 更新部署（服务器上）：
-cd /opt/atoms-demo && sudo -u atoms bash -ec 'git fetch origin && git reset --hard origin/main && npm ci && npm run build'
-systemctl restart atoms
 # 备份：仅一个文件（SQLite 全量）+ 工作区目录
 scp root@<IP>:/opt/atoms-demo/data/app.db ./backup-$(date +%F).db
+# 改访问口令
+htpasswd -bB /etc/nginx/.atoms_htpasswd atoms <新密码> && systemctl reload nginx
 ```
 
 ## 已知限制（demo 姿态，有意为之）
