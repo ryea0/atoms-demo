@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   renderApiJs,
+  renderApiTs,
   renderIndexHtml,
   renderStartSh,
 } from '@/lib/agents/roles/samples/app-skeleton';
@@ -245,6 +246,9 @@ function targetPathOf(messages: LlmMessage[]): string {
 function renderEngineerFile(path: string, messages: LlmMessage[]): string {
   const requirement = requirementOf(messages);
   const routes = apiRoutesOf(messages);
+  if (path.endsWith('.ts')) {
+    return renderApiTs(routes);
+  }
   if (path.endsWith('api.js') || path.endsWith('.js') || path.endsWith('.mjs')) {
     return renderApiJs(routes);
   }

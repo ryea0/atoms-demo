@@ -566,6 +566,58 @@ export function renderApiJs(routes: string[]): string {
   return renderCrudApi(routes);
 }
 
+/** TS 后端骨架：与 renderCrudApi 同语义（内存 CRUD + REST 信封），类型注解版 */
+export function renderApiTs(routes: string[]): string {
+  const list = routes.length > 0 ? routes : [DEFAULT_API_ROUTE];
+  const primary = resourceOf(list[0] ?? DEFAULT_API_ROUTE);
+  const lines: string[] = [
+    '/**',
+    ' * 内存态后端（TypeScript、无框架、同构）：handle(method, path, body)',
+    ' * 运行边界：浏览器沙箱内执行——禁 fs/net/本地存储，刷新页面即重置。',
+    ` * 路由：${list.join(', ')}`,
+    ' * 响应统一为 { code, data?, message? }；REST 状态码：200/201/400/404/405。',
+    ' */',
+    'type Item = { id: number; title: string; done: boolean };',
+    'type Envelope = { code: number; data?: unknown; message?: string };',
+    'const db: Record<string, Item[]> = {};',
+    'let nextId = 1;',
+    ...list.map((r) => `db['${resourceOf(r)}'] = [{ id: nextId++, title: '示例任务', done: false }];`),
+    '',
+    'export function handle(method: string, path: string, body: unknown): Envelope {',
+    '  const parts = String(path ?? "").split("/").filter(Boolean);',
+    `  const resource = parts[1] ?? '${primary}';`,
+    '  const id = parts.length > 2 ? Number(parts[2]) : null;',
+    '  const bucket = db[resource];',
+    '  if (bucket === undefined) return { code: 404, message: "未知资源：" + resource };',
+    '  const action = String(method ?? "GET").toUpperCase();',
+    '  const item = (body ?? null) as { title?: string; done?: boolean } | null;',
+    '  if (action === "GET" && id === null) return { code: 200, data: bucket };',
+    '  if (action === "POST") {',
+    '    const title = typeof item?.title === "string" ? item.title.trim() : "";',
+    '    if (title.length === 0) return { code: 400, message: "title 不能为空" };',
+    '    const created: Item = { id: nextId++, title, done: false };',
+    '    bucket.unshift(created);',
+    '    return { code: 201, data: created };',
+    '  }',
+    '  const mutating = action === "PUT" || action === "PATCH" || action === "DELETE" || (action === "GET" && id !== null);',
+    '  if (!mutating) return { code: 405, message: "不支持的方法：" + action };',
+    '  if (id === null) return { code: 404, message: "缺少资源 id" };',
+    '  const at = bucket.findIndex((entry) => entry.id === id);',
+    '  if (at < 0) return { code: 404, message: "条目不存在" };',
+    '  if (action === "GET") return { code: 200, data: bucket[at] };',
+    '  if (action === "PUT" || action === "PATCH") {',
+    '    if (typeof item?.title === "string" && item.title.trim().length > 0) bucket[at].title = item.title.trim();',
+    '    if (typeof item?.done === "boolean") bucket[at].done = item.done;',
+    '    return { code: 200, data: bucket[at] };',
+    '  }',
+    '  const removed = bucket.splice(at, 1)[0];',
+    '  return { code: 200, data: { ok: true, id: removed.id } };',
+    '}',
+    '',
+  ];
+  return lines.join('\n');
+}
+
 /** CRUD 后端：/api/<resource> 内存数组分桶，REST 增删改查（200/201/400/404/405） */
 function renderCrudApi(routes: string[]): string {
   const list = routes.length > 0 ? routes : [DEFAULT_API_ROUTE];

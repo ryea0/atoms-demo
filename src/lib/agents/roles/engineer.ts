@@ -20,7 +20,7 @@ import { bashTool, fsTools, type Tool } from '@/lib/agents/tools';
 import { javascriptProfile, resolveProfileByPaths } from '@/lib/languages';
 import type { LanguageId } from '@/lib/languages/types';
 import type { FileTree, FileTreeNode } from './file-tree';
-import { renderApiJs, renderIndexHtml, renderStartSh } from './samples/app-skeleton';
+import { renderApiJs, renderApiTs, renderIndexHtml, renderStartSh } from './samples/app-skeleton';
 import { resolveModel } from '@/lib/llm/client';
 import { wrapMetered } from '@/lib/llm/metered-provider';
 import { validateFile, type FileValidation } from '@/lib/validation';
@@ -264,6 +264,7 @@ function buildReviewTaskText(ctx: EngineerReviewContext): string {
 
 /** 按扩展名渲染保底模板：模型两次都没 write_file 时的确定性兜底（DESIGN §5⑤ 下限保证） */
 function renderFallbackFile(path: string, requirement: string, routes: string[]): string {
+  if (/\.ts$/.test(path)) return renderApiTs(routes);
   if (/\.m?js$/.test(path)) return renderApiJs(routes);
   if (/\.html?$/.test(path)) return renderIndexHtml(requirement, routes);
   if (path.endsWith('.sh')) return renderStartSh();
