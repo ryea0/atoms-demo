@@ -37,6 +37,11 @@ export interface ChatInputProps {
   mode: 'fast' | 'full';
   /** 快照未就绪时禁用整个输入区 */
   disabled?: boolean;
+  /**
+   * 请求在途（T31 防重复提交）：ChatPanel 统一持有的发送门闸，覆盖输入框之外的发送入口。
+   * 在途期间禁用发送钮与回车提交——模型思考以分钟计，第二次点击不再产生重复请求。
+   */
+  inFlight?: boolean;
 }
 
 /** @ 成员浮层：候选列表（listbox 语义 + 高亮态；键盘导航在 ChatInput 处理） */
@@ -83,7 +88,7 @@ function MentionPopover({
   );
 }
 
-export function ChatInput({ onSend, onStop, running, mode, disabled = false }: ChatInputProps): ReactElement {
+export function ChatInput({ onSend, onStop, running, mode, disabled = false, inFlight = false }: ChatInputProps): ReactElement {
   const [text, setText] = useState('');
   const [caret, setCaret] = useState(0);
   /** chips 多选（与正文里的 @ 提及取并集发送） */
@@ -94,7 +99,8 @@ export function ChatInput({ onSend, onStop, running, mode, disabled = false }: C
   const [highlight, setHighlight] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const mention = disabled ? null : parseMention(text, caret);
+  const blocked = disabled || inFlight;
+  const mention = blocked ? null : parseMention(text, caret);
   const candidates = mention === null ? [] : matchRoles(mention.query);
   const popoverOpen = mention !== null && dismissedQuery !== mention.query && candidates.length > 0;
   const activeIndex = Math.min(highlight, Math.max(candidates.length - 1, 0));
@@ -121,7 +127,7 @@ export function ChatInput({ onSend, onStop, running, mode, disabled = false }: C
   };
 
   const submit = (): void => {
-    if (disabled || sending) return;
+    if (blocked || sending) return;
     const content = text.trim();
     if (content === '') return;
     setSending(true);
@@ -300,7 +306,7 @@ export function ChatInput({ onSend, onStop, running, mode, disabled = false }: C
           size="icon"
           aria-label="发送消息"
           onClick={submit}
-          disabled={disabled || sending || text.trim() === ''}
+          disabled={blocked || sending || text.trim() === ''}
           className="size-9 shrink-0 rounded-full max-lg:size-11"
         >
           <Send className="size-4" aria-hidden />

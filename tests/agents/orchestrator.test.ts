@@ -36,13 +36,16 @@ const reviewPaths: string[] = [];
 const reviewFailPaths = new Set<string>();
 /** 非空则 routeLeader 返回这份 DAG（环依赖注入用） */
 let cycleTasks: TaskAssignment[] | null = null;
+/** 非空则在 PM 任务执行中途调用（模拟「任务跑着的时候用户发来干预」，T31 Commit C） */
+let midRoundEnqueue: ((ctx: { storage: StorageProvider; projectId: number }) => Promise<void>) | null = null;
 
 vi.mock('@/lib/agents/roles/pm', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/agents/roles/pm')>();
   return {
     ...actual,
-    runPm: (ctx: import('@/lib/agents/roles/pm').PmContext) => {
+    runPm: async (ctx: import('@/lib/agents/roles/pm').PmContext) => {
       pmRequirements.push(ctx.requirement);
+      if (midRoundEnqueue !== null) await midRoundEnqueue({ storage: ctx.storage, projectId: ctx.projectId });
       return actual.runPm(ctx);
     },
   };
@@ -122,6 +125,7 @@ beforeEach(() => {
   reviewPaths.length = 0;
   reviewFailPaths.clear();
   cycleTasks = null;
+  midRoundEnqueue = null;
 });
 
 afterEach(() => {
@@ -210,6 +214,25 @@ describe('ProjectEventBus', () => {
       ),
     ).not.toThrow();
     expect(seen).toEqual(['b']);
+  });
+
+  it('reasoning 事件是 ephemeral（T31）：订阅者实时收到、但不进环形缓冲与 liveBuffer；seq 照常占号', () => {
+    const bus = new ProjectEventBus();
+    const seen: string[] = [];
+    bus.subscribe(1, (e) => seen.push(`${e.event}:${e.content ?? ''}`));
+
+    bus.emit(1, { runId: null, event: 'agent_start', agent: 'pm', meta: { taskKey: 'pm-prd' } });
+    const reasoning = bus.emit(1, { runId: null, event: 'reasoning', agent: 'pm', content: '先想清楚需求' });
+    bus.emit(1, { runId: null, event: 'file_start', agent: 'pm', path: 'docs/prd.md' });
+    bus.emit(1, { runId: null, event: 'delta', agent: 'pm', path: 'docs/prd.md', content: '# PRD' });
+
+    // 实时推送照常到达
+    expect(seen).toContain('reasoning:先想清楚需求');
+    expect(reasoning.seq).toBe(2); // seq 单调分配（占号）
+    // 但不进重放窗口、不进在流缓冲：快照里没有 reasoning，后续事件 seq 跳号（2 被思考流占用）
+    expect(bus.snapshotBuffer(1, 0).map((e) => e.event)).toEqual(['agent_start', 'file_start', 'delta']);
+    expect(bus.snapshotBuffer(1, 0).map((e) => e.seq)).toEqual([1, 3, 4]);
+    expect(bus.liveBuffer(1, 'docs/prd.md')).toBe('# PRD');
   });
 
   it('error 事件清除该路径的 liveBuffer，其他路径不受影响', () => {
@@ -529,6 +552,67 @@ describe('startGeneration（mock 全链路）', () => {
     expect(events.at(-1)?.event).toBe('done');
     const progress = await progressRow(storage, projectId);
     expect(progress.content).toContain('写后自审失败');
+  }, 30000);
+
+  it('⑩ 思考流直播（T31）：角色 LLM 调用发出 reasoning 事件（agent 归属该角色、runId 与同处事件一致）', async () => {
+    const { storage, projectId } = await newProject('full');
+    const { events, stop } = collectEvents(projectId);
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: REQUIREMENT,
+      mode: 'full',
+      mentions: [],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    // 每个出场角色都有自己的思考流（mock 每次调用吐 2-3 段）
+    for (const agent of ['leader', 'pm', 'architect', 'engineer'] as const) {
+      const chunks = events.filter((e) => e.event === 'reasoning' && e.agent === agent);
+      expect(chunks.length).toBeGreaterThanOrEqual(2);
+      for (const chunk of chunks) {
+        expect(chunk.content ?? '').not.toBe('');
+        expect(chunk.path).toBeUndefined(); // 思考流不带文件路径语义
+      }
+    }
+    // 思考流落在该角色的任务窗口内：agent_start 之后、file_end（定版）之前
+    const firstReasoningSeq = Math.min(...events.filter((e) => e.event === 'reasoning' && e.agent === 'pm').map((e) => e.seq));
+    const prdStartSeq = mustFind(events, (e) => e.event === 'agent_start' && e.agent === 'pm').seq;
+    const prdEndSeq = mustFind(events, (e) => e.event === 'file_end' && e.path === 'docs/prd.md').seq;
+    expect(firstReasoningSeq).toBeGreaterThan(prdStartSeq);
+    expect(firstReasoningSeq).toBeLessThan(prdEndSeq);
+  }, 30000);
+
+  it('⑪ 收尾边界也消费干预（T31）：任务执行期间到达的指令不再滞留队列', async () => {
+    const { storage, projectId } = await newProject('full');
+    const { events, stop } = collectEvents(projectId);
+    // @ 直派 PM：本轮唯一任务 pm-prd 的边界检查先于任务执行——执行期间到达的干预，
+    // 在修复前没有任何后续边界去取它（delivered_at 恒 null，用户侧永远「排队中」）
+    midRoundEnqueue = async ({ storage: target, projectId: pid }) => {
+      await target.addMessage({ projectId: pid, role: 'intervention', content: '汇报里请补一句下一步迭代方向' });
+    };
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: '@产品经理 出一份 PRD',
+      mode: 'full',
+      mentions: ['pm'],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    // 收尾边界取走并注入：事件带 targetTask=leader-closing，队列打戳清空
+    const closing = mustFind(
+      events,
+      (e) => e.event === 'intervention_injected' && e.meta?.targetTask === 'leader-closing',
+    );
+    expect((closing.content ?? '')).toContain('下一步迭代方向');
+    const messages = await storage.listMessages(projectId);
+    const pending = messages.filter((m) => m.role === 'intervention' && m.deliveredAt === null);
+    expect(pending).toHaveLength(0);
   }, 30000);
 
   it('⑨ 排队轮的请求断开不越界：只停本轮，在跑轮照常完成到 done', async () => {

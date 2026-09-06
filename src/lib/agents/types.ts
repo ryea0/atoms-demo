@@ -22,6 +22,11 @@ export interface RunnerCallbacks {
   onToolCall?: (call: { name: string; args: unknown; output: string; ok?: boolean }) => void;
   /** 流式增量：原样透传 provider.stream 的 onDelta，内核不缓冲不裁剪（落库时机=file_end，见 DESIGN §3.6） */
   onDelta?: (text: string) => void;
+  /**
+   * 思考流增量（T31）：provider 解析 delta.reasoning_content 后回调，内核原样透传、不缓冲不裁剪，
+   * 也不计入用量（completion 口径只算正文）。编排器接成 SSE reasoning 事件（ephemeral，不重放）。
+   */
+  onReasoning?: (text: string) => void;
 }
 
 /** 一次 agent 运行的入参：角色四要素（prompt/工具/模型/上下文）+ 防失控与回调 */

@@ -87,6 +87,7 @@ function makeState(over: Partial<WorkspaceState> = {}): WorkspaceState {
     softLocked: [],
     connected: true,
     livePaths: [],
+    liveAgents: {},
     finished: false,
     error: null,
     ...over,
@@ -116,6 +117,11 @@ function makeFetchMock(preferences: unknown = { editing_enabled: true, default_m
   };
   const fetchMock = vi.fn(fetchImpl);
   return { calls, fetchMock };
+}
+
+/** 消息气泡匹配（排除输入框：jsdom 把 textarea 的值也当子文本节点，getByText 会误中） */
+function bubbleTexts(text: string): HTMLElement[] {
+  return screen.getAllByText(text).filter((element): element is HTMLElement => element.tagName !== 'TEXTAREA');
 }
 
 /** 最近一次请求（url 结尾匹配；stop 请求无 body） */
@@ -373,63 +379,85 @@ describe('产物工具卡', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* 直播活动行（T30）：只播报正在进行的任务，历史交时间线                     */
+/* 直播转录块（T31）：吸收取代 T30 活动行——思考流 + 产出尾流进聊天区        */
 /* ------------------------------------------------------------------ */
 
-describe('直播活动行', () => {
-  it('运行中的任务渲染活动行：角色 emoji + 中文名 + 「正在写 {path}」，区域 aria-live=polite', () => {
+describe('直播转录块', () => {
+  it('thinking 块：成员名 + 思考中徽章 + 思考流正文，区域 aria-live=polite', () => {
     mount(
       makeState({
-        runs: [
-          makeRun({
-            id: 21,
-            status: 'done',
-            endedAt: Date.now(),
-            task: '实现 app/done.js',
-            taskKey: 'engineer:app/done.js',
-          }),
-          makeRun({ id: 22, status: 'running', task: '', taskKey: 'engineer:app/main.js' }),
-        ],
+        liveAgents: {
+          pm: { reasoning: '先拆功能清单，再定验收标准。', outputPath: null, outputTail: '', status: 'thinking' },
+        },
       }),
     );
 
-    const region = screen.getByRole('region', { name: '进行中的活动' });
+    const region = screen.getByRole('region', { name: '进行中的成员' });
     expect(region).toHaveAttribute('aria-live', 'polite');
-    // 脉冲动画（运行中的「在动」信号）
-    expect(region.querySelector('.animate-pulse')).not.toBeNull();
-    expect(within(region).getByText('工程师')).toBeInTheDocument();
-    expect(screen.getByText('正在写 app/main.js')).toBeInTheDocument();
-    // 已结束的 run 不进直播区（时间线已管历史，这里只直播当下）
-    expect(screen.queryByText('正在写 app/done.js')).not.toBeInTheDocument();
+    expect(within(region).getByText('产品经理')).toBeInTheDocument();
+    expect(within(region).getByText('思考中…')).toBeInTheDocument();
+    expect(within(region).getByText(/先拆功能清单/)).toBeInTheDocument();
   });
 
-  it('点击活动行的文件路径回调 onOpenFile(path)，跳转查看器打字机', () => {
-    const onOpenFile = vi.fn();
-    mount(makeState({ runs: [makeRun({ status: 'running', task: '', taskKey: 'engineer:app/main.js' })] }), {
-      onOpenFile,
-    });
-
-    fireEvent.click(screen.getByRole('button', { name: '正在写 app/main.js' }));
-    expect(onOpenFile).toHaveBeenCalledWith('app/main.js');
-  });
-
-  it('无法解析出文件路径的任务：显示任务描述文本、不可点击', () => {
+  it('writing 块：正在写徽章可点 + 尾流预览 + 「打开文件」回调 onOpenFile', () => {
     const onOpenFile = vi.fn();
     mount(
-      makeState({ runs: [makeRun({ agent: 'pm', task: '梳理需求与优先级', taskKey: 'pm-prd', status: 'running' })] }),
+      makeState({
+        liveAgents: {
+          engineer: {
+            reasoning: '依赖已读',
+            outputPath: 'app/main.js',
+            outputTail: 'const a = 1;',
+            status: 'writing',
+          },
+        },
+      }),
       { onOpenFile },
     );
 
-    const region = screen.getByRole('region', { name: '进行中的活动' });
-    expect(within(region).getByText('产品经理')).toBeInTheDocument();
-    expect(within(region).getByText('梳理需求与优先级')).toBeInTheDocument();
-    expect(within(region).queryByRole('button')).not.toBeInTheDocument();
-    expect(onOpenFile).not.toHaveBeenCalled();
+    const region = screen.getByRole('region', { name: '进行中的成员' });
+    expect(within(region).getByText('工程师')).toBeInTheDocument();
+    fireEvent.click(within(region).getByText('正在写 app/main.js'));
+    expect(onOpenFile).toHaveBeenCalledWith('app/main.js');
+    fireEvent.click(within(region).getByRole('button', { name: '打开文件' }));
+    expect(onOpenFile).toHaveBeenCalledWith('app/main.js');
+    expect(within(region).getByText(/const a = 1;/)).toBeInTheDocument();
+    // 思考流与产出尾流同块并存
+    expect(within(region).getByText(/依赖已读/)).toBeInTheDocument();
   });
 
-  it('没有运行中的任务：不渲染活动区（不占版面）', () => {
+  it('done 块：已完成徽章 + 摘要；无思考流的块不渲染折叠按钮', () => {
+    mount(
+      makeState({
+        liveAgents: {
+          architect: { reasoning: '', outputPath: 'docs/system_design.md', outputTail: '', status: 'done', summary: '设计完成' },
+        },
+      }),
+    );
+    expect(screen.getByText('已完成')).toBeInTheDocument();
+    expect(screen.getByText('设计完成')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /思考/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '打开文件' })).not.toBeInTheDocument();
+  });
+
+  it('思考流可折叠：点击「思考」切换正文显隐（aria-expanded）', () => {
+    mount(
+      makeState({
+        liveAgents: {
+          pm: { reasoning: '第一段思考', outputPath: null, outputTail: '', status: 'thinking' },
+        },
+      }),
+    );
+    const toggle = screen.getByRole('button', { name: /思考/ });
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText(/第一段思考/)).not.toBeInTheDocument();
+  });
+
+  it('无活跃成员：不渲染直播区（不占版面）', () => {
     mount(makeState({ runs: [makeRun({ status: 'done', endedAt: Date.now() })] }));
-    expect(screen.queryByRole('region', { name: '进行中的活动' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: '进行中的成员' })).not.toBeInTheDocument();
   });
 });
 
@@ -661,6 +689,99 @@ describe('输入区', () => {
     expect(calls.filter((call) => call.url.endsWith('/messages'))).toHaveLength(1);
 
     unsubscribe();
+  });
+
+  it('发送即时反馈（T31）：乐观气泡即现、在途发送钮禁用；持久化行到达后不出现双气泡', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    /** POST /messages 挂起在 gate 上，便于断言「在途」窗口 */
+    const fetchImpl = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : String(input);
+      if (url.endsWith('/messages')) {
+        await gate;
+        const payload = { delivered: 'round' };
+        return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' } as unknown as Response;
+    };
+    vi.stubGlobal('fetch', vi.fn(fetchImpl) as unknown as typeof fetch);
+
+    const store = createWorkspaceStore(PROJECT_ID);
+    // store 需先持有项目态（生产里由 useWorkspace 快照 hydrate）：beginRound 依赖它复位 finished
+    store.hydrate({
+      project: makeProject({ status: 'done' }),
+      lastSeq: 0,
+      messages: [],
+      files: [],
+      agentRuns: [],
+      checkpoints: [],
+      usage: [],
+      streamingFiles: [],
+      softLockedFiles: [],
+    });
+    let current = makeState({ finished: true, project: makeProject({ status: 'done' }) });
+    const mounted = render(createElement(ChatPanel, { state: current }));
+    const unsubscribe = store.subscribe(() => {
+      current = makeState({
+        finished: store.getState().finished,
+        project: store.getState().project,
+        messages: store.getState().messages,
+      });
+      mounted.rerender(createElement(ChatPanel, { state: current }));
+    });
+
+    const input = screen.getByRole('textbox', { name: '输入消息' }) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '给列表加个搜索框' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+
+    // 在途窗口：话已上屏（乐观气泡）、发送钮禁用（防黑盒期重复提交）
+    expect(store.getState().messages.some((m) => m.id < 0 && m.role === 'user' && m.content === '给列表加个搜索框')).toBe(true);
+    expect(bubbleTexts('给列表加个搜索框')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: '停止生成' })).not.toBeInTheDocument();
+
+    release();
+    // 新一轮开跑：finished 复位 → 停止钮立即出现（不再等 agent_start）；
+    // 发送钮随输入被清空保持禁用（空文本本就不可发），不作为在途判据
+    await waitFor(() => expect(screen.getByRole('button', { name: '停止生成' })).toBeInTheDocument());
+
+    // 持久化 user 行（SSE message 事件）到达：同内容的本地气泡被收编，仍只有一句
+    act(() => {
+      store.applyEvent({
+        seq: 1,
+        projectId: PROJECT_ID,
+        runId: null,
+        event: 'message',
+        content: '给列表加个搜索框',
+        meta: { role: 'user', messageId: 61 },
+      });
+    });
+    expect(bubbleTexts('给列表加个搜索框')).toHaveLength(1);
+    expect(store.getState().messages.map((message) => message.id)).toEqual([61]);
+
+    unsubscribe();
+  });
+
+  it('发送失败（T31）：乐观气泡回滚、输入保留，可重试', async () => {
+    const fetchImpl = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : String(input);
+      if (url.endsWith('/messages')) {
+        return { ok: false, status: 500, json: async () => ({ error: { message: '服务器开小差' } }), text: async () => '' } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' } as unknown as Response;
+    };
+    vi.stubGlobal('fetch', vi.fn(fetchImpl) as unknown as typeof fetch);
+
+    mount(makeState());
+    const input = screen.getByRole('textbox', { name: '输入消息' }) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '会失败的请求' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+
+    await waitFor(() => expect(bubbleTexts('会失败的请求')).toHaveLength(0));
+    expect(input.value).toBe('会失败的请求'); // 输入不清空，可直接重试
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
   });
 
   it('快照未就绪（projectId=null）：输入区禁用，不误发请求', () => {

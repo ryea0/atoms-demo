@@ -72,6 +72,10 @@ export interface RunCloserInput {
   signal?: AbortSignal;
   /** 注入 provider（测试桩 / 编排器统一装配）；缺省走 getLlmProvider()（读 env，默认 mock） */
   provider?: LlmProvider;
+  /** 思考流透传（编排器接 SSE reasoning 事件用，T31）；缺省不透传，行为不变 */
+  onReasoning?: (text: string) => void;
+  /** 收尾边界取到的待注入干预（T31）：编排器在 leader-closing 边界消费后传入，进【干预指令】小节 */
+  interventions?: readonly string[];
 }
 
 /** runCloser 结果：任务记录 id + 记忆文件路径 + 汇报文本（由调用方作为 assistant message 落库） */
@@ -293,7 +297,7 @@ export async function runCloser(ctx: RunCloserInput): Promise<RunCloserResult> {
       systemPrompt: CLOSER_SYSTEM_PROMPT,
       task,
       upstreamSummaries: [],
-      interventions: [],
+      interventions: ctx.interventions === undefined ? [] : [...ctx.interventions],
     });
     const result = await runAgent({
       role,
@@ -303,6 +307,7 @@ export async function runCloser(ctx: RunCloserInput): Promise<RunCloserResult> {
       model,
       ctx: { storage, projectId, role } satisfies ToolContext,
       provider: meteredProvider,
+      callbacks: ctx.onReasoning === undefined ? undefined : { onReasoning: ctx.onReasoning },
       signal,
     });
 

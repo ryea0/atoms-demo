@@ -68,6 +68,8 @@ export interface ArchitectContext {
   signal?: AbortSignal;
   /** 可注入 provider（测试桩 / 编排器统一入口）；缺省 getLlmProvider()，恒经 wrapMetered 计量包裹 */
   provider?: LlmProvider;
+  /** 思考流透传（编排器接 SSE reasoning 事件用，T31）；缺省不透传，行为不变 */
+  onReasoning?: (text: string) => void;
 }
 
 /** runArchitect 结果：任务 id + 落库文件清单 + 结构化文件树（下游逐文件派发的拓扑序） */
@@ -260,6 +262,7 @@ export async function runArchitect(ctx: ArchitectContext): Promise<ArchitectResu
       model,
       ctx: { storage, projectId, role: 'architect' },
       provider,
+      callbacks: ctx.onReasoning === undefined ? undefined : { onReasoning: ctx.onReasoning },
       signal: ctx.signal,
     });
 

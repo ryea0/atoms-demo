@@ -8,14 +8,13 @@
  * （POST messages / POST stop），子组件保持纯展示；查看器/回滚的接线（T25）通过
  * onOpenFile / onRollback 回调上抛，本组件不直接操作查看器。
  */
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import { toast } from 'sonner';
 import { ChatInput, type ChatInputSendInput } from './ChatInput';
-import { ActivityFeed } from './ActivityFeed';
+import { LiveAgentBlock } from './LiveAgentBlock';
 import { MessageList } from './MessageList';
 import { Timeline } from './Timeline';
-import { runningActivitiesOf } from '@/lib/client/activity';
 import { isGenerationRunning } from '@/lib/client/format';
 import { sendProjectMessage, stopProjectGeneration } from '@/lib/client/session';
 import { createWorkspaceStore, type WorkspaceState } from '@/lib/client/store';
@@ -47,29 +46,49 @@ export function ChatPanel({ state, onOpenFile, onRollback }: ChatPanelProps): Re
     if (element !== null) element.scrollTop = element.scrollHeight;
   }, [feedLength]);
 
-  /** 发送（空闲=新一轮；运行中=干预入队）。失败 toast 且返回 false（输入不清空） */
+  /** 请求在途守卫（T31）：从点击发送到 POST 返回期间禁用发送，防黑盒期重复提交 */
+  const [sending, setSending] = useState(false);
+
+  /** 发送（空闲=新一轮；运行中=干预入队）。失败回滚乐观气泡 + toast，返回 false（输入不清空） */
   const handleSend = useCallback(
     async (input: ChatInputSendInput): Promise<boolean> => {
       if (projectId === null) return false;
+      const store = createWorkspaceStore(projectId);
+      // 发送即上屏（乐观气泡，合成负数 id）：模型思考以分钟计，用户的第一反馈是「话已送到」；
+      // 成功后由持久化行收编（同内容匹配，不产生双气泡），失败则原样回滚
+      const localId = store.appendLocalUserMessage({
+        projectId,
+        content: input.content,
+        mentions: input.mentions,
+      });
+      setSending(true);
       try {
         const result = await sendProjectMessage(projectId, input);
-        // 入队分支只落库不发 SSE：用响应 messageId 本地补登待注入卡，「📥 排队中」即时可见，
-        // 之后同 messageId 的 intervention_injected 事件把它翻转为「已注入 {文件}」
         if (result.delivered === 'intervention' && result.messageId !== undefined) {
-          createWorkspaceStore(projectId).appendPendingIntervention({
+          // 入队分支只落库不发 SSE：用响应 messageId 本地补登待注入卡，「📥 排队中」即时可见，
+          // 之后同 messageId 的 intervention_injected 事件把它翻转为「已注入 {文件}」；
+          // 队列卡接管这条消息的展示，乐观气泡随即让位（避免同文案出现两份）
+          store.appendPendingIntervention({
             projectId,
             messageId: result.messageId,
             content: input.content,
             mentions: input.mentions,
           });
+          store.removeLocalMessage(projectId, localId);
+        } else {
+          // 新一轮开跑：复位上一轮遗留的 finished，停止钮/干预黄条/直播块立即生效
+          store.beginRound(projectId);
         }
         return true;
       } catch (error) {
+        store.removeLocalMessage(projectId, localId);
         console.error('[chat] 消息发送失败：', error);
         toast.error('发送失败', {
           description: error instanceof Error ? error.message : '请稍后重试',
         });
         return false;
+      } finally {
+        setSending(false);
       }
     },
     [projectId],
@@ -112,8 +131,8 @@ export function ChatPanel({ state, onOpenFile, onRollback }: ChatPanelProps): Re
           onOpenFile={onOpenFile}
           onSend={handleSendText}
         />
-        {/* 直播活动行（T30）：正在进行的任务（次级小字，区别于消息卡）；历史交时间线 */}
-        <ActivityFeed activities={runningActivitiesOf(state.runs)} onOpenFile={onOpenFile} />
+        {/* 直播转录块（T31，吸收取代 T30 活动行）：谁在干活、在想什么、正在写哪个文件 */}
+        <LiveAgentBlock live={state.liveAgents} onOpenFile={onOpenFile} />
         {state.runs.length > 0 && <Timeline runs={state.runs} onRollback={onRollback} running={running} />}
       </div>
 
@@ -131,6 +150,7 @@ export function ChatPanel({ state, onOpenFile, onRollback }: ChatPanelProps): Re
         running={running}
         mode={state.project?.mode ?? 'full'}
         disabled={projectId === null}
+        inFlight={sending}
       />
     </div>
   );

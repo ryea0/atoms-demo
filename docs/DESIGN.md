@@ -135,9 +135,10 @@ finish()                                               // 无更多任务
 ### 3.6 流式协议（SSE，含恢复语义）
 ```
 {seq, projectId, runId, event, agent?, path?, content?, summary?, error?}
-event: agent_start | file_start | delta | file_end | agent_end | message | intervention_injected | done | stopped | error
+event: agent_start | file_start | delta | file_end | agent_end | message | intervention_injected | reasoning | done | stopped | error
 ```
 - **落库时机= file_end**（delta 只走 SSE 不落库，消除写放大；编排器内存缓冲当前文件全文）
+- **reasoning（2026-09-06 T31）= 思考流直播，ephemeral**：只走 SSE，不进环形缓冲、不进内存缓冲——断线重连/刷新**不重放**思考流，快照也不含（现场感糖，落库与重放开销不值）；seq 照常单调分配，故重放窗口内允许跳号。前端在聊天区渲染「谁在思考/正在写哪个文件」的直播块，窄屏单栏也能看到过程
 - **刷新/断线恢复**：`GET /api/projects/[id]` 返回快照（files 表当前内容 + agent_runs 状态 + **正在生成文件的内存缓冲全文**）；SSE 重连带 `Last-Event-ID=seq`，服务端从内存事件环形缓冲（最近 500 条）重放
 - Next.js 注意：stream 路由 `force-dynamic`、响应禁用缓冲；反代（nginx/Zeabur 网关）需关 proxy buffering
 

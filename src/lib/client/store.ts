@@ -52,6 +52,32 @@ export interface WorkspaceFile {
  */
 export type WorkspaceSnapshot = ProjectSnapshot;
 
+/** 直播块的成员状态（T31）：思考中 → 写文件中 → 完成 */
+export type LiveAgentStatus = 'thinking' | 'writing' | 'done';
+
+/** 单个活跃成员的直播转录（聊天区 LiveAgentBlock 的数据源；键=agent） */
+export interface LiveAgentState {
+  /** 思考流尾段（cap 3000 字符，只留尾部）；ephemeral——刷新/重连不恢复 */
+  reasoning: string;
+  /** 正在写的目标文件（file_start/delta 归属该 agent 时更新） */
+  outputPath: string | null;
+  /** 产出尾流（cap 600 字符；file_start 重置——Last-Event-ID 重放叠加时幂等） */
+  outputTail: string;
+  status: LiveAgentStatus;
+  /** agent_end 带回的交接摘要（时间线之外的第二处现场展示） */
+  summary?: string;
+}
+
+/** 思考流尾段上限（字符）：只留尾部，现场感足够，内存有界 */
+const REASONING_TAIL_CAP = 3000;
+/** 产出尾流上限（字符） */
+const OUTPUT_TAIL_CAP = 600;
+
+/** 取文本尾段（超长丢头部——直播块只关心「此刻写到哪」） */
+function tailOf(text: string, cap: number): string {
+  return text.length <= cap ? text : text.slice(text.length - cap);
+}
+
 /** 工作台聚合状态（组件层通过 useWorkspace 订阅） */
 export interface WorkspaceState {
   projectId: number | null;
@@ -67,6 +93,12 @@ export interface WorkspaceState {
   connected: boolean;
   /** 正在流式生成的路径（文件树「生长中」标记用） */
   livePaths: readonly string[];
+  /**
+   * 活跃成员的直播转录（T31，键=agent）：聊天区「谁在干什么、在想什么」的现场块。
+   * 只由 SSE 推进（reasoning/file_start/delta/agent_end），ephemeral——快照 hydrate 不恢复
+   * 思考流（只按快照 running runs 播种「在场」占位），done/stopped 整体清空。
+   */
+  liveAgents: Record<string, LiveAgentState>;
   /** done/stopped 之后为真（error 不算收尾，运行可能继续） */
   finished: boolean;
   /** 最近一次错误（流事件或快照加载失败），中文用户可读 */
@@ -85,6 +117,7 @@ function initialState(): WorkspaceState {
     softLocked: [],
     connected: false,
     livePaths: [],
+    liveAgents: {},
     finished: false,
     error: null,
   };
@@ -115,6 +148,7 @@ function sameState(a: WorkspaceState, b: WorkspaceState): boolean {
   if (a.projectId !== b.projectId || a.finished !== b.finished || a.error !== b.error) return false;
   if (!recordEquals(a.project, b.project)) return false;
   if (a.livePaths.join('\n') !== b.livePaths.join('\n')) return false;
+  if (!recordEquals(a.liveAgents, b.liveAgents)) return false;
   if (a.softLocked.join('\n') !== b.softLocked.join('\n')) return false;
   if (!filesEquals(a.files, b.files)) return false;
   const listEquals = (x: readonly unknown[], y: readonly unknown[]): boolean =>
@@ -217,6 +251,90 @@ export class WorkspaceStore {
     return { files, livePaths: livePathsOf(files) };
   }
 
+  /* ---------------- 直播转录（T31） ---------------- */
+
+  /** 不可变推进单个成员的直播块；协议未带 agent 的事件不推进（无归属可挂） */
+  private patchLiveAgent(
+    agent: AgentRole,
+    build: (prev: LiveAgentState | undefined) => LiveAgentState,
+  ): Partial<WorkspaceState> {
+    const current = this.state.liveAgents;
+    return { liveAgents: { ...current, [agent]: build(current[agent]) } };
+  }
+
+  /**
+   * agent_start：开一块直播（或续上同角色既有块）。
+   * 清理时机取舍（T31 取简）：若现有块**全部** done 则先整体清空再开新块——选「保留到下一块
+   * 开始」而非「最后一个完成即清空」，串行 DAG 的任务间隙不会整块闪烁消失；轮次收口（done/stopped）
+   * 另有整体清空。历史交接由时间线与消息流负责，直播块只管当下。
+   */
+  private liveAgentStartPatch(event: StreamEvent): Partial<WorkspaceState> {
+    const agent = event.agent ?? 'leader';
+    const existing = Object.values(this.state.liveAgents);
+    const base: Record<string, LiveAgentState> =
+      existing.length > 0 && existing.every((item) => item.status === 'done') ? {} : this.state.liveAgents;
+    const prev = base[agent];
+    return {
+      liveAgents: {
+        ...base,
+        [agent]: prev ?? { reasoning: '', outputPath: null, outputTail: '', status: 'thinking' },
+      },
+    };
+  }
+
+  /** reasoning：思考流追加（只留尾段）；已在写文件时保持 writing——避免徽章在写作中途闪回「思考中」 */
+  private liveReasoningPatch(event: StreamEvent): Partial<WorkspaceState> {
+    const agent = event.agent;
+    const content = event.content;
+    if (agent === undefined || content === undefined || content === '') return {};
+    return this.patchLiveAgent(agent, (prev) => ({
+      reasoning: tailOf((prev?.reasoning ?? '') + content, REASONING_TAIL_CAP),
+      outputPath: prev?.outputPath ?? null,
+      outputTail: prev?.outputTail ?? '',
+      status: prev?.status === 'writing' ? 'writing' : 'thinking',
+    }));
+  }
+
+  /**
+   * file_start / delta：产出尾流推进。
+   * file_start 把尾流**重置为空**——Last-Event-ID 重放叠加时先重开再追加，天然幂等
+   * （否则重放的 delta 会把同一段内容拼两遍）。
+   */
+  private liveOutputPatch(event: StreamEvent): Partial<WorkspaceState> {
+    const agent = event.agent;
+    const path = event.path;
+    if (agent === undefined) return {};
+    if (event.event === 'file_start') {
+      if (path === undefined) return {};
+      return this.patchLiveAgent(agent, (prev) => ({
+        reasoning: prev?.reasoning ?? '',
+        outputPath: path,
+        outputTail: '',
+        status: 'writing',
+      }));
+    }
+    const content = event.content ?? '';
+    if (content === '' && path === undefined) return {};
+    return this.patchLiveAgent(agent, (prev) => ({
+      reasoning: prev?.reasoning ?? '',
+      outputPath: path ?? prev?.outputPath ?? null,
+      outputTail: tailOf((prev?.outputTail ?? '') + content, OUTPUT_TAIL_CAP),
+      status: 'writing',
+    }));
+  }
+
+  /** agent_end：标 done + 记交接摘要（块先留着，等下一块开始或轮次收口再清） */
+  private liveAgentEndPatch(event: StreamEvent): Partial<WorkspaceState> {
+    const agent = event.agent ?? 'leader';
+    return this.patchLiveAgent(agent, (prev) => ({
+      reasoning: prev?.reasoning ?? '',
+      outputPath: prev?.outputPath ?? null,
+      outputTail: prev?.outputTail ?? '',
+      status: 'done',
+      summary: event.summary,
+    }));
+  }
+
   /** SSE 连接状态（onopen/onerror/卸载；值不变时不通知，避免渲染抖动） */
   setConnected(connected: boolean): void {
     if (this.state.connected === connected) return;
@@ -233,19 +351,25 @@ export class WorkspaceStore {
     if (this.state.projectId !== null && event.projectId !== this.state.projectId) return;
     switch (event.event) {
       case 'file_start':
-        this.applyFileUpsert(event, () => '');
+        this.patch({ ...this.fileUpsertPatch(event, () => ''), ...this.liveOutputPatch(event) });
         break;
       case 'delta':
-        this.applyFileUpsert(event, (prev) => (prev?.content ?? '') + (event.content ?? ''));
+        this.patch({
+          ...this.fileUpsertPatch(event, (prev) => (prev?.content ?? '') + (event.content ?? '')),
+          ...this.liveOutputPatch(event),
+        });
         break;
       case 'file_end':
         this.applyFileEnd(event);
         break;
       case 'agent_start':
-        this.patch(this.runsPatchForStart(event));
+        this.patch({ ...this.runsPatchForStart(event), ...this.liveAgentStartPatch(event) });
         break;
       case 'agent_end':
-        this.patch(this.runsPatchForEnd(event));
+        this.patch({ ...this.runsPatchForEnd(event), ...this.liveAgentEndPatch(event) });
+        break;
+      case 'reasoning':
+        this.patch(this.liveReasoningPatch(event));
         break;
       case 'message':
         this.patch(this.messagesPatchFor(event, this.messageRoleOf(event)));
@@ -257,6 +381,7 @@ export class WorkspaceStore {
         this.patch({
           files: withStreamingCleared(this.state.files),
           livePaths: [],
+          liveAgents: {}, // 轮次收口：直播块整体清场（现场感只属于进行中的轮次）
           finished: true,
           project: withStatus(this.state.project, 'done'),
         });
@@ -265,6 +390,7 @@ export class WorkspaceStore {
         this.patch({
           files: withStreamingCleared(this.state.files),
           livePaths: [],
+          liveAgents: {},
           finished: true,
           project: withStatus(this.state.project, 'paused'),
         });
@@ -278,18 +404,17 @@ export class WorkspaceStore {
   }
 
   /** file_start：重开占位（内容清空，等 delta 重填）；file_end：以累积内容定版 */
-  private applyFileUpsert(event: StreamEvent, contentOf: (prev: WorkspaceFile | undefined) => string): void {
+  /** 返回文件占位补丁（不直接 patch——file_start/delta 要和直播块补丁合并成一次通知） */
+  private fileUpsertPatch(event: StreamEvent, contentOf: (prev: WorkspaceFile | undefined) => string): Partial<WorkspaceState> {
     const path = event.path;
-    if (path === undefined) return;
-    this.patch(
-      this.upsertFile(path, (prev) => ({
-        id: prev?.id ?? null,
-        content: contentOf(prev),
-        version: prev?.version ?? 0,
-        lastEditor: event.agent ?? prev?.lastEditor ?? 'engineer',
-        streaming: true,
-      })),
-    );
+    if (path === undefined) return {};
+    return this.upsertFile(path, (prev) => ({
+      id: prev?.id ?? null,
+      content: contentOf(prev),
+      version: prev?.version ?? 0,
+      lastEditor: event.agent ?? prev?.lastEditor ?? 'engineer',
+      streaming: true,
+    }));
   }
 
   /**
@@ -508,7 +633,19 @@ export class WorkspaceStore {
       deliveredAt: now,
       createdAt: now,
     };
-    return { messages: [...this.state.messages, message] };
+
+    // 乐观气泡收编（T31）：发送瞬间本地补登的用户消息（负数合成 id）在持久化行到达时让位——
+    // 按「同角色 + 同内容」匹配移除，防止同一句话出现两个气泡（合成 id 与正数 id 互不命中，
+    // 上面的 messageId 去重管不到它）
+    let base = this.state.messages;
+    if (role === 'user' && id > 0) {
+      const content = event.content ?? '';
+      const localIndex = base.findIndex((item) => item.id < 0 && item.role === 'user' && item.content === content);
+      if (localIndex >= 0) {
+        base = base.filter((_, index) => index !== localIndex);
+      }
+    }
+    return { messages: [...base, message] };
   }
 
   /**
@@ -536,6 +673,48 @@ export class WorkspaceStore {
       createdAt: Date.now(),
     };
     this.patch({ messages: [...this.state.messages, message] });
+  }
+
+  /**
+   * 本地乐观补登用户消息（T31）：POST 返回前先把「我说的话」上屏（合成负数 id），
+   * 消除发送后的黑盒空窗。返回合成 id 供失败回滚（removeLocalMessage）；成功路径由
+   * messagesPatchFor 的收编逻辑用持久化行顶替（同内容匹配），不产生双气泡。
+   */
+  appendLocalUserMessage(input: { projectId: number; content: string; mentions: readonly AgentRole[] }): number {
+    if (this.state.projectId !== null && this.state.projectId !== input.projectId) return 0;
+    const id = (this.syntheticId -= 1);
+    const now = Date.now();
+    const message: Message = {
+      id,
+      projectId: input.projectId,
+      role: 'user',
+      content: input.content,
+      meta: input.mentions.length > 0 ? { mentions: [...input.mentions] } : null,
+      deliveredAt: now,
+      createdAt: now,
+    };
+    this.patch({ messages: [...this.state.messages, message] });
+    return id;
+  }
+
+  /** 回滚本地乐观消息（发送失败时调用）：只删自己刚补登的合成行（正数 id 不归本地管） */
+  removeLocalMessage(projectId: number, id: number): void {
+    if (id >= 0) return;
+    if (this.state.projectId !== null && this.state.projectId !== projectId) return;
+    if (!this.state.messages.some((message) => message.id === id)) return;
+    this.patch({ messages: this.state.messages.filter((message) => message.id !== id) });
+  }
+
+  /**
+   * 新一轮开跑（POST delivered='round' 成功后调用）：复位 finished + 项目状态置 running。
+   * 修复「上一轮 done 之后 finished 恒真」的陈旧收尾态（T30 遗留）：不复位的话，
+   * 下一轮从发送到首个 agent_start 之间，停止钮 / 干预黄条 / 直播块全部缺席——
+   * 正是用户「以为卡死」的黑盒来源。已在运行态则静默（不产生多余渲染）。
+   */
+  beginRound(projectId: number): void {
+    if (this.state.projectId !== projectId) return;
+    if (this.state.finished === false && this.state.project?.status === 'running') return;
+    this.patch({ finished: false, project: withStatus(this.state.project, 'running') });
   }
 
   /**
@@ -567,12 +746,29 @@ export class WorkspaceStore {
       livePaths.push(item.path);
     }
 
+    // 直播块（T31）：思考流是 ephemeral，刷新后不恢复正文；但快照里 running 的任务要播种
+    // 「在场」占位（谁在干活 + 工程师任务带目标路径）——否则刷新到下一个事件之间聊天区
+    // 对「正在生成」毫无表示（T30 活动行已并入直播块，这里补上它的刷新兜底）。
+    const liveAgents: Record<string, LiveAgentState> = {};
+    for (const run of snapshot.agentRuns) {
+      if (run.status !== 'running') continue;
+      const separator = run.taskKey.indexOf(':');
+      const path = separator > 0 ? run.taskKey.slice(separator + 1) : '';
+      liveAgents[run.agent] = {
+        reasoning: '',
+        outputPath: path === '' ? null : path,
+        outputTail: '',
+        status: 'thinking',
+      };
+    }
+
     const status = snapshot.project.status;
     const next: WorkspaceState = {
       projectId: snapshot.project.id,
       project: snapshot.project,
       files,
       livePaths,
+      liveAgents,
       messages: [...snapshot.messages],
       runs: [...snapshot.agentRuns],
       checkpoints: [...snapshot.checkpoints],

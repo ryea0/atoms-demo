@@ -947,3 +947,109 @@ describe('中止/超时调用计量', () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* 思考流（T31）：reasoning_content / reasoning 别名 → onReasoning，不进正文与计量 */
+/* ------------------------------------------------------------------ */
+describe('思考流解析', () => {
+  it('stream：delta.reasoning_content → onReasoning 逐段回调；content 与 completion 计量不含思考', async () => {
+    stubOpenAiEnv();
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        sseResponse([
+          { choices: [{ index: 0, delta: { reasoning_content: '先想清楚：' } }] },
+          { choices: [{ index: 0, delta: { reasoning_content: '需求是待办清单。' } }] },
+          { choices: [{ index: 0, delta: { content: '好的' } }] },
+          { choices: [], usage: { prompt_tokens: 30, completion_tokens: 2 } },
+        ]),
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = getLlmProvider();
+    const thinking: string[] = [];
+    const deltas: string[] = [];
+    const result = await provider.stream(makeReq({ model: 'qwen-test', onReasoning: (t) => thinking.push(t) }), (t) =>
+      deltas.push(t),
+    );
+
+    expect(thinking.join('')).toBe('先想清楚：需求是待办清单。');
+    expect(deltas.join('')).toBe('好的'); // 思考流不进正文
+    expect(result.content).toBe('好的');
+    // completion 计量口径不变（正文 2 token；思考片段不另计）
+    expect(result.usage).toEqual({ promptTokens: 30, completionTokens: 2 });
+  });
+
+  it('stream：兼容 delta.reasoning 别名；两者都无则不回调', async () => {
+    stubOpenAiEnv();
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        sseResponse([
+          { choices: [{ index: 0, delta: { reasoning: '别名通道的思考' } }] },
+          { choices: [{ index: 0, delta: { content: '正文' } }] },
+          { choices: [] },
+        ]),
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = getLlmProvider();
+    const thinking: string[] = [];
+    const result = await provider.stream(makeReq({ model: 'qwen-test', onReasoning: (t) => thinking.push(t) }), () => {});
+    expect(thinking).toEqual(['别名通道的思考']);
+    expect(result.content).toBe('正文');
+  });
+
+  it('complete 路径不回调 onReasoning（思考流只在 stream 通道存在）', async () => {
+    stubOpenAiEnv();
+    const fetchMock = vi.fn(() => Promise.resolve(Response.json({ choices: [{ index: 0, message: { content: '答案' } }], usage: { prompt_tokens: 5, completion_tokens: 2 } })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = getLlmProvider();
+    const thinking: string[] = [];
+    await provider.complete(makeReq({ model: 'qwen-test', onReasoning: (t) => thinking.push(t) }));
+    expect(thinking).toHaveLength(0);
+  });
+});
+
+describe('mock provider 思考流（T31）', () => {
+  it('默认开：stream 先吐 2-3 段中文思考，走 onReasoning 通道、不混进正文', async () => {
+    const provider = createMockProvider();
+    const thinking: string[] = [];
+    const deltas: string[] = [];
+    const result = await provider.stream(makeReq({ onReasoning: (t) => thinking.push(t) }), (t: string) =>
+      deltas.push(t),
+    );
+
+    expect(thinking.length).toBeGreaterThanOrEqual(2);
+    expect(thinking.length).toBeLessThanOrEqual(3);
+    for (const segment of thinking) expect(segment.trim()).not.toBe('');
+    // 思考片段不占 delta 通道：正文流里找不到任何一段思考原文
+    for (const segment of thinking) expect(deltas.join('')).not.toContain(segment);
+    expect(result.content).not.toContain(thinking[0] ?? '');
+  });
+
+  it('LLM_MOCK_REASONING=off → 完全不吐思考（演示链路可关）', async () => {
+    vi.stubEnv('LLM_MOCK_REASONING', 'off');
+    const seen: string[] = [];
+    const deltas: string[] = [];
+    await createMockProvider().stream(makeReq({ onReasoning: (t) => seen.push(t) }), (t: string) => deltas.push(t));
+    expect(seen).toHaveLength(0);
+    expect(deltas.join('')).not.toBe('');
+  });
+
+  it('场景化：工程师场景的思考片段提到目标文件路径', async () => {
+    const seen: string[] = [];
+    await createMockProvider().stream(
+      makeReq({
+        onReasoning: (t) => seen.push(t),
+        messages: [
+          { role: 'system', content: '你是工程师（engineer），负责产出代码文件' },
+          { role: 'user', content: '请实现目标文件 app/backend/api.js' },
+        ],
+      }),
+      () => {},
+    );
+    expect(seen.join('')).toContain('app/backend/api.js');
+  });
+});

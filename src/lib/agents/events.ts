@@ -12,6 +12,11 @@
  * 等价于一次带错误信息的 agent_end——编排器任务失败只发 error{agent,taskKey}，不再补发
  * agent_end；客户端（store.errorPatchFor）据此把该角色最近 running run 置 failed。
  * 新增事件消费方（时间线、进度条等）必须遵守同一约定，否则任务级失败会永久停留在「进行中」。
+ *
+ * 协议备注（reasoning 事件，T31）：`{agent, content=增量}` 的思考流直播，**ephemeral**——
+ * 不进环形缓冲、不进 liveBuffer：断线重连/刷新不重放思考流，快照也不含。取舍写在此处：
+ * 思考流是「现场感」糖，落库与重放开销不值（快照若回放几千字思考既撑大 payload 又无信息量，
+ * 现场感错过了就错过了）。代价是重放窗口内 seq 会跳号（reasoning 照常占号、不占缓冲），属预期。
  */
 import type { AgentRole } from '@/lib/db/provider/types';
 
@@ -24,6 +29,7 @@ export type StreamEventName =
   | 'agent_end'
   | 'message'
   | 'intervention_injected'
+  | 'reasoning'
   | 'done'
   | 'stopped'
   | 'error';
@@ -92,20 +98,24 @@ export class ProjectEventBus {
     state.seq += 1;
     const event: StreamEvent = { ...e, seq: state.seq, projectId };
 
-    state.ring.push(event);
-    if (state.ring.length > RING_CAP) state.ring.splice(0, state.ring.length - RING_CAP);
+    // reasoning 是 ephemeral 事件（见文件头协议备注）：seq 照常单调分配，但不占缓冲、不进 liveBuffer，
+    // 因此重放（Last-Event-ID / snapshotBuffer）永远不会带回思考流
+    if (event.event !== 'reasoning') {
+      state.ring.push(event);
+      if (state.ring.length > RING_CAP) state.ring.splice(0, state.ring.length - RING_CAP);
 
-    // 正在流式文件全文：delta 累积；file_start 重开新档；file_end 清除
-    if (event.event === 'file_start' && event.path !== undefined) {
-      state.live.set(event.path, '');
-    } else if (event.event === 'delta' && event.path !== undefined) {
-      state.live.set(event.path, (state.live.get(event.path) ?? '') + (event.content ?? ''));
-    } else if (event.event === 'file_end' && event.path !== undefined) {
-      state.live.delete(event.path);
-    } else if (event.event === 'error' && event.path !== undefined) {
-      state.live.delete(event.path); // 文件级失败：清掉该路径的在流文本（避免快照读到残文）
-    } else if (event.event === 'stopped') {
-      state.live.clear(); // 停止后不再有「正在生成」的文件
+      // 正在流式文件全文：delta 累积；file_start 重开新档；file_end 清除
+      if (event.event === 'file_start' && event.path !== undefined) {
+        state.live.set(event.path, '');
+      } else if (event.event === 'delta' && event.path !== undefined) {
+        state.live.set(event.path, (state.live.get(event.path) ?? '') + (event.content ?? ''));
+      } else if (event.event === 'file_end' && event.path !== undefined) {
+        state.live.delete(event.path);
+      } else if (event.event === 'error' && event.path !== undefined) {
+        state.live.delete(event.path); // 文件级失败：清掉该路径的在流文本（避免快照读到残文）
+      } else if (event.event === 'stopped') {
+        state.live.clear(); // 停止后不再有「正在生成」的文件
+      }
     }
 
     for (const subscriber of state.subscribers) {

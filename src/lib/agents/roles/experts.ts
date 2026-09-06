@@ -88,6 +88,8 @@ export interface RunExpertInput {
   provider?: LlmProvider;
   /** 流式增量透传（编排器接打字机 SSE delta 用）；缺省不透传，行为不变 */
   onDelta?: (text: string) => void;
+  /** 思考流透传（编排器接 SSE reasoning 事件用，T31）；缺省不透传，行为不变 */
+  onReasoning?: (text: string) => void;
 }
 
 /** runExpert 结果：任务记录 id + 产出文件路径 */
@@ -187,7 +189,10 @@ export async function runExpert(ctx: RunExpertInput): Promise<RunExpertResult> {
       model,
       ctx: { storage, projectId, role } satisfies ToolContext,
       provider: meteredProvider,
-      callbacks: ctx.onDelta === undefined ? undefined : { onDelta: ctx.onDelta },
+      callbacks:
+        ctx.onDelta === undefined && ctx.onReasoning === undefined
+          ? undefined
+          : { onDelta: ctx.onDelta, onReasoning: ctx.onReasoning },
       signal,
     });
     return stripOuterFence(result.content);
