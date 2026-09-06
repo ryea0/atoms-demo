@@ -20,6 +20,8 @@ const eslintConfig = [
       "next-env.d.ts",
       // SDD 并行 worktree（在途分支代码不进主干 lint）
       ".superpowers/**",
+      // 受控执行层物化的运行产物（files 表投影，非源码；与 vitest 排除对称，d29e767 先例）
+      "data/workspaces/**",
     ],
   },
 ];
