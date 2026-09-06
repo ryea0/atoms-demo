@@ -58,7 +58,7 @@ systemctl enable --now atoms
 
 echo "==> 8/8 nginx 反代（SSE 直通 + basic auth 防刷 LLM 账单）"
 if [[ ! -f /etc/nginx/.atoms_htpasswd ]]; then
-  pw=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
+  pw=$(openssl rand -hex 8)
   htpasswd -bcB /etc/nginx/.atoms_htpasswd atoms "$pw" >/dev/null
   echo "    [demo 访问口令，仅此一次显示] 用户名 atoms  密码 $pw"
 fi
