@@ -25,20 +25,25 @@ import type { LlmProvider, LlmRequest, LlmResult } from '@/lib/llm/types';
 /* 测试工具                                                             */
 /* ------------------------------------------------------------------ */
 
-/** 脚本桩 provider：只回一次 content，记录收到的请求，脚本耗尽即抛错（多调一次显式失败） */
+/** 脚本桩 provider：按脚本依次回 content，记录收到的请求，脚本耗尽即抛错（多调一次显式失败） */
 class FakeProvider implements LlmProvider {
   readonly name = 'fake';
   readonly requests: LlmRequest[] = [];
-  private used = false;
+  private cursor = 0;
 
-  constructor(private readonly content: string) {}
+  private readonly contents: string[];
+
+  constructor(...contents: string[]) {
+    this.contents = contents;
+  }
 
   async stream(req: LlmRequest, onDelta: (text: string) => void): Promise<LlmResult> {
     this.requests.push({ ...req, messages: req.messages.map((m) => ({ ...m })) });
-    if (this.used) throw new Error('FakeProvider 只允许一次调用');
-    this.used = true;
-    onDelta(this.content);
-    return { content: this.content, toolCalls: [], usage: { promptTokens: 11, completionTokens: 7 } };
+    const content = this.contents[this.cursor];
+    this.cursor += 1;
+    if (content === undefined) throw new Error('FakeProvider 脚本已耗尽（被多调用了一次）');
+    onDelta(content);
+    return { content, toolCalls: [], usage: { promptTokens: 11, completionTokens: 7 } };
   }
 
   async complete(req: LlmRequest): Promise<LlmResult> {
@@ -341,9 +346,9 @@ describe('runArchitect（mock）', () => {
     expect(run.summary ?? '').toContain('docs/architecture.mmd');
   });
 
-  it('输出完全为空 → 不抛错：0 文件、fileTree 空数组、warning 记录', async () => {
+  it('输出完全为空 → 补发也空手而归 → 不抛错：0 文件、fileTree 空数组、warning 记录', async () => {
     const { storage, projectId } = await newProject();
-    const result = await runArchitect({ storage, projectId, provider: new FakeProvider('  \n\n ') });
+    const result = await runArchitect({ storage, projectId, provider: new FakeProvider('  \n\n ', '还是什么都没有') });
     expect(result.files).toEqual([]);
     expect(result.fileTree).toEqual([]);
     const run = await firstRun(storage, projectId);
@@ -433,5 +438,95 @@ describe('runArchitect（mock）', () => {
     expect(md?.content).toContain('本节是正文小节，不是文件分段。');
     // 两行都留在上一段正文里 → 既没有内容被丢，也没有“契约外路径被拒”的误导告警
     expect((await firstRun(storage, projectId)).summary ?? '').not.toContain('契约外');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 3. 架构师：机读树补发修复（三段式第 2 步，2026-09-06 线上案例）        */
+/* ------------------------------------------------------------------ */
+
+/** 首调返回截断产出、第二次（补发）直接抛错的桩：验证补发失败不炸 run */
+class FlakyOnSecondProvider implements LlmProvider {
+  readonly name = 'flaky';
+  readonly requests: LlmRequest[] = [];
+  private calls = 0;
+
+  constructor(private readonly first: string) {}
+
+  async stream(req: LlmRequest, onDelta: (text: string) => void): Promise<LlmResult> {
+    this.requests.push({ ...req, messages: req.messages.map((m) => ({ ...m })) });
+    this.calls += 1;
+    if (this.calls > 1) throw new Error('补发调用网络炸了');
+    onDelta(this.first);
+    return { content: this.first, toolCalls: [], usage: null };
+  }
+
+  async complete(req: LlmRequest): Promise<LlmResult> {
+    return this.stream(req, () => undefined);
+  }
+}
+
+describe('runArchitect：单发截断缺机读树 → 补发窄调用修复', () => {
+  /** 线上案例形态：前几段完整、末尾的 file_tree.md/json 双缺（输出预算被图与设计文档吃光） */
+  const TRUNCATED = [
+    '===== docs/system_design.md =====',
+    sampleSegment('docs/system_design.md'),
+    '===== docs/architecture.mmd =====',
+    sampleSegment('docs/architecture.mmd'),
+    '',
+  ].join('\n');
+
+  const TREE_JSON = JSON.stringify(JSON.parse(readSample('filetree.json')), null, 2);
+
+  it('补发成功：树落库（editor=architect）、fileTree 非空、summary 留修复痕（不静默吞）', async () => {
+    const { storage, projectId } = await newProject();
+    await storage.upsertFile({ projectId, path: PRD_PATH, content: readSample('prd.md'), editor: 'pm' });
+    const provider = new FakeProvider(TRUNCATED, `\`\`\`json\n${TREE_JSON}\n\`\`\``);
+
+    const result = await runArchitect({ storage, projectId, provider });
+
+    expect(result.fileTree).toHaveLength(5);
+    expect(result.files).toContain('docs/file_tree.json');
+    const row = await storage.getFile(projectId, 'docs/file_tree.json');
+    expect(row?.lastEditor).toBe('architect');
+    expect(JSON.parse(row?.content ?? 'null')).toEqual(result.fileTree);
+
+    const run = await firstRun(storage, projectId);
+    expect(run.status).toBe('done');
+    expect(run.summary ?? '').toContain('补发');
+    expect(run.summary ?? '').not.toContain('空数组');
+
+    // 补发是窄契约：只谈树、不带 8 段分段协议；user 带已落库设计与 PRD 作依据
+    const repairSystem = provider.requests[1]?.messages.find((m) => m.role === 'system')?.content ?? '';
+    expect(repairSystem).toContain('file_tree');
+    expect(repairSystem).toContain('只输出');
+    expect(repairSystem).not.toContain('8 段');
+    const repairUser = provider.requests[1]?.messages.find((m) => m.role === 'user')?.content ?? '';
+    expect(repairUser).toContain('PRD');
+  });
+
+  it('补发返回垃圾 → 维持降级：fileTree 空数组、warning 记补发失败与空数组提示、run 仍 done', async () => {
+    const { storage, projectId } = await newProject();
+    const provider = new FakeProvider(TRUNCATED, '抱歉，这一轮我给不出树。');
+    const result = await runArchitect({ storage, projectId, provider });
+
+    expect(result.fileTree).toEqual([]);
+    expect(result.files).not.toContain('docs/file_tree.json');
+    const run = await firstRun(storage, projectId);
+    expect(run.status).toBe('done');
+    expect(run.summary ?? '').toContain('补发');
+    expect(run.summary ?? '').toContain('空数组');
+  });
+
+  it('补发 provider 抛错 → 不炸 run：吞成 warning（停止语义除外），降级契约不变', async () => {
+    const { storage, projectId } = await newProject();
+    const provider = new FlakyOnSecondProvider(TRUNCATED);
+    const result = await runArchitect({ storage, projectId, provider });
+
+    expect(result.fileTree).toEqual([]);
+    const run = await firstRun(storage, projectId);
+    expect(run.status).toBe('done');
+    expect(run.summary ?? '').toContain('补发');
+    expect(run.summary ?? '').toContain('空数组');
   });
 });

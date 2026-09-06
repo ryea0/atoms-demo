@@ -6,6 +6,8 @@
  *   · docs/file_tree.md（人读）· docs/file_tree.json（机读，控制器裁决：交付物按 8 个 docs 文件计）
  * 切分/校验/落库/树解析是确定性代码；缺段不抛错——缺什么少什么，警告进 run.summary
  * （fileTree 为空数组同样只记 warning，仍正常返回），由编排器/下游决定降级。
+ * 机读树缺失/不可解析时空树会先触发一次「只要树」的补发窄调用（三段式第 2 步，
+ * 2026-09-06 增补：真实模型单发 8 段被输出预算截断，末位的树最先死），仍失败才交降级。
  *
  * 上下文（规则 7 零历史共享）：只带「PM 的 summary + docs/prd.md 全文」，两者都缺失时降级提示。
  * 安全（规则 6/07）：分段路径与树节点路径一律过 normalizeProjectPath；契约外路径跳过并告警
@@ -16,6 +18,7 @@
  */
 import { z } from 'zod';
 import { runAgent } from '@/lib/agents/runner';
+import { AgentAbortError } from '@/lib/agents/types';
 import {
   beginRoleRun,
   failRoleRun,
@@ -216,6 +219,48 @@ function architectUserPrompt(prd: string | null, pmSummary: string | null): stri
 /* 主流程                                                              */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* 机读树补发修复（三段式第 2 步）                                        */
+/* ------------------------------------------------------------------ */
+
+/** 树节点逐个过沙箱归一（不合格节点剔除并记 warning），返回可用节点 */
+function normalizeTreeNodes(nodes: FileTreeNode[], warnings: string[]): FileTree {
+  const tree: FileTree = [];
+  for (const node of nodes) {
+    const nodePath = normalizeProjectPath(node.path);
+    if (!nodePath.ok) {
+      warnings.push(`file_tree 节点路径未过沙箱，已剔除：${node.path}（${nodePath.error}）`);
+      continue;
+    }
+    tree.push({ ...node, path: nodePath.path });
+  }
+  return tree;
+}
+
+/** 补发 system prompt：窄契约——只出一份树，不带 8 段分段协议（小输出，避开截断） */
+function fileTreeRepairSystemPrompt(): string {
+  return [
+    '你是架构师，执行一次窄任务：上一轮单发产出被截断，机读文件树缺失。',
+    '只输出一份 file_tree JSON（裸 JSON 或 ```json 围栏均可），不要输出任何其他文件、图或解释文字。',
+    '结构：[{"path":"...","desc":"职责一句话","depends":["..."]}]，按依赖拓扑序排列，depends 只指向树内已有路径。',
+    '后端固定 app/backend/api.js（无框架同构模块，导出 handle(method, path, body)，数据存内存）；'
+      + "前端固定 app/frontend/index.html（单页，fetch('/api/...')，禁 localStorage）。生成应用零依赖、无构建步骤。",
+  ].join('\n');
+}
+
+/** 补发 user prompt：已落库设计（若有）+ PRD（若有）作为依据 */
+function fileTreeRepairUserPrompt(design: string | null, prd: string | null): string {
+  return [
+    design === null
+      ? '（已落库交付物中没有 system_design.md——按 PRD 直接规划）'
+      : `【已落库 system_design.md】\n${design}`,
+    '',
+    prd === null ? '（PRD 缺失——按任务上下文合理假设并在 desc 里写明）' : `【PRD 全文】\n${prd}`,
+    '',
+    '【任务】依据上述材料产出 file_tree JSON（只输出树本身）。',
+  ].join('\n');
+}
+
 /** 交接摘要：产出清单 + 告警 + 序列化的 file_tree（规则 7：summary 是唯一交接物） */
 function summarizeArchitecture(files: string[], fileTree: FileTree, warnings: string[]): string {
   const missing = ARCHITECT_DOC_PATHS.filter((path) => !files.includes(path));
@@ -298,22 +343,63 @@ export async function runArchitect(ctx: ArchitectContext): Promise<ArchitectResu
     }
 
     // file_tree 解析：机读段优先；解析失败/无节点都只记 warning（缺什么少什么，不抛错）
-    const fileTree: FileTree = [];
+    let fileTree: FileTree = [];
     if (fileTreeRaw === null) {
-      warnings.push(`缺失机读 ${FILE_TREE_PATH}，file_tree 视为空（下游按降级流程处理）`);
+      warnings.push(`缺失机读 ${FILE_TREE_PATH}，file_tree 视为空（将尝试补发修复）`);
     } else {
       const parsed = parseFileTree(fileTreeRaw);
       if (parsed.ok) {
-        for (const node of parsed.tree) {
-          const nodePath = normalizeProjectPath(node.path);
-          if (!nodePath.ok) {
-            warnings.push(`file_tree 节点路径未过沙箱，已剔除：${node.path}（${nodePath.error}）`);
-            continue;
-          }
-          fileTree.push({ ...node, path: nodePath.path });
-        }
+        fileTree = normalizeTreeNodes(parsed.tree, warnings);
       } else {
-        warnings.push(`${FILE_TREE_PATH}：${parsed.error}——file_tree 视为空`);
+        warnings.push(`${FILE_TREE_PATH}：${parsed.error}——file_tree 视为空（将尝试补发修复）`);
+      }
+    }
+
+    /**
+     * 三段式第 2 步（2026-09-06 线上案例：真实模型单发 8 段被输出预算/总时长截断，
+     * 末位的机读树最先死 → 下游整体降级成与需求无关的快速模板）：
+     * 树空时补发一次「只要树」的窄契约小调用，依据 = 本轮已落库 system_design（若有）+ PRD（若有）。
+     * 修复成功 → 树落库并入 files；仍失败 → 维持空树 warning（第 3 步降级交给编排器）。
+     * provider 错误吞成 warning 不炸 run（补发是增强项），停止语义照常上抛。
+     */
+    if (fileTree.length === 0) {
+      const design = files.includes('docs/system_design.md')
+        ? (await storage.getFile(projectId, 'docs/system_design.md'))?.content ?? null
+        : null;
+      try {
+        const repaired = await runAgent({
+          role: 'architect',
+          systemPrompt: fileTreeRepairSystemPrompt(),
+          userPrompt: fileTreeRepairUserPrompt(design, prd?.content ?? null),
+          tools: [],
+          model,
+          ctx: { storage, projectId, role: 'architect' },
+          provider,
+          callbacks: ctx.onReasoning === undefined ? undefined : { onReasoning: ctx.onReasoning },
+          signal: ctx.signal,
+        });
+        const parsedRepair = parseFileTree(repaired.content);
+        if (!parsedRepair.ok) {
+          warnings.push(`补发修复未产出可用树：${parsedRepair.error}`);
+        } else {
+          const repairedTree = normalizeTreeNodes(parsedRepair.tree, warnings);
+          if (repairedTree.length === 0) {
+            warnings.push('补发树为空数组，维持降级');
+          } else {
+            fileTree = repairedTree;
+            await storage.upsertFile({
+              projectId,
+              path: FILE_TREE_PATH,
+              content: `${JSON.stringify(repairedTree, null, 2)}\n`,
+              editor: 'architect',
+            });
+            if (!files.includes(FILE_TREE_PATH)) files.push(FILE_TREE_PATH);
+            warnings.push(`机读 ${FILE_TREE_PATH} 缺失，已由补发小调用修复（${repairedTree.length} 节点）`);
+          }
+        }
+      } catch (error) {
+        if (error instanceof AgentAbortError) throw error; // 停止语义不吞
+        warnings.push(`补发修复失败（${error instanceof Error ? error.message : String(error)}），维持降级`);
       }
     }
     if (fileTree.length === 0) warnings.push('file_tree 为空数组：下游无拓扑序可用，需按降级模板生成');
