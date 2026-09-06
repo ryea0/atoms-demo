@@ -3,7 +3,7 @@
  *
  * brief Step 1 用例（mock 全链路）：
  * ① 建项目→startGeneration→事件序列 agent_start(pm)…file_start…delta…file_end…done；
- *    files 最终含 docs/* + app/*；PROGRESS.md 含 ✅ 且在收尾段之前
+ *    files 最终含 docs/* + app/*；PROGRESS.md 为任务计划清单（任务级 [x] 打勾且在收尾段之前）
  * ② stopProject 中途 → 事件含 stopped、status=paused
  * ③ 注入 pending intervention → 事件 intervention_injected、deliveredAt 已打、PM 上下文含指令
  * ④ 单文件 hard×2 → 该文件 ok=false（errors 非空）、error 事件、后续文件继续、done 仍发出
@@ -303,7 +303,7 @@ describe('ProjectEventBus', () => {
 /* ------------------------------------------------------------------ */
 
 describe('startGeneration（mock 全链路）', () => {
-  it('① 完整链路：事件序列 agent_start(pm)→file_start/delta/file_end→done；docs+app 落库；PROGRESS ✅ 在收尾段之前', async () => {
+  it('① 完整链路：事件序列 agent_start(pm)→file_start/delta/file_end→done；docs+app 落库；PROGRESS 为任务计划清单（任务级 [x] 在收尾段之前）', async () => {
     const { storage, projectId } = await newProject('full');
     const { events, stop } = collectEvents(projectId);
     // 首个事件到达时应处于 running（编排器注册态）
@@ -366,10 +366,14 @@ describe('startGeneration（mock 全链路）', () => {
     const prd = await storage.getFile(projectId, 'docs/prd.md');
     expect(prd?.lastEditor).toBe('pm');
 
-    // PROGRESS.md：存在、含 ✅、进度行在领导汇报段之前
+    // PROGRESS.md：任务计划清单——节标题 + 任务级打勾 + 勾选项在收尾段之前（2026-09-06 验收口径）
     const progress = await progressRow(storage, projectId);
-    expect(progress.content).toContain('✅');
-    expect(progress.content.indexOf('✅')).toBeLessThan(progress.content.indexOf(CLOSING_SECTION_HEADING));
+    expect(progress.content).toContain('## 任务计划（');
+    expect(progress.content).toMatch(/^- \[x\] pm-prd（产品经理）/m);
+    expect(progress.content).toMatch(/^- \[x\] architect-design（架构师）/m); // mock 链任务键（ARCHITECT_TASK_KEY 口径）
+    expect(progress.content).toMatch(/^- \[x\] engineer-app（工程师）/m);
+    expect(progress.content.indexOf('- [x]')).toBeLessThan(progress.content.indexOf(CLOSING_SECTION_HEADING));
+    expect(progress.content).not.toMatch(/—— 🔄/m); // 全部完成，无进行中残留
 
     // 项目收口：done；每任务前有检查点
     expect((await storage.getProject(projectId))?.status).toBe('done');

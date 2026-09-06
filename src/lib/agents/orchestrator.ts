@@ -22,10 +22,13 @@ import {
   filePausedLine,
   fileResumedLine,
   fileSkippedLine,
+  markTaskLine,
+  startRoundPlan,
   taskDoneLine,
   taskFailedLine,
   taskSkippedLine,
   taskStartLine,
+  type RoundPlanRef,
 } from '@/lib/agents/progress';
 import { isAbortError } from '@/lib/agents/roles/run-support';
 import { normalizePreferences } from '@/lib/settings/types';
@@ -78,6 +81,8 @@ interface TaskContext {
   task: TaskAssignment;
   interventions: Message[];
   emit: (e: Omit<StreamEvent, 'seq' | 'projectId'>) => StreamEvent;
+  /** 本轮任务计划锚点（子任务登记与打勾的作用域，2026-09-06 验收口径） */
+  plan: RoundPlanRef;
 }
 
 /* ------------------------------------------------------------------ */
@@ -689,6 +694,15 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
     const topo = topoSortTasks(decision.tasks);
     for (const warning of topo.warnings) await note(`- ⚠ ${warning.message}`);
     const taskByKey = new Map(decision.tasks.map((task) => [task.taskKey, task]));
+    // 任务计划清单（2026-09-06 验收反馈）：整轮 DAG 预写为复选框，任务边界处逐项打勾；
+    // 大任务的子任务拆解在 dispatch* 内按确定性交付物登记（见 progress.ts 形态契约）
+    const plan = await startRoundPlan(
+      storage,
+      projectId,
+      topo.order
+        .map((key) => taskByKey.get(key))
+        .filter((task): task is TaskAssignment => task !== undefined),
+    );
     const taskOutcome = new Map<string, 'done' | 'failed' | 'skipped'>();
     /** 本轮失败任务的原因（taskKey → 错误信息；closer 反谎报上下文的数据源，T33 C） */
     const failedReasons = new Map<string, string>();
@@ -707,13 +721,14 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
         task,
         interventions: [],
         emit,
+        plan,
       };
 
       // 级联跳过：前置失败/被跳过的任务不再执行（失败只中断依赖它的任务）
       const failedDep = task.dependsOn.find((dep) => taskOutcome.get(dep) === 'failed' || taskOutcome.get(dep) === 'skipped');
       if (failedDep !== undefined) {
         taskOutcome.set(taskKey, 'skipped');
-        await note(taskSkippedLine(task.agent, taskKey, failedDep));
+        await markTaskLine(storage, projectId, plan, taskKey, taskSkippedLine(task.agent, taskKey, failedDep));
         continue;
       }
 
@@ -723,7 +738,7 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
       // 干预队列：任务边界取待注入消息（DESIGN §3.5 必检级）→ 事件 → 打戳 → 拼进任务文本
       c.interventions = await takeInterventions(storage, projectId, taskKey, emit);
 
-      await note(taskStartLine(task.agent, taskKey, task.instruction));
+      await markTaskLine(storage, projectId, plan, taskKey, taskStartLine(task.agent, taskKey, task.instruction));
       try {
         const result = await dispatchTask(c, round);
         taskOutcome.set(taskKey, 'done');
@@ -738,7 +753,7 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
             projectId,
           );
         }
-        await note(taskDoneLine(task.agent, taskKey, result.summary));
+        await markTaskLine(storage, projectId, plan, taskKey, taskDoneLine(task.agent, taskKey, result.summary));
 
         // @直派成员以自身名义汇报（T32 b 方案）：在任务级 agent_end（dispatchTask 内发出）之后
         // 补一条该成员的完成通报；非 @直派任务不发（领导收尾汇报负责聚合视角）
@@ -770,7 +785,7 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
           failedRunId = run.id;
         }
         emit({ runId: failedRunId, event: 'error', agent: task.agent, error: message, meta: { taskKey } });
-        await note(taskFailedLine(task.agent, taskKey, message));
+        await markTaskLine(storage, projectId, plan, taskKey, taskFailedLine(task.agent, taskKey, message));
         // @直派任务失败也要出声（T33 B2）：失败通报是用户在聊天区看到失败的第一现场
         if (taskKey.startsWith(USER_DISPATCH_PREFIX)) {
           await emitAgentFailureReport(storage, projectId, emit, task, message, failedRunId);
