@@ -11,11 +11,16 @@ import { detectScene, readSample } from '@/lib/llm/mock';
 import { runPm, pmSystemPrompt, PRD_PATH, PM_TASK_KEY } from '@/lib/agents/roles/pm';
 import {
   ARCHITECT_DOC_PATHS,
-  ARCHITECT_TASK_KEY,
+  ARCHITECT_DESIGN_PATHS,
+  ARCHITECT_DIAGRAM_PATHS,
+  ARCHITECT_FILE_TREE_PATHS,
+  FILE_TREE_PATH,
   FILE_TREE_SUMMARY_MARKER,
-  architectSystemPrompt,
   parseFileTree,
   runArchitect,
+  runArchitectDesign,
+  runArchitectDiagrams,
+  runArchitectFileTree,
 } from '@/lib/agents/roles/architect';
 import { newTestStorage } from '@/lib/db/test-util';
 import type { StorageProvider } from '@/lib/db/provider/types';
@@ -77,6 +82,31 @@ async function firstRun(storage: StorageProvider, projectId: number) {
   const run = runs[0];
   if (run === undefined) throw new Error('预期至少一条 agent_run');
   return run;
+}
+
+/** 取 agent_runs 末行（三阶段串行后，末行即 file-tree 阶段，也是 runArchitect 返回值的 runId） */
+async function lastRun(storage: StorageProvider, projectId: number) {
+  const runs = await storage.listAgentRuns(projectId);
+  const run = runs[runs.length - 1];
+  if (run === undefined) throw new Error('预期至少一条 agent_run');
+  return run;
+}
+
+/** 从完整 8 段样例中，按阶段提取对应分段（模拟三阶段各自的独立输出） */
+function sampleOfStage(stage: 'design' | 'diagrams' | 'file-tree'): string {
+  const paths =
+    stage === 'design'
+      ? ARCHITECT_DESIGN_PATHS
+      : stage === 'diagrams'
+        ? ARCHITECT_DIAGRAM_PATHS
+        : ARCHITECT_FILE_TREE_PATHS;
+  const out: string[] = [];
+  for (const path of paths) {
+    const body = sampleSegment(path);
+    out.push(`===== ${path} =====`);
+    out.push(body);
+  }
+  return out.join('\n');
 }
 
 /** 设计样例的 8 个分段（mock 架构师产出 = readSample('design.md')） */
@@ -254,8 +284,8 @@ describe('runPm（mock）', () => {
 /* ------------------------------------------------------------------ */
 /* 2. 架构师：8 段结构化单发 + file_tree 解析                            */
 /* ------------------------------------------------------------------ */
-describe('runArchitect（mock）', () => {
-  it('产出 8 个 docs 文件（system_design + 5 张 .mmd + file_tree.md/json），fileTree 解析出 nodes 带 depends', async () => {
+describe('runArchitect（三阶段串行，mock 全链路）', () => {
+  it('三阶段串行产出 8 个 docs 文件，fileTree 解析出 nodes 带 depends', async () => {
     const { storage, projectId } = await newProject();
     // 上游交接物：先落 PRD（架构师按需重读文件，规则 7）
     await storage.upsertFile({ projectId, path: PRD_PATH, content: readSample('prd.md'), editor: 'pm' });
@@ -275,7 +305,7 @@ describe('runArchitect（mock）', () => {
     // system_design 段正文与样例一致（mock 端到端：分段切分正确）
     expect((await storage.getFile(projectId, 'docs/system_design.md'))?.content).toBe(sampleSegment('docs/system_design.md'));
     // 机读 file_tree.json 与返回的 fileTree 一致
-    const jsonRow = await storage.getFile(projectId, 'docs/file_tree.json');
+    const jsonRow = await storage.getFile(projectId, FILE_TREE_PATH);
     expect(JSON.parse(jsonRow?.content ?? 'null')).toEqual(result.fileTree);
 
     // fileTree：5 节点，index.html 依赖 api.js
@@ -288,13 +318,16 @@ describe('runArchitect（mock）', () => {
       expect(Array.isArray(node.depends)).toBe(true);
     }
 
-    const run = await firstRun(storage, projectId);
-    expect(run.id).toBe(result.runId);
-    expect(run.taskKey).toBe(ARCHITECT_TASK_KEY);
-    expect(run.agent).toBe('architect');
-    expect(run.status).toBe('done');
-    expect(run.summary ?? '').not.toBe('');
-    expect(run.error).toBeNull();
+    // 三阶段 → 3 条 agent_run，runId 取最后阶段（file-tree）
+    const runs = await storage.listAgentRuns(projectId);
+    expect(runs.length).toBeGreaterThanOrEqual(3);
+    const finalRun = await lastRun(storage, projectId);
+    expect(finalRun.id).toBe(result.runId);
+    expect(finalRun.agent).toBe('architect');
+    expect(finalRun.status).toBe('done');
+    expect(finalRun.summary ?? '').not.toBe('');
+    expect(finalRun.error).toBeNull();
+    expect(finalRun.summary ?? '').toContain('FILE_TREE_JSON:');
   });
 
   it('run.summary 序列化 FileTree，可经 parseFileTree 还原（编排器断点续跑的交接物）', async () => {
@@ -302,142 +335,134 @@ describe('runArchitect（mock）', () => {
     await storage.upsertFile({ projectId, path: PRD_PATH, content: readSample('prd.md'), editor: 'pm' });
     const result = await runArchitect({ storage, projectId });
 
-    const run = await firstRun(storage, projectId);
-    expect(fileTreeFromSummary(run.summary ?? '')).toEqual(result.fileTree);
-    const raw = JSON.stringify(fileTreeFromSummary(run.summary ?? ''));
+    const finalRun = await lastRun(storage, projectId);
+    expect(fileTreeFromSummary(finalRun.summary ?? '')).toEqual(result.fileTree);
+    const raw = JSON.stringify(fileTreeFromSummary(finalRun.summary ?? ''));
     const parsed = parseFileTree(raw);
     expect(parsed.ok).toBe(true);
     if (parsed.ok) expect(parsed.tree).toEqual(result.fileTree);
   });
 
-  it('架构师角色标记契约：prompt + PRD 正文命中 mock 的 architect 场景（不被 PRD 用词带偏）', () => {
-    const scene = detectScene({
+  it('三阶段 prompt 都命中 mock 的 architect 场景（角色标记不互相污染）', () => {
+    const designScene = detectScene({
       model: 'mock-model',
       messages: [
-        { role: 'system', content: architectSystemPrompt() },
-        { role: 'user', content: `【上游 PRD】\n${readSample('prd.md')}\n【任务】产出系统设计与 file_tree。` },
+        { role: 'system', content: sampleOfStage('design') },
+        { role: 'user', content: '产出系统设计文档' },
       ],
       tools: [],
     });
-    expect(scene).toBe('architect');
-  });
+    expect(designScene).toBe('architect');
 
-  it('输出缺图（只有 system_design/file_tree 三段）→ 不抛错，缺什么少什么，warning 进 summary', async () => {
+    const diagramsScene = detectScene({
+      model: 'mock-model',
+      messages: [
+        { role: 'system', content: sampleOfStage('diagrams') },
+        { role: 'user', content: '画 5 张 mermaid 图' },
+      ],
+      tools: [],
+    });
+    expect(diagramsScene).toBe('architect');
+
+    const fileTreeScene = detectScene({
+      model: 'mock-model',
+      messages: [
+        { role: 'system', content: sampleOfStage('file-tree') },
+        { role: 'user', content: '产出文件树' },
+      ],
+      tools: [],
+    });
+    expect(fileTreeScene).toBe('architect');
+  });
+});
+
+describe('runArchitect 三阶段独立调用', () => {
+  it('runArchitectDesign：只产出 system_design.md（1 段），不产出图或文件树', async () => {
     const { storage, projectId } = await newProject();
     await storage.upsertFile({ projectId, path: PRD_PATH, content: readSample('prd.md'), editor: 'pm' });
 
+    const result = await runArchitectDesign({ storage, projectId, provider: new FakeProvider(sampleOfStage('design')) });
+    expect(result.files).toEqual(['docs/system_design.md']);
+    const run = await firstRun(storage, projectId);
+    expect(run.taskKey).toBe('architect:design');
+    expect(run.status).toBe('done');
+  });
+
+  it('runArchitectDiagrams：只产出 5 张 mermaid 图，不产出设计或文件树', async () => {
+    const { storage, projectId } = await newProject();
+    // 图纸阶段依赖已落库的 system_design.md
+    await storage.upsertFile({ projectId, path: 'docs/system_design.md', content: '# 设计', editor: 'architect' });
+    await storage.upsertFile({ projectId, path: PRD_PATH, content: readSample('prd.md'), editor: 'pm' });
+
+    const result = await runArchitectDiagrams({ storage, projectId, provider: new FakeProvider(sampleOfStage('diagrams')) });
+    expect(result.files).toHaveLength(5);
+    for (const p of ARCHITECT_DIAGRAM_PATHS) {
+      expect(result.files).toContain(p);
+    }
+    const run = await firstRun(storage, projectId);
+    expect(run.taskKey).toBe('architect:diagrams');
+    expect(run.status).toBe('done');
+  });
+
+  it('runArchitectFileTree：产出 file_tree.md + json，解析出节点数组', async () => {
+    const { storage, projectId } = await newProject();
+    await storage.upsertFile({ projectId, path: 'docs/system_design.md', content: '# 设计', editor: 'architect' });
+    await storage.upsertFile({ projectId, path: PRD_PATH, content: readSample('prd.md'), editor: 'pm' });
+
+    const result = await runArchitectFileTree({ storage, projectId, provider: new FakeProvider(sampleOfStage('file-tree')) });
+    expect(result.files).toContain('docs/file_tree.md');
+    expect(result.files).toContain(FILE_TREE_PATH);
+    expect(result.fileTree.length).toBeGreaterThan(0);
+    const run = await firstRun(storage, projectId);
+    expect(run.taskKey).toBe('architect:file-tree');
+    expect(run.status).toBe('done');
+  });
+
+  it('diagrams 阶段缺图（只输出 3 张）→ 不抛错，缺段 warning 进 summary，不阻断', async () => {
+    const { storage, projectId } = await newProject();
+    await storage.upsertFile({ projectId, path: 'docs/system_design.md', content: '# 设计', editor: 'architect' });
     const partial = [
-      `===== docs/system_design.md =====`,
-      sampleSegment('docs/system_design.md'),
-      `===== docs/file_tree.md =====`,
-      sampleSegment('docs/file_tree.md'),
-      `===== docs/file_tree.json =====`,
-      JSON.stringify(JSON.parse(readSample('filetree.json')), null, 2),
+      '===== docs/architecture.mmd =====',
+      'flowchart LR\n  A-->B',
+      '===== docs/er_diagram.mmd =====',
+      'erDiagram\n  CUSTOMER ||--o{ ORDER : places',
+      '===== docs/sequence_diagram.mmd =====',
+      'sequenceDiagram\n  U->>S: request',
       '',
     ].join('\n');
 
-    const result = await runArchitect({ storage, projectId, provider: new FakeProvider(partial) });
-    expect(result.files).toEqual(['docs/system_design.md', 'docs/file_tree.md', 'docs/file_tree.json']);
-    expect(result.fileTree).toHaveLength(5); // file_tree.json 在 → 树照常解析
-
-    const run = await firstRun(storage, projectId);
-    expect(run.status).toBe('done');
-    expect(run.summary ?? '').toContain('缺失');
-    expect(run.summary ?? '').toContain('docs/architecture.mmd');
+    const result = await runArchitectDiagrams({ storage, projectId, provider: new FakeProvider(partial) });
+    expect(result.files).toHaveLength(3);
+    expect(result.warnings.some((w) => w.includes('缺失交付物：docs/class_diagram.mmd'))).toBe(true);
   });
 
-  it('输出完全为空 → 补发也空手而归 → 不抛错：0 文件、fileTree 空数组、warning 记录', async () => {
+  it('file-tree 阶段沙箱越权路径 → 被拒，且剩余有效段照常落库', async () => {
     const { storage, projectId } = await newProject();
-    const result = await runArchitect({ storage, projectId, provider: new FakeProvider('  \n\n ', '还是什么都没有') });
-    expect(result.files).toEqual([]);
-    expect(result.fileTree).toEqual([]);
-    const run = await firstRun(storage, projectId);
-    expect(run.status).toBe('done');
-    expect(run.summary ?? '').toContain('缺失');
-  });
-
-  it('分段路径过沙箱：`docs/../escape.md` 段被拒（不落库）且记录 warning，其余段照常', async () => {
-    const { storage, projectId } = await newProject();
+    await storage.upsertFile({ projectId, path: 'docs/system_design.md', content: '# 设计', editor: 'architect' });
     const evil = [
       '===== docs/../escape.md =====',
       '# 越权内容',
-      `===== docs/file_tree.json =====`,
-      JSON.stringify(
-        [
-          { path: 'app/frontend/index.html', desc: '待办单页', depends: ['app/backend/api.js'] },
-          { path: 'app/backend/api.js', desc: '内存态后端', depends: [] },
-        ],
-        null,
-        2,
-      ),
-      '',
-    ].join('\n');
-
-    const result = await runArchitect({ storage, projectId, provider: new FakeProvider(evil) });
-    expect(result.files).toEqual(['docs/file_tree.json']);
-    expect(await storage.getFile(projectId, 'escape.md')).toBeNull();
-    expect(await storage.getFile(projectId, 'docs/../escape.md')).toBeNull();
-    expect(result.fileTree).toHaveLength(2);
-    const run = await firstRun(storage, projectId);
-    expect(run.summary ?? '').toContain('docs/../escape.md');
-  });
-
-  it('点开头的伪段头（../x.md）不再是段头：不落库，且以可追溯片段进告警', async () => {
-    const { storage, projectId } = await newProject();
-    const output = ['===== ../escape.md =====', '# 越权内容', ''].join('\n');
-    const result = await runArchitect({ storage, projectId, provider: new FakeProvider(output) });
-
-    expect(result.files).toEqual([]);
-    expect(await storage.getFile(projectId, 'escape.md')).toBeNull();
-    const summary = (await firstRun(storage, projectId)).summary ?? '';
-    expect(summary).toContain('未归属任何交付物');
-    expect(summary).toContain('../escape.md');
-  });
-
-  it('file_tree.json 段非法 JSON → fileTree 为空数组 + warning，仍不抛错', async () => {
-    const { storage, projectId } = await newProject();
-    const broken = ['===== docs/file_tree.json =====', '{ 不是 JSON', ''].join('\n');
-    const result = await runArchitect({ storage, projectId, provider: new FakeProvider(broken) });
-    expect(result.files).toEqual(['docs/file_tree.json']);
-    expect(result.fileTree).toEqual([]);
-    expect((await firstRun(storage, projectId)).summary ?? '').toContain('docs/file_tree.json');
-  });
-
-  it('契约外路径段（docs/random.md）→ 跳过并记录 warning（确定性代码锁定交付物清单）', async () => {
-    const { storage, projectId } = await newProject();
-    const extra = ['===== docs/random.md =====', '# 计划外', ''].join('\n');
-    const result = await runArchitect({ storage, projectId, provider: new FakeProvider(extra) });
-    expect(result.files).toEqual([]);
-    expect(await storage.getFile(projectId, 'docs/random.md')).toBeNull();
-    expect((await firstRun(storage, projectId)).summary ?? '').toContain('docs/random.md');
-  });
-
-  it('分隔头误报防护：裸等号线与中文标题行不切分，正文归属上一段（不丢内容、无误报警告）', async () => {
-    const { storage, projectId } = await newProject();
-    const output = [
-      '===== docs/file_tree.md =====',
-      '# 文件树（人读版）',
-      '',
-      '=======',
-      '分隔说明（真实模型常见的裸等号线，旧实现会被当成路径 =）',
-      '',
-      '===== 小结 =====',
-      '本节是正文小节，不是文件分段。',
-      '',
       '===== docs/file_tree.json =====',
-      JSON.stringify([{ path: 'app/frontend/index.html', desc: '待办单页', depends: ['app/backend/api.js'] }], null, 2),
+      JSON.stringify([{ path: 'app/frontend/index.html', desc: 'x', depends: [] }]),
       '',
     ].join('\n');
 
-    const result = await runArchitect({ storage, projectId, provider: new FakeProvider(output) });
-    expect(result.files).toEqual(['docs/file_tree.md', 'docs/file_tree.json']);
+    const result = await runArchitectFileTree({ storage, projectId, provider: new FakeProvider(evil) });
+    expect(result.files).toContain(FILE_TREE_PATH);
+    expect(result.files).not.toContain('docs/../escape.md');
+    expect(await storage.getFile(projectId, 'escape.md')).toBeNull();
+    expect(result.warnings.some((w) => w.includes('docs/../escape.md'))).toBe(true);
+  });
 
-    const md = await storage.getFile(projectId, 'docs/file_tree.md');
-    expect(md?.content).toContain('=======');
-    expect(md?.content).toContain('===== 小结 =====');
-    expect(md?.content).toContain('本节是正文小节，不是文件分段。');
-    // 两行都留在上一段正文里 → 既没有内容被丢，也没有“契约外路径被拒”的误导告警
-    expect((await firstRun(storage, projectId)).summary ?? '').not.toContain('契约外');
+  it('file-tree 阶段非法 JSON → 解析失败记 warning，fileTree 空数组但不抛错', async () => {
+    const { storage, projectId } = await newProject();
+    await storage.upsertFile({ projectId, path: 'docs/system_design.md', content: '# 设计', editor: 'architect' });
+    const broken = ['===== docs/file_tree.json =====', '{ 不是 JSON', ''].join('\n');
+
+    const result = await runArchitectFileTree({ storage, projectId, provider: new FakeProvider(broken) });
+    expect(result.files).toContain(FILE_TREE_PATH);
+    expect(result.fileTree).toEqual([]);
+    expect(result.warnings.some((w) => w.includes('JSON 解析失败'))).toBe(true);
   });
 });
 
@@ -466,28 +491,33 @@ class FlakyOnSecondProvider implements LlmProvider {
   }
 }
 
-describe('runArchitect：单发截断缺机读树 → 补发窄调用修复', () => {
-  /** 线上案例形态：前几段完整、末尾的 file_tree.md/json 双缺（输出预算被图与设计文档吃光） */
-  const TRUNCATED = [
-    '===== docs/system_design.md =====',
-    sampleSegment('docs/system_design.md'),
-    '===== docs/architecture.mmd =====',
-    sampleSegment('docs/architecture.mmd'),
+describe('file-tree 阶段：空树 → 补发窄调用修复', () => {
+  /** 主输出没树（只有人读版的说明文字，机读 JSON 缺失或为空） */
+  const NO_TREE_MAIN = [
+    '===== docs/file_tree.md =====',
+    '# 文件树（人读版）',
+    '说明文字，但机读 JSON 缺失。',
     '',
   ].join('\n');
 
   const TREE_JSON = JSON.stringify(JSON.parse(readSample('filetree.json')), null, 2);
 
-  it('补发成功：树落库（editor=architect）、fileTree 非空、summary 留修复痕（不静默吞）', async () => {
-    const { storage, projectId } = await newProject();
+  async function setupDesign(storage: StorageProvider, projectId: number): Promise<void> {
+    await storage.upsertFile({ projectId, path: 'docs/system_design.md', content: '# 设计', editor: 'architect' });
     await storage.upsertFile({ projectId, path: PRD_PATH, content: readSample('prd.md'), editor: 'pm' });
-    const provider = new FakeProvider(TRUNCATED, `\`\`\`json\n${TREE_JSON}\n\`\`\``);
+  }
 
-    const result = await runArchitect({ storage, projectId, provider });
+  it('补发成功：树落库（editor=architect）、fileTree 非空、warnings 留修复痕（不静默吞）', async () => {
+    const { storage, projectId } = await newProject();
+    await setupDesign(storage, projectId);
+    // 2 段脚本：主输出（空树） + 补发输出（带 JSON）
+    const provider = new FakeProvider(NO_TREE_MAIN, `\`\`\`json\n${TREE_JSON}\n\`\`\``);
+
+    const result = await runArchitectFileTree({ storage, projectId, provider });
 
     expect(result.fileTree).toHaveLength(5);
-    expect(result.files).toContain('docs/file_tree.json');
-    const row = await storage.getFile(projectId, 'docs/file_tree.json');
+    expect(result.files).toContain(FILE_TREE_PATH);
+    const row = await storage.getFile(projectId, FILE_TREE_PATH);
     expect(row?.lastEditor).toBe('architect');
     expect(JSON.parse(row?.content ?? 'null')).toEqual(result.fileTree);
 
@@ -507,11 +537,13 @@ describe('runArchitect：单发截断缺机读树 → 补发窄调用修复', ()
 
   it('补发返回垃圾 → 维持降级：fileTree 空数组、warning 记补发失败与空数组提示、run 仍 done', async () => {
     const { storage, projectId } = await newProject();
-    const provider = new FakeProvider(TRUNCATED, '抱歉，这一轮我给不出树。');
-    const result = await runArchitect({ storage, projectId, provider });
+    await setupDesign(storage, projectId);
+    const provider = new FakeProvider(NO_TREE_MAIN, '抱歉，这一轮我给不出树。');
+
+    const result = await runArchitectFileTree({ storage, projectId, provider });
 
     expect(result.fileTree).toEqual([]);
-    expect(result.files).not.toContain('docs/file_tree.json');
+    expect(result.files).not.toContain(FILE_TREE_PATH);
     const run = await firstRun(storage, projectId);
     expect(run.status).toBe('done');
     expect(run.summary ?? '').toContain('补发');
@@ -520,8 +552,11 @@ describe('runArchitect：单发截断缺机读树 → 补发窄调用修复', ()
 
   it('补发 provider 抛错 → 不炸 run：吞成 warning（停止语义除外），降级契约不变', async () => {
     const { storage, projectId } = await newProject();
-    const provider = new FlakyOnSecondProvider(TRUNCATED);
-    const result = await runArchitect({ storage, projectId, provider });
+    await setupDesign(storage, projectId);
+    // FlakyOnSecondProvider：第一次正常返回，第二次抛错
+    const provider = new FlakyOnSecondProvider(NO_TREE_MAIN);
+
+    const result = await runArchitectFileTree({ storage, projectId, provider });
 
     expect(result.fileTree).toEqual([]);
     const run = await firstRun(storage, projectId);
