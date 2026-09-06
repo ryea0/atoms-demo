@@ -1,0 +1,19 @@
+[Unit]
+Description=Atoms-Demo (Next.js next start :3000)
+After=network.target
+
+[Service]
+Type=simple
+User=atoms
+Group=atoms
+WorkingDirectory=/opt/atoms-demo
+# 直接调 next 二进制（绕过 npm 包装，systemd 信号可直达进程）
+ExecStart=/usr/bin/node /opt/atoms-demo/node_modules/next/dist/bin/next start -p 3000
+Restart=always
+RestartSec=3
+# 输出上限兜底（SSE 日志量可控）
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
