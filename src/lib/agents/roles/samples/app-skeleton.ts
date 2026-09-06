@@ -724,17 +724,36 @@ function renderLandingApi(): string {
   return lines.join('\n');
 }
 
-/** 渲染启动说明脚本（浏览器内全栈：无需安装依赖、无需本地 node 进程） */
+/**
+ * 渲染启动脚本（T13 交付物；T30 调整端口契约）。
+ *
+ * 双通道如实说明：完整交互 = 浏览器内全栈（api.js 的 handle 由平台 fetch 拦截垫片装配，
+ * 无需本地进程）；导出到本地后想直接看页面，再由本脚本起一个零依赖静态服务。
+ * 端口默认 3001（shell 侧等价 `process.env.PORT || 3001`），避开平台自身 dev server
+ * 的默认端口（3000 会撞车）；被占用用 PORT 环境变量覆盖。mock provider / seed /
+ * engineer 保底模板三处共用本渲染函数，端口契约单点维护。
+ */
 export function renderStartSh(): string {
   const lines: string[] = [
     '#!/usr/bin/env sh',
-    '# 生成应用启动说明（Atoms-Demo 浏览器内全栈）',
-    '# 后端 = api.js 的 handle(method,path,body)，由平台 fetch 拦截垫片在浏览器内装配，',
-    '# 因此前端与后端都无需安装依赖、无需启动本地服务。',
+    '# 生成应用启动脚本（Atoms-Demo 浏览器内全栈：零依赖、内存态、无构建步骤）',
+    '# 完整交互 = api.js 的 handle(method,path,body)，由平台 fetch 拦截垫片在浏览器内装配，',
+    '# 因此无需安装依赖、无需本地 node 进程；本脚本只提供导出后的本地静态预览。',
     'set -e',
     '',
-    'echo "[atoms] 预览：在平台预览面板打开 app/frontend/index.html 即可运行。"',
+    '# 默认端口 3001（等价 process.env.PORT || 3001，避开平台 dev server 的默认端口）',
+    'PORT="${PORT:-3001}"',
+    '',
+    'echo "[atoms] 完整交互：在平台预览面板打开 app/frontend/index.html（浏览器内后端）。"',
     'echo "[atoms] 数据为内存态：刷新即重置；应用零依赖，不做 npm install。"',
+    'echo "[atoms] 本地静态预览：http://127.0.0.1:${PORT}/app/frontend/index.html"',
+    'echo "[atoms] 若端口被占用：PORT=xxxx bash start_app.sh"',
+    '',
+    'if command -v python3 >/dev/null 2>&1; then',
+    '  exec python3 -m http.server "$PORT" --bind 127.0.0.1',
+    'fi',
+    '',
+    'echo "[atoms] 未检测到 python3，跳过本地静态服务：请改用平台预览面板。"',
     '',
   ];
   return lines.join('\n');
