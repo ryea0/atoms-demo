@@ -34,8 +34,9 @@ if [[ ! -d $APP_DIR/.git ]]; then
   rm -rf "$APP_DIR"
   git clone https://github.com/ryea0/atoms-demo.git "$APP_DIR"
 else
-  git -C "$APP_DIR" fetch origin
-  git -C "$APP_DIR" reset --hard origin/main
+  # 目录属主是 atoms，root 重入需显式豁免 dubious ownership（幂等重跑路径）
+  git -c safe.directory="$APP_DIR" -C "$APP_DIR" fetch origin
+  git -c safe.directory="$APP_DIR" -C "$APP_DIR" reset --hard origin/main
 fi
 
 echo "==> 5/8 专用运行用户 + 目录属主"
