@@ -84,9 +84,9 @@ function iconFor(name: string): LucideIcon {
   return EXT_ICONS[ext] ?? File;
 }
 
-/** M 角标语义：蓝 = agent 最后修改，绿 = 人工/预置（取 files.lastEditor，DESIGN §2） */
+/** M 角标语义：蓝 = agent 最后修改，绿 = 人工/预置（--color-human token，DESIGN §2） */
 const BADGE_AGENT = 'bg-brand/10 text-brand';
-const BADGE_HUMAN = 'bg-emerald-500/10 text-emerald-600';
+const BADGE_HUMAN = 'bg-human/10 text-human';
 
 interface EditorBadge {
   readonly title: string;

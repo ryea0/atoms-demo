@@ -11,6 +11,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { FileTree, type FileTreeProps } from '@/components/tree/FileTree';
 import { buildTree, countLines, defaultExpandedDirs } from '@/lib/client/tree';
 import type { WorkspaceFile } from '@/lib/client/store';
+import { readFileSync } from 'node:fs';
 
 /* ------------------------------------------------------------------ */
 /* buildTree 纯函数                                                     */
@@ -235,7 +236,9 @@ describe('FileTree 角标与流式状态', () => {
     expect(agentBadge.className).toContain('text-brand');
 
     const humanBadge = screen.getByTitle('人工修改');
-    expect(humanBadge.className).toContain('text-emerald-600');
+    // 绿角标统一走 --color-human token（T25 收口，不再硬编码 emerald 色值）
+    expect(humanBadge.className).toContain('text-human');
+    expect(humanBadge.className).toContain('bg-human/10');
 
     expect(screen.getByTitle('预置文件')).toBeInTheDocument();
     expect(screen.getByTitle('工程师 修改')).toBeInTheDocument();
@@ -260,6 +263,15 @@ describe('FileTree 角标与流式状态', () => {
   it('新文件出现动画：行节点带 fade-in / slide-in 过渡类', () => {
     renderTree();
     expect(screen.getByRole('treeitem', { name: /prd\.md/ }).className).toContain('fade-in');
+  });
+
+  it('绿角标 token 收口：globals.css 声明 --color-human，且角标组件不再硬编码 emerald（T25）', () => {
+    const css = readFileSync('src/app/globals.css', 'utf8');
+    expect(css).toContain('--color-human:');
+
+    for (const file of ['src/components/tree/FileTree.tsx', 'src/components/viewer/ViewerTabs.tsx']) {
+      expect(readFileSync(file, 'utf8')).not.toContain('emerald');
+    }
   });
 });
 
@@ -297,7 +309,7 @@ describe('FileTree 选择与下载', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '下载项目' }));
     expect(openMock).toHaveBeenCalledTimes(1);
-    expect(openMock).toHaveBeenCalledWith('/api/projects/42/export', '_blank');
+    expect(openMock).toHaveBeenCalledWith('/api/projects/42/export', '_blank', 'noopener,noreferrer');
   });
 
   it('projectId 缺省（快照未就绪）→ 下载按钮禁用，点击不触发导出', () => {

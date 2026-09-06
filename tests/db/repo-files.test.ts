@@ -142,7 +142,7 @@ describe('repo files：版本历史与作用域补充回归', () => {
     // 保存/恢复/加锁同样被 project_id 作用域挡住
     await expect(
       s.saveHuman({ projectId:b.id, fileId:f.fileId, content:'越权写入', baseVersion:1 }),
-    ).resolves.toEqual({ ok:false, conflict:true, current:'' });
+    ).resolves.toEqual({ ok:false, conflict:true, current:'', version:0 }); // 不存在=冲突分支（version 0 表服务端无行）
     await expect(s.restoreFileVersion(b.id, f.fileId, 1)).rejects.toThrow();
     await s.setSoftLock(b.id, f.fileId, true);
     expect(await s.getSoftLockedFiles(a.id)).toHaveLength(0);
@@ -178,7 +178,8 @@ describe('repo files：冲突/并发不得污染历史（fix round 1）', () => 
 
     const before = await s.listFileVersions(p.id, f.fileId);
     const stale = await s.saveHuman({ projectId:p.id, fileId:f.fileId, content:'基于 v1 的过期保存', baseVersion:1 });
-    expect(stale).toEqual({ ok:false, conflict:true, current:'v2' });
+    // conflict 分支回带服务端当前版本号（T25）：SSE 断连期间「用我的版本」也能一次重发成功
+    expect(stale).toEqual({ ok:false, conflict:true, current:'v2', version:2 });
 
     // 关键守卫：失败的写不能留下任何"从未存在过的版本"
     expect(await s.listFileVersions(p.id, f.fileId)).toEqual(before);

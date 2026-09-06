@@ -34,6 +34,12 @@ export function createProjectsRepo(db: SqliteDb): ProjectsRepo {
       return toProject(row);
     },
 
+    /** 项目总数（count(*) 单行聚合；seed 幂等守卫用，与 session 无关） */
+    async countProjects(): Promise<number> {
+      const rows = await db.select({ value: count() }).from(projects).all();
+      return rows[0]?.value ?? 0;
+    },
+
     /**
      * 按 session 列项目（卡片墙数据）。
      * 三表直连会产生笛卡尔积（文件数×调用数），计数被放大——所以 files/llm_calls 各自先按

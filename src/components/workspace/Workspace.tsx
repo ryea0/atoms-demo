@@ -9,18 +9,27 @@
  *
  * 响应式（.claude/rules/04）：≥lg 三栏并排（聊天 30% / 文件树 20% / 查看器 50%），
  * <lg 折叠为单栏 + 底部 tab 切换——显隐用纯 CSS 完成，三栏只挂载一次（不重复订阅 store）。
+ *
+ * 跨面板接线（T25）：「当前打开的文件」归本层持有（选中状态就近提升到唯一消费者之上）——
+ * 文件树 onSelect 与产物卡 onOpenFile 写入，查看器 onActivePathChange 回写（页签内切换也要
+ * 反向点亮文件树），经 initialPath 下发声明式打开。回滚同理收口在本层：确认 → POST restore
+ * → 重拉快照对齐 store（回滚不发 file 事件）。
  */
 import { useCallback, useMemo, useState } from 'react';
+import { toast } from 'sonner';
 import { ChatPanel } from '@/components/chat/ChatPanel';
 import { EditSwitch } from '@/components/common/EditSwitch';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Toaster } from '@/components/ui/sonner';
 import { FRONTEND_INDEX_PATH, PreviewPane } from '@/components/preview/PreviewPane';
-import { useWorkspace } from '@/lib/client/store';
+import { createWorkspaceStore, useWorkspace } from '@/lib/client/store';
+import { checkpointIdForRun, checkpointLabelOf } from '@/lib/client/checkpoint';
+import { fetchWorkspaceSnapshot, restoreProjectCheckpoint } from '@/lib/client/session';
 import type { AgentRole } from '@/lib/db/provider/types';
 import { FileTree } from '@/components/tree/FileTree';
 import { ViewerTabs } from '@/components/viewer/ViewerTabs';
 import { PaneShell } from './PaneShell';
+import { RollbackDialog } from './RollbackDialog';
 import { TopBar, type WorkspaceView } from './TopBar';
 
 /** 窄屏（<lg）单栏模式下的栏目 */
@@ -41,11 +50,58 @@ export function Workspace({ projectId }: { projectId: number }) {
   const state = useWorkspace(projectId);
   const [view, setView] = useState<WorkspaceView>('editor');
   const [pane, setPane] = useState<MobilePane>('chat');
+  /** 当前打开的文件（文件树高亮 + 查看器激活页签的唯一事实来源） */
+  const [activePath, setActivePath] = useState<string | null>(null);
+  /** 待确认的回滚目标（cpId + 展示 label）；null = 关闭 */
+  const [rollbackTarget, setRollbackTarget] = useState<{ checkpointId: number; label: string } | null>(null);
+  const [rollingBack, setRollingBack] = useState(false);
 
   const handleViewChange = useCallback((next: WorkspaceView) => setView(next), []);
   const handlePaneChange = useCallback((value: string) => {
     if (isMobilePane(value)) setPane(value);
   }, []);
+
+  // 文件树点击 / 产物卡点击 → 打开并激活查看器页签；<lg 单栏下同时切到查看栏
+  // （否则页签在隐藏栏里打开，移动端毫无反馈——T25 R1 评审 Finding 2）
+  const handleOpenFile = useCallback((path: string) => {
+    setActivePath(path);
+    setPane('viewer');
+  }, []);
+  // 查看器页签切换/关闭 → 回写选中态（文件树高亮跟随，双向不回环：同值 setState 不触发渲染）
+  const handleActivePathChange = useCallback((path: string | null) => setActivePath(path), []);
+
+  /** 时间线「回到此任务前」：先解析该任务之前的检查点，命中才进确认闸 */
+  const handleRollback = useCallback(
+    (runId: number) => {
+      const checkpointId = checkpointIdForRun(state.checkpoints, runId);
+      if (checkpointId === null) {
+        toast.error('该任务之前没有可用检查点，无法回滚');
+        return;
+      }
+      const checkpoint = state.checkpoints.find((item) => item.id === checkpointId);
+      setRollbackTarget({ checkpointId, label: checkpoint === undefined ? String(checkpointId) : checkpointLabelOf(checkpoint) });
+    },
+    [state.checkpoints],
+  );
+
+  /** 确认回滚：POST restore → 重拉快照整体重建 store（回滚不发 file 事件，快照是唯一对齐途径） */
+  const confirmRollback = useCallback(() => {
+    if (rollbackTarget === null || projectId === null) return;
+    setRollingBack(true);
+    const { checkpointId } = rollbackTarget;
+    void restoreProjectCheckpoint(projectId, checkpointId)
+      .then(() => fetchWorkspaceSnapshot(projectId))
+      .then((snapshot) => {
+        createWorkspaceStore(projectId).hydrate(snapshot);
+        setRollbackTarget(null);
+        toast.success('已回滚到检查点，文件已恢复');
+      })
+      .catch((error: unknown) => {
+        console.error('[workspace] 检查点回滚失败：', error);
+        toast.error('回滚失败', { description: error instanceof Error ? error.message : '请稍后重试' });
+      })
+      .finally(() => setRollingBack(false));
+  }, [rollbackTarget, projectId]);
 
   // 运行中角色集合（快照里的 running run + SSE agent_start/agent_end 推进的结果）
   const runningRoles = useMemo(() => {
@@ -77,17 +133,22 @@ export function Workspace({ projectId }: { projectId: number }) {
           active={pane === 'chat'}
           className="flex-1 border-r border-border lg:flex-none lg:w-[30%]"
         >
-          <ChatPanel state={state} />
+          <ChatPanel state={state} onOpenFile={handleOpenFile} onRollback={handleRollback} />
         </PaneShell>
 
-        {/* 文件树 ~20%：FileTree（T20）。选中态接线（activePath/onSelect）归 T25 查看器联动 */}
+        {/* 文件树 ~20%：FileTree（T20）；选中态由本层 activePath 下发（T25 跨面板接线） */}
         <PaneShell
           label="文件树"
           title="文件"
           active={pane === 'files'}
           className="flex-1 border-r border-border lg:flex-none lg:w-[20%]"
         >
-          <FileTree files={state.files} projectId={state.project?.id ?? null} />
+          <FileTree
+            files={state.files}
+            projectId={state.project?.id ?? null}
+            activePath={activePath}
+            onSelect={handleOpenFile}
+          />
         </PaneShell>
 
         {/* 查看器/预览 ~50%：T21 ViewerTabs、T22 PreviewPane 在此填充 */}
@@ -100,7 +161,7 @@ export function Workspace({ projectId }: { projectId: number }) {
           {view === 'preview' ? (
             <PreviewPane projectId={projectId} hasFrontend={state.files.has(FRONTEND_INDEX_PATH)} />
           ) : (
-            <ViewerTabs />
+            <ViewerTabs initialPath={activePath} onActivePathChange={handleActivePathChange} />
           )}
         </PaneShell>
       </div>
@@ -125,7 +186,18 @@ export function Workspace({ projectId }: { projectId: number }) {
         </Tabs>
       </nav>
 
-      {/* toast 挂本页（分享复制提示用），不进根布局 */}
+      {/* 回滚确认闸（时间线入口）：确认语义在此，POST 与快照刷新在 confirmRollback */}
+      <RollbackDialog
+        open={rollbackTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setRollbackTarget(null);
+        }}
+        checkpointLabel={rollbackTarget?.label ?? ''}
+        onConfirm={confirmRollback}
+        pending={rollingBack}
+      />
+
+      {/* toast 挂本页（分享复制/回滚提示用），不进根布局 */}
       <Toaster position="top-center" richColors />
     </div>
   );

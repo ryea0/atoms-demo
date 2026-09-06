@@ -43,6 +43,7 @@ import { GET as EXPORT_GET } from '@/app/api/projects/[id]/export/route';
 import { PATCH as FILE_PATCH } from '@/app/api/projects/[id]/files/[fid]/route';
 import { POST as REGEN_POST } from '@/app/api/projects/[id]/files/[fid]/regenerate/route';
 import { POST as RESTORE_POST } from '@/app/api/projects/[id]/checkpoints/[cpId]/restore/route';
+import { GET as OPEN_GET } from '@/app/api/projects/[id]/open/route';
 
 /* ------------------------------------------------------------------ */
 /* 常量与工具                                                           */
@@ -348,7 +349,7 @@ describe('GET stream：Last-Event-ID 重放', () => {
 /* ------------------------------------------------------------------ */
 
 describe('PATCH /api/projects/[id]/files/[fid]', () => {
-  it('③ 成功 200 {version}；过期 baseVersion → 409 {conflict,current}；文件不存在 404；超 512KB 400', async () => {
+  it('③ 成功 200 {version}；过期 baseVersion → 409 {conflict,current,version}；文件不存在 404；超 512KB 400', async () => {
     const { id } = await seedProject();
     const { fileId } = await storage().upsertFile({ projectId: id, path: 'app/a.js', content: 'v1', editor: 'seed' });
 
@@ -364,7 +365,8 @@ describe('PATCH /api/projects/[id]/files/[fid]', () => {
       fileCtx(id, fileId),
     );
     expect(conflict.status).toBe(409);
-    expect(await conflict.json()).toEqual({ conflict: true, current: 'v2 内容' });
+    // 409 体回带服务端当前版本号（T25）：SSE 断连期间「用我的版本」也能一次重发成功
+    expect(await conflict.json()).toEqual({ conflict: true, current: 'v2 内容', version: 2 });
 
     const missing = await FILE_PATCH(
       patchJson(`http://localhost/api/projects/${id}/files/9999`, { content: 'x', baseVersion: 1 }, SESSION_A),
@@ -412,7 +414,7 @@ describe('GET /api/projects/[id]/preview', () => {
     expect(html).toContain('window.fetch'); // 拦截器在位
   });
 
-  it('无 api.js：只注入拦截器占位（/api/ 返回后端未生成）；缺 index.html → 404 中文提示', async () => {
+  it('无 api.js：只注入拦截器占位（/api/ 返回后端未生成）', async () => {
     const onlyIndex = await seedProject();
     await storage().upsertFile({ projectId: onlyIndex.id, path: 'app/frontend/index.html', content: indexHtml, editor: 'engineer' });
     const placeholder = await PREVIEW_GET(makeRequest(`http://localhost/api/projects/${onlyIndex.id}/preview`, {}, SESSION_A), idCtx(onlyIndex.id));
@@ -424,7 +426,24 @@ describe('GET /api/projects/[id]/preview', () => {
     const { id } = await seedProject();
     const missing = await PREVIEW_GET(makeRequest(`http://localhost/api/projects/${id}/preview`, {}, SESSION_A), idCtx(id));
     expect(missing.status).toBe(404);
-    expect(((await missing.json()) as { error: string }).error).toContain('index.html');
+    // 缺入口页与归属不符的错误分支见下一用例（中文 HTML 提示页）
+  });
+
+  it('失败分支回中文 HTML 提示页（iframe 里不再显示裸 404 JSON，T25）', async () => {
+    // 缺 index.html
+    const { id } = await seedProject();
+    const missing = await PREVIEW_GET(makeRequest(`http://localhost/api/projects/${id}/preview`, {}, SESSION_A), idCtx(id));
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get('content-type')).toContain('text/html');
+    const html = await missing.text();
+    expect(html).toContain('预览不可用');
+    expect(html).toContain('index.html');
+
+    // 未授权 / 他人 id（归属不符同样 404）
+    const foreign = await PREVIEW_GET(makeRequest(`http://localhost/api/projects/${id}/preview`, {}, SESSION_B), idCtx(id));
+    expect(foreign.status).toBe(404);
+    expect(foreign.headers.get('content-type')).toContain('text/html');
+    expect(await foreign.text()).toContain('预览不可用');
   });
 });
 
@@ -643,6 +662,68 @@ describe('POST /api/projects/[id]/checkpoints/[cpId]/restore', () => {
 /* ------------------------------------------------------------------ */
 /* 补充：列表 / 快照 / messages / DELETE / rename                        */
 /* ------------------------------------------------------------------ */
+
+describe('seed 模板画廊（T25 R1：union 可见 + 打开即克隆）', () => {
+  /** 造 2 个 seed 模板 + 1 个当前会话项目；返回 { 本会话项目 id, seed 模板 ids } */
+  async function seedTemplates(): Promise<{ mineId: number; seedIds: number[] }> {
+    const s1 = await storage().createProject({ sessionId: 'seed', title: '待办清单应用', requirement: '做一个待办清单', mode: 'fast' });
+    await storage().upsertFile({ projectId: s1.id, path: 'app/frontend/index.html', content: '<p>todo</p>', editor: 'seed' });
+    const s2 = await storage().createProject({ sessionId: 'seed', title: '团队数据看板', requirement: '做一个看板', mode: 'fast' });
+    const mine = await storage().createProject({ sessionId: SESSION_A, title: '我的项目', requirement: 'r', mode: 'fast' });
+    liveProjectIds.add(s1.id);
+    liveProjectIds.add(s2.id);
+    liveProjectIds.add(mine.id);
+    seenProjectIds.add(s1.id);
+    seenProjectIds.add(s2.id);
+    seenProjectIds.add(mine.id);
+    return { mineId: mine.id, seedIds: [s1.id, s2.id] };
+  }
+
+  it('seed 卡片对所有会话可见（排在用户项目之后，带 isSeed 标记）', async () => {
+    const { mineId, seedIds } = await seedTemplates();
+    const response = await LIST_GET(makeRequest('http://localhost/api/projects', {}, SESSION_A));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { projects: Array<{ id: number; isSeed?: boolean; title: string }> };
+    // 用户项目在前，seed 模板行追加在末尾（模板内部仍按 updatedAt 倒序）
+    expect(body.projects[0]?.id).toBe(mineId);
+    expect(body.projects.slice(1).map((p) => p.id)).toEqual([...seedIds].sort((a, b) => b - a));
+    expect(body.projects.slice(1).map((p) => p.isSeed)).toEqual([true, true]);
+    expect(new Set(body.projects.slice(1).map((p) => p.title))).toEqual(new Set(['待办清单应用', '团队数据看板']));
+  });
+
+  it('GET open：seed 模板克隆到当前会话并 302 到副本（新访客顺带发会话 cookie）', async () => {
+    const { seedIds } = await seedTemplates();
+    const seedId = seedIds[0];
+    if (seedId === undefined) throw new Error('seed 模板缺失');
+
+    // 新访客：无 cookie
+    const response = await OPEN_GET(makeRequest(`http://localhost/api/projects/${seedId}/open`, {}, undefined), idCtx(seedId));
+    expect(response.status).toBe(302);
+    const location = response.headers.get('location');
+    expect(location).toContain('/p/');
+    expect(response.headers.get('set-cookie')).toContain(SESSION_COOKIE);
+
+    const copyId = Number((location ?? '').split('/p/')[1]);
+    expect(Number.isFinite(copyId)).toBe(true);
+    const copy = await storage().getProject(copyId);
+    expect(copy?.sessionId).not.toBe('seed');
+    expect(copy?.title).toContain('示例副本');
+    expect((await storage().readAllFiles(copyId)).map((f) => f.path)).toContain('app/frontend/index.html');
+    // seed 原件不被占有
+    expect((await storage().getProject(seedId))?.sessionId).toBe('seed');
+  });
+
+  it('GET open：普通项目 302 到自身（不克隆）；不存在 404', async () => {
+    const { mineId } = await seedTemplates();
+    const own = await OPEN_GET(makeRequest(`http://localhost/api/projects/${mineId}/open`, {}, SESSION_A), idCtx(mineId));
+    expect(own.status).toBe(302);
+    expect(own.headers.get('location')).toContain(`/p/${mineId}`);
+    expect(await storage().countProjects()).toBe(3);
+
+    const missing = await OPEN_GET(makeRequest('http://localhost/api/projects/424242/open', {}, SESSION_A), idCtx(424242));
+    expect(missing.status).toBe(404);
+  });
+});
 
 describe('GET /api/projects（列表 + 最近会话）', () => {
   it('按 session 过滤；recent 参数 clamp 上限 50；非法 recent 400', async () => {

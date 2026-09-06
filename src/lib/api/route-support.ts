@@ -12,7 +12,7 @@ import { resolveSession, type ResolvedSession } from '@/lib/session';
 import type { Project, StorageProvider } from '@/lib/db/provider/types';
 
 /** 会话工具转发出口：路由文件统一从本模块拿（session.ts 是唯一实现） */
-export { applySessionCookie } from '@/lib/session';
+export { applySessionCookie, resolveSession } from '@/lib/session';
 
 /** 全部 agent 角色（与 provider/types 的 AgentRole 保持一致；mentions 校验用） */
 export const agentRoleSchema = z.enum(['leader', 'pm', 'architect', 'engineer', 'analyst', 'seo', 'ads']);

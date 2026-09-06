@@ -283,7 +283,13 @@ describe('软锁裁决', () => {
     stop();
 
     expect(await pendingCheck).toBe(true); // 未在锁定文件边界被吞
-    expect(events.some((e) => e.event === 'intervention_injected' && e.meta?.targetTask === `engineer:${LOCKED_PATH}`)).toBe(false);
+    // 排队指令没有在锁定文件边界被消费（裁决自身的注入事件不算——它消费的是裁决回复，T25 起
+    // 裁决消费也发 intervention_injected，故此处必须按内容区分，不能只看 targetTask）
+    expect(
+      events.some(
+        (e) => e.event === 'intervention_injected' && (e.content ?? '').includes('空态提示') && e.meta?.targetTask === `engineer:${LOCKED_PATH}`,
+      ),
+    ).toBe(false);
 
     // 下一文件边界正常注入：事件指向 index.html、指令进入其任务上下文
     const injected = mustFind(events, (e) => e.event === 'intervention_injected' && (e.content ?? '').includes('空态提示'));
@@ -297,6 +303,28 @@ describe('软锁裁决', () => {
     const messages = await storage.listMessages(projectId);
     expect(messages.find((m) => m.role === 'intervention' && m.content.includes('空态提示'))?.deliveredAt).not.toBeNull();
     expect(events.at(-1)?.event).toBe('done');
+  }, 30000);
+
+  it('⑦ 裁决消费发 intervention_injected 事件并落库 targetTask（队列卡实时翻转，T25）', async () => {
+    const { storage, projectId } = await newProjectWithLock();
+    storageRef = storage;
+    const { events, stop } = collectEvents(projectId);
+    const off = replyOnRuling(projectId, '跳过');
+
+    await runRound(storage, projectId);
+    off();
+    stop();
+
+    // 裁决回复被消费 → 必须有对应注入事件（前端队列卡据此从「排队中」翻转为已消费）
+    const reply = (await storage.listMessages(projectId)).find(
+      (m) => m.role === 'intervention' && m.content === '跳过',
+    );
+    expect(reply?.deliveredAt).not.toBeNull();
+    const injected = mustFind(events, (e) => e.event === 'intervention_injected' && e.meta?.messageId === reply?.id);
+    expect(injected.meta?.targetTask).toBe(`engineer:${LOCKED_PATH}`);
+
+    // 落库同样带 targetTask：刷新后队列卡仍显示消费边界对应的文件
+    expect(reply?.meta?.targetTask).toBe(`engineer:${LOCKED_PATH}`);
   }, 30000);
 });
 
@@ -344,6 +372,44 @@ describe('文件级干预注入', () => {
     const messages = await storage.listMessages(projectId);
     const intervention = messages.find((m) => m.role === 'intervention');
     expect(intervention?.deliveredAt).not.toBeNull();
+    // 持久化 meta 同时带 path（文件级注入折算自 targetTask）：刷新后「已注入 {文件}」仍可还原
+    expect(intervention?.meta?.path).toBe('app/frontend/index.html');
+  }, 30000);
+
+  it('⑤b 注入打戳把 targetTask 写进消息 meta（刷新后「已注入 {文件}」不再降级，T25）', async () => {
+    const { storage, projectId } = await newProjectWithLock();
+    storageRef = storage;
+    // 先解除软锁：本用例只关心任务边界注入路径
+    const locked = await storage.getFile(projectId, LOCKED_PATH);
+    if (locked !== null) await storage.setSoftLock(projectId, locked.id, false);
+
+    const { events, stop } = collectEvents(projectId);
+    // 任务边界（第一个任务开跑前）排队干预 → 会在 pm 任务边界注入
+    const off = projectEventBus.subscribe(projectId, (event) => {
+      if (event.event === 'message' && event.meta?.role === 'user') {
+        void storageRef
+          .addMessage({ projectId, role: 'intervention', content: 'PRD 必须包含埋点需求', meta: { mentions: ['pm'] } })
+          .catch((error: unknown) => console.error('[colab.test] 干预写入失败：', error));
+      }
+    });
+
+    await runRound(storage, projectId);
+    off();
+    stop();
+
+    const injected = mustFind(
+      events,
+      (e) => e.event === 'intervention_injected' && (e.content ?? '').includes('埋点需求'),
+    );
+    expect(injected.meta?.targetTask).toBe('pm-prd');
+
+    // 打戳必须连同 targetTask 一起落库：刷新后从快照读 meta 仍能还原「已注入 {文件}」
+    const messages = await storage.listMessages(projectId);
+    const row = messages.find((m) => m.role === 'intervention' && m.content.includes('埋点需求'));
+    expect(row?.deliveredAt).not.toBeNull();
+    expect(row?.meta?.targetTask).toBe('pm-prd');
+    // mentions 不因补写 targetTask 丢失（原 meta 合并而非覆盖）
+    expect(row?.meta?.mentions).toEqual(['pm']);
   }, 30000);
 });
 

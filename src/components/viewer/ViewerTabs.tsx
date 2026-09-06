@@ -233,7 +233,7 @@ function EditorFlag({ editor }: { editor: FileEditor }): React.ReactElement {
     <span
       aria-hidden
       title={editorLabel(editor)}
-      className={cn('font-mono text-[10px] font-bold', isAgent ? 'text-brand' : 'text-emerald-600')}
+      className={cn('font-mono text-[10px] font-bold', isAgent ? 'text-brand' : 'text-human')}
     >
       M
     </span>
@@ -275,7 +275,10 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
-  const [conflictWith, setConflictWith] = useState<string | null>(null);
+  /** 409 冲突上下文：服务端当前内容（并排 diff）+ 当前版本号（「用我的」就地重发用，T25） */
+  const [conflictWith, setConflictWith] = useState<{ current: string; version: number } | null>(null);
+  /** 拒存提示（流式生成中保存被拒；内联展示，不吞草稿） */
+  const [blockedNotice, setBlockedNotice] = useState<string | null>(null);
 
   // 事件回调里要用最新版本号（SSE 随时可能推进），经 ref 取当前值
   const fileRef = useRef(file);
@@ -290,6 +293,7 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
     setEditing(false);
     setDraft('');
     setConflictWith(null);
+    setBlockedNotice(null);
   }, []);
 
   // 软锁生命周期 = 编辑态生命周期（进入声明，取消/保存/卸载释放；锁自身还有 TTL 兜底）
@@ -302,21 +306,29 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
   }, [editing, fileId, projectId]);
 
   const persist = useCallback(
-    async (content: string): Promise<void> => {
+    async (content: string, baseVersionOverride?: number): Promise<void> => {
       const current = fileRef.current;
       const currentId = current.id;
       if (currentId === null) return;
+      // 流式拒存（T25）：agent 正在重写同一文件时保存必然互相覆盖，CAS 也一定会拒——
+      // 直接拒存并提示，草稿与编辑态保留，生成结束后用户可原样重发
+      if (current.streaming) {
+        setBlockedNotice('该文件正在生成中，请稍候');
+        toast.error('该文件正在生成中，请稍候');
+        return;
+      }
       setSaving(true);
       try {
-        const result = await saveHumanFile(projectId, currentId, content, current.version);
+        const baseVersion = baseVersionOverride ?? current.version;
+        const result = await saveHumanFile(projectId, currentId, content, baseVersion);
         if (result.ok) {
           // 人工写不发 SSE：store 必须就地推进，否则回显旧内容、二次编辑用过期版本必 409
           store.applyHumanSave(path, { content, version: result.version });
           leaveEditing();
           return;
         }
-        // CAS 失败：agent 已写入新版本 → 冲突对话框（带上服务端当前内容供并排对比）
-        setConflictWith(result.current);
+        // CAS 失败：agent 已写入新版本 → 冲突对话框（内容供并排对比，版本号供「用我的」重发）
+        setConflictWith({ current: result.current, version: result.version });
       } catch (error) {
         console.error('[viewer] 人工保存失败：', error);
         toast.error(error instanceof Error ? error.message : '保存失败，请稍后重试');
@@ -327,9 +339,14 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
     [projectId, leaveEditing, store, path],
   );
 
+  /**
+   * 「用我的版本」：取「409 回带的服务端版本号」与「store 当前版本号」的较大者重发——
+   * SSE 断连期间只有 409 体能推进（T25），SSE 正常时 store 可能已被更新的 file_end 推进。
+   */
   const handleKeepMine = (): void => {
+    const known = Math.max(conflictWith?.version ?? 0, fileRef.current.version);
     setConflictWith(null);
-    void persist(draft);
+    void persist(draft, known > 0 ? known : undefined);
   };
 
   const body = useMemo(() => {
@@ -362,6 +379,11 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
         ) : null}
 
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {blockedNotice !== null && (
+            <span role="alert" className="shrink-0 text-[11px] text-amber-700">
+              {blockedNotice}
+            </span>
+          )}
           {editing ? (
             <>
               <Button
@@ -418,7 +440,7 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
           if (!open) setConflictWith(null);
         }}
         mine={draft}
-        theirs={conflictWith ?? ''}
+        theirs={conflictWith?.current ?? ''}
         onKeepMine={handleKeepMine}
         onUseTheirs={leaveEditing}
       />

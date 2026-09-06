@@ -178,7 +178,7 @@ export function createFilesRepo(db: SqliteDb): FilesRepo {
     async saveHuman(input: SaveHumanInput): Promise<SaveHumanResult> {
       const current = await getFileRowById(input.projectId, input.fileId);
       // 文件不存在（或归属不符）同样走冲突分支：current 置空串，前端按空内容渲染
-      if (!current) return { ok: false, conflict: true, current: '' };
+      if (!current) return { ok: false, conflict: true, current: '', version: 0 };
 
       const version = overwriteWithArchive(
         input.fileId,
@@ -188,9 +188,9 @@ export function createFilesRepo(db: SqliteDb): FilesRepo {
         { content: input.content, lastEditor: 'human' },
       );
       if (version === null) {
-        // CAS 失败：回读服务端当前内容供冲突对话框（并排 diff）使用
+        // CAS 失败：回读服务端当前内容与版本号供冲突对话框（并排 diff / 用我的版本就地重发）
         const latest = await getFileRowById(input.projectId, input.fileId);
-        return { ok: false, conflict: true, current: latest?.content ?? '' };
+        return { ok: false, conflict: true, current: latest?.content ?? '', version: latest?.version ?? 0 };
       }
       return { ok: true, version };
     },

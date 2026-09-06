@@ -11,6 +11,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { FRONTEND_INDEX_PATH, PreviewPane } from '@/components/preview/PreviewPane';
+// 服务端镜像常量（服务端专用模块，但无服务端依赖——仅类型 import，测试内引用安全）
+import { PREVIEW_INDEX_PATH } from '@/lib/preview/assemble';
 
 const PROJECT_ID = 12;
 const PREVIEW_PATH = `/api/projects/${PROJECT_ID}/preview`;
@@ -32,6 +34,16 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+});
+
+/* ------------------------------------------------------------------ */
+/* 契约常量一致性                                                       */
+/* ------------------------------------------------------------------ */
+
+describe('前端入口路径镜像常量', () => {
+  it('客户端 FRONTEND_INDEX_PATH 与服务端 PREVIEW_INDEX_PATH 逐字一致（漂移即预览占位误判）', () => {
+    expect(FRONTEND_INDEX_PATH).toBe(PREVIEW_INDEX_PATH);
+  });
 });
 
 /* ------------------------------------------------------------------ */
