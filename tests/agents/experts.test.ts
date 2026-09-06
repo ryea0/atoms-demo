@@ -324,14 +324,17 @@ describe('runCloser：MEMORY + PROGRESS 领导汇报段', () => {
       provider: captureProvider,
       roundOutcome: {
         succeeded: 2,
+        skipped: 1,
         failed: [{ taskKey: 'user-engineer-0', reason: '单文件任务执行失败：provider 连续两次不可用。' }],
       },
     });
 
     const joined = prompts.join('\n');
     expect(joined).toContain('【本轮结果】');
-    expect(joined).toContain('成功 2 项、失败 1 项');
+    expect(joined).toContain('成功 2 项、失败 1 项、跳过 1 项');
     expect(joined).toContain('user-engineer-0——单文件任务执行失败');
+    // 跳过=级联后果，与根因失败分开陈述（T34）
+    expect(joined).toContain('级联');
     // 反谎报要求：存在失败项时必须如实列出，不得声称所有任务均已成功完成
     expect(joined).toContain('如实');
     expect(joined).toContain('不得声称所有任务均已成功完成');
@@ -356,11 +359,12 @@ describe('runCloser：MEMORY + PROGRESS 领导汇报段', () => {
       },
     };
 
-    await runCloser({ storage, projectId, provider: captureProvider, roundOutcome: { succeeded: 3, failed: [] } });
+    await runCloser({ storage, projectId, provider: captureProvider, roundOutcome: { succeeded: 3, skipped: 0, failed: [] } });
 
     const joined = prompts.join('\n');
     expect(joined).toContain('【本轮结果】');
     expect(joined).toContain('成功 3 项、失败 0 项');
+    expect(joined).not.toContain('跳过');
     expect(joined).not.toContain('失败：');
     expect(joined).not.toContain('不得声称所有任务均已成功完成');
   });

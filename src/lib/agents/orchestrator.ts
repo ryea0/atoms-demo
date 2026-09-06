@@ -606,7 +606,18 @@ async function emitAgentFailureReport(
 ): Promise<void> {
   const content = `❌ ${roleRegistry[task.agent].name}：${AGENT_TASK_NOUN[task.agent]}未完成——${errorFirstSentence(message)}`;
   const meta: MessageMeta = { kind: 'agent-report', agent: task.agent, status: 'failed' };
-  const row = await storage.addMessage({ projectId, role: 'assistant', content, meta });
+  let row: Message;
+  try {
+    row = await storage.addMessage({ projectId, role: 'assistant', content, meta });
+  } catch (error) {
+    // 取舍（T34）：失败通报是任务级失败的**可见化增强**，不是关键路径。此处运行在任务级 catch
+    // 内部，落库失败若再向上抛，会被顶层 catch 收成「整轮 failed」——单任务失败被升级成整轮失败。
+    // 所以只 console.error 留痕（不静默吞），整轮照常收口；直播侧的失败可见性已由任务级
+    // error 事件兜住，也不再补发无 messageId 的 message 事件（前端按正数 id 去重，
+    // 缺 id 的消息在断线重放时会重复渲染）。
+    console.error(`[orchestrator] 失败通报落库失败（projectId=${projectId}，taskKey=${task.taskKey}）：`, error);
+    return;
+  }
   emit({
     runId,
     event: 'message',
@@ -784,6 +795,8 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
     // 侧要求如实汇报失败项
     const roundOutcome: CloserRoundOutcome = {
       succeeded: [...taskOutcome.values()].filter((status) => status === 'done').length,
+      // 跳过=被失败级联波及的任务（T34）：单列口径，closer 侧与根因失败分开陈述
+      skipped: [...taskOutcome.values()].filter((status) => status === 'skipped').length,
       failed: [...failedReasons].map(([taskKey, message]) => ({ taskKey, reason: errorFirstSentence(message) })),
     };
     const closer = await runCloser({
@@ -888,35 +901,37 @@ async function dispatchArchitect(c: TaskContext, round: RoundState): Promise<Tas
 /**
  * 工程师树解析：本轮架构师树 → 库里持久化树（迭代轮次）→ 快速模式内置模板树；
  * 完整模式全无 → null（由 dispatchEngineer 走降级兜底，T33 A）。
+ * 快速模式两条模板入口（①本轮架构师树空回退 ②库里无持久化树）不走裸模板：
+ * 与 ③full 降级兜底共用 filteredFastTemplateTree 出口——三条模板入口同一防覆写纪律（T34）。
  */
 async function resolveEngineerTree(c: TaskContext, round: RoundState): Promise<FileTree | null> {
   if (round.architectRan) {
     if (round.tree !== null && round.tree.length > 0) return round.tree;
-    return c.mode === 'fast' ? buildFastFileTree(c.project.requirement) : null;
+    return c.mode === 'fast' ? filteredFastTemplateTree(c) : null;
   }
   const row = await c.storage.getFile(c.projectId, FILE_TREE_PATH);
   if (row !== null) {
     const parsed = parseFileTree(row.content);
     if (parsed.ok && parsed.tree.length > 0) return parsed.tree;
   }
-  return c.mode === 'fast' ? buildFastFileTree(c.project.requirement) : null;
+  return c.mode === 'fast' ? filteredFastTemplateTree(c) : null;
 }
 
 /**
- * 树降级兜底（T33 A）：架构师没给出树（真模型在 @直派单发语境会跳过 docs/file_tree.json）
- * 时不再让整轮无声地死掉——按内置模板树（buildFastFileTree）补缺派发。
+ * 快速模式内置模板树的统一出口（三条模板入口同一防覆写纪律，T33 A / T34）：
+ * ①fast 本轮架构师树空回退 ②fast 库里无持久化树 ③full 模式架构师全无树的降级兜底。
  *
  * 语义（安全关键）：
- * - 模板树是**通用骨架**，直接 upsert 会把迭代轮里已生成的应用文件整个毁掉——所以只补
- *   「库里还没有的路径」，files 表已存在的路径一律跳过（幂等，不覆盖既有产出）；
- * - 过滤后为空 → 任务正常完成、summary 写「目标文件均已存在，无需新写」（幂等语义，
- *   重跑同轮不再有副作用）；
- * - 非空 → 正常逐文件派发，PROGRESS 留 ⚠ 行说明降级事实（不静默吞，CLAUDE.md 编码约定）。
+ * - 模板树是**通用骨架**，直接 upsert 会把迭代轮里已生成的应用文件整个毁掉——
+ *   round.producedThisRound 只做轮内去重、拦不住跨轮，所以只保留「库里还没有的路径」，
+ *   files 表已存在的路径一律过滤（幂等，不覆盖既有产出；单文件重试走 regenerateFile，不经此处）；
+ * - 过滤后为空 → 调用方按 T33 语义幂等完成（不写任何文件，summary 写「目标文件均已存在」）；
+ * - 非空（仅降级兜底入口）→ 正常逐文件派发，PROGRESS 留 ⚠ 行说明降级事实（不静默吞）。
  *
- * 降级是编排器的确定性兜底（CLAUDE.md 规则 1：执行侧的可靠性代码，不是替模型做设计决策）；
+ * 补缺是编排器的确定性兜底（CLAUDE.md 规则 1：执行侧的可靠性代码，不是替模型做设计决策）；
  * 架构师产出 file_tree 的硬保证（输出后校验+带错重试）另行挂账，不在此处。
  */
-async function fallbackEngineerTree(c: TaskContext): Promise<FileTree> {
+async function filteredFastTemplateTree(c: TaskContext): Promise<FileTree> {
   const existing = new Set((await c.storage.listFiles(c.projectId)).map((row) => row.path));
   return buildFastFileTree(c.project.requirement).filter((node) => !existing.has(node.path));
 }
@@ -937,19 +952,21 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
 
   let tree = await resolveEngineerTree(c, round);
   if (tree === null) {
-    // 降级兜底（T33 A）：full 模式全无树 → 内置模板树补缺（只写库里还没有的路径）
-    tree = await fallbackEngineerTree(c);
-    if (tree.length === 0) {
-      // 模板文件全部已存在：幂等完成，不写任何文件（避免迭代轮被骨架覆盖）
-      const summary = '目标文件均已存在，无需新写（架构师未产出 file_tree，内置模板树全部命中既有文件）';
-      c.emit({ runId: null, event: 'agent_end', agent: 'engineer', summary });
-      return { runId: null, summary, files: [] };
+    // 降级兜底（T33 A）：full 模式全无树 → 内置模板树补缺（与 fast 模板入口同一过滤出口，T34）
+    tree = await filteredFastTemplateTree(c);
+    if (tree.length > 0) {
+      await appendProgressLine(
+        storage,
+        projectId,
+        `- ⚠ 架构师未产出 file_tree，按内置模板树降级（新写 ${tree.length} 个文件）`,
+      );
     }
-    await appendProgressLine(
-      storage,
-      projectId,
-      `- ⚠ 架构师未产出 file_tree，按内置模板树降级（新写 ${tree.length} 个文件）`,
-    );
+  }
+  if (tree.length === 0) {
+    // 三条模板入口过滤后无缺可补：幂等完成，不写任何文件（避免迭代轮被骨架覆盖，T33 A / T34）
+    const summary = '目标文件均已存在，无需新写（内置模板树全部命中既有文件）';
+    c.emit({ runId: null, event: 'agent_end', agent: 'engineer', summary });
+    return { runId: null, summary, files: [] };
   }
 
   // 交接摘要基线：PM/架构师 run.summary + 任务边界干预指令（规则 7：summary 是唯一交接物）
