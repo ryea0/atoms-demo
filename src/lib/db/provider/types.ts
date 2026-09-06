@@ -17,11 +17,12 @@ export interface Project { id:number; sessionId:string; title:string; requiremen
   mode:'fast'|'full'; status:ProjectStatus; createdAt:number; updatedAt:number; }
 
 /**
- * 消息元数据：mentions=@ 指定成员；kind 标记特殊聊天卡片（softlock=软锁裁决 / restore=回滚通知）、
- * path 为关联文件路径、targetTask 为干预注入边界对应的任务键（`engineer:{path}`，T25）——
- * 随消息落库（T23/T25），刷新后前端仍能还原裁决卡片与「已注入 {文件}」队列卡。
+ * 消息元数据：mentions=@ 指定成员；kind 标记特殊聊天卡片（softlock=软锁裁决 / restore=回滚通知 /
+ * agent-report=@直派成员的自身汇报，T32）、path 为关联文件路径、targetTask 为干预注入边界对应的
+ * 任务键（`engineer:{path}`，T25）、agent 为消息归属角色（agent-report 据此渲染成员徽章）——
+ * 随消息落库（T23/T25/T32），刷新后前端仍能还原裁决卡片、「已注入 {文件}」队列卡与成员徽章。
  */
-export interface MessageMeta { mentions?:AgentRole[]; kind?:string; path?:string; targetTask?:string; }
+export interface MessageMeta { mentions?:AgentRole[]; kind?:string; path?:string; targetTask?:string; agent?:AgentRole; }
 
 export interface Message { id:number; projectId:number; role:'user'|'assistant'|'intervention'|'system';
   content:string; meta?:MessageMeta|null; deliveredAt:number|null; createdAt:number; }

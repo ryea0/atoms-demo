@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { ChatPanel } from '@/components/chat/ChatPanel';
+import { MessageList } from '@/components/chat/MessageList';
 import {
   clearWorkspaceStores,
   createWorkspaceStore,
@@ -191,6 +192,47 @@ describe('消息流渲染', () => {
     );
     expect(screen.getByText(/领导汇报/)).toBeInTheDocument();
     expect(screen.getByText('全部任务已完成，可点击预览查看应用')).toBeInTheDocument();
+  });
+
+  it('agent-report 消息渲染成员归属徽章（T32），不触发领导汇报卡样式', () => {
+    // 直接渲染 MessageList：ChatInput 常驻的成员 chips 也带角色名，会干扰精确匹配
+    render(
+      createElement(MessageList, {
+        messages: [
+          msg('assistant', '✅ 产品经理：PRD 撰写已完成。产物已写入 docs/prd.md。', {
+            meta: { kind: 'agent-report', agent: 'pm', path: 'docs/prd.md' },
+          }),
+          msg('assistant', '全部任务已完成，可点击预览查看应用'),
+        ],
+        files: new Map<string, WorkspaceFile>(),
+        runs: [],
+        finished: true,
+        running: false,
+        onSend: async () => true,
+      }),
+    );
+    // 角色徽章：成员中文名以独立元素出现（普通正文气泡是整句，不会精确命中）
+    expect(screen.getByText('产品经理')).toBeInTheDocument();
+    expect(screen.getByText('📋')).toBeInTheDocument();
+    expect(screen.getByText(/✅ 产品经理：PRD 撰写已完成/)).toBeInTheDocument();
+    // 收尾卡启发式只命中最后一条（领导收尾），agent-report 消息不触发「领导汇报」标签
+    expect(screen.getAllByText(/领导汇报/)).toHaveLength(1);
+  });
+
+  it('agent-report 消息缺 agent 元数据时仍渲染正文（防御性降级，不出徽章）', () => {
+    render(
+      createElement(MessageList, {
+        messages: [msg('assistant', '✅ 数据分析师：数据分析已完成。', { meta: { kind: 'agent-report' } })],
+        files: new Map<string, WorkspaceFile>(),
+        runs: [],
+        finished: false,
+        running: false,
+        onSend: async () => true,
+      }),
+    );
+    expect(screen.getByText(/✅ 数据分析师：数据分析已完成/)).toBeInTheDocument();
+    expect(screen.queryByText('📊')).not.toBeInTheDocument();
+    expect(screen.queryByText(/领导汇报/)).not.toBeInTheDocument();
   });
 });
 

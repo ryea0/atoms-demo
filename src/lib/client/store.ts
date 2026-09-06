@@ -176,7 +176,8 @@ function isAgentRole(value: unknown): value is AgentRole {
 
 /**
  * 消息 meta 组装（T19 卡片还原的数据源）：mentions 之外保留卡片语义——
- * - kind=softlock/restore、path=关联文件（领导裁决/回滚通知卡）
+ * - kind=softlock/restore/agent-report、path=关联文件（领导裁决/回滚通知卡、成员自身汇报的产物路径）
+ * - agent=消息归属角色（agent-report 据此渲染成员徽章，T32）
  * - intervention_injected 的 targetTask（T23 保证指向真实运行的任务，格式 `engineer:{path}`）
  *   折算成 path，聊天区「已注入 {文件}」卡片据此显示注入边界对应的文件
  * 事件里没有这些语义时返回 null（不写空 meta）。
@@ -184,6 +185,8 @@ function isAgentRole(value: unknown): value is AgentRole {
 function messageMetaOf(event: StreamEvent, mentions: AgentRole[]): MessageMeta | null {
   const meta: MessageMeta = {};
   if (typeof event.meta?.kind === 'string' && event.meta.kind !== '') meta.kind = event.meta.kind;
+  const rawAgent = event.meta?.agent;
+  if (isAgentRole(rawAgent)) meta.agent = rawAgent;
   if (typeof event.meta?.path === 'string' && event.meta.path !== '') {
     meta.path = event.meta.path;
   } else if (event.event === 'intervention_injected') {

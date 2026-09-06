@@ -502,10 +502,11 @@ describe('startGeneration（mock 全链路）', () => {
 
     expect(Math.max(...seoSeqs)).toBeLessThan(firstDone.seq);
     expect(firstDone.seq).toBeLessThan(Math.min(...adsSeqs));
-    // 两轮都各自收尾：两条 assistant 汇报、两个 done
+    // 两轮都各自收尾：两条 assistant 汇报、两个 done。@ 直派任务各补一条成员自身汇报
+    // （T32 b 方案：seo 轮 + ads 轮各 1 条 agent-report）+ 1 条领导收尾 = 每轮 2 条
     expect(events.filter((e) => e.event === 'done').length).toBe(2);
     const messages = await storage.listMessages(projectId);
-    expect(messages.filter((m) => m.role === 'assistant').length).toBe(2);
+    expect(messages.filter((m) => m.role === 'assistant').length).toBe(4);
   });
 
   it('⑦ closer 汇报成为 assistant message（独立 @ 快速轮）', async () => {
@@ -613,6 +614,65 @@ describe('startGeneration（mock 全链路）', () => {
     const messages = await storage.listMessages(projectId);
     const pending = messages.filter((m) => m.role === 'intervention' && m.deliveredAt === null);
     expect(pending).toHaveLength(0);
+  }, 30000);
+
+  it('⑫ @直派成员自身名义汇报（T32）：任务级 agent_end 之后补一条 agent-report 消息（agent 归属 + messageId + 主产出路径）', async () => {
+    const { storage, projectId } = await newProject('fast');
+    const { events, stop } = collectEvents(projectId);
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: '出一份 PRD',
+      mode: 'fast',
+      mentions: ['pm'],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    // 聊天事件：agent 字段指向被 @ 的成员（不是 leader）、messageId 回带（前端按正数 id 去重）
+    const report = mustFind(events, (e) => e.event === 'message' && e.meta?.kind === 'agent-report');
+    expect(report.agent).toBe('pm');
+    expect(report.meta?.messageId).toBeGreaterThan(0);
+    expect(report.meta?.path).toBe('docs/prd.md');
+    // 正文形状：✅ + 角色中文名 + 完成语 + 主产出路径
+    expect(report.content ?? '').toContain('✅');
+    expect(report.content ?? '').toContain('产品经理');
+    expect(report.content ?? '').toContain('docs/prd.md');
+
+    // 落库：assistant 行 + meta（kind/agent/path），刷新后徽章与路径仍可还原
+    const persisted = (await storage.listMessages(projectId)).find((m) => m.id === report.meta?.messageId);
+    expect(persisted?.role).toBe('assistant');
+    expect(persisted?.meta?.kind).toBe('agent-report');
+    expect(persisted?.meta?.agent).toBe('pm');
+    expect(persisted?.meta?.path).toBe('docs/prd.md');
+
+    // 时序：在该任务的 agent_end 之后、领导收尾汇报之前（领导收尾卡仍是最后一条 assistant）
+    const agentEndSeq = mustFind(events, (e) => e.event === 'agent_end' && e.agent === 'pm').seq;
+    expect(report.seq).toBeGreaterThan(agentEndSeq);
+    const closingSeq = mustFind(events, (e) => e.event === 'message' && (e.agent === 'leader' && (e.content ?? '').includes('领导汇报'))).seq;
+    expect(report.seq).toBeLessThan(closingSeq);
+    // 领导收尾汇报保留不动（多任务轮聚合视角）
+    expect(events.some((e) => e.event === 'message' && (e.content ?? '').includes('领导汇报'))).toBe(true);
+  }, 30000);
+
+  it('⑬ 非 @直派任务不产生 agent-report 消息（T32：只有 user- 前缀任务键才补自身汇报）', async () => {
+    const { storage, projectId } = await newProject('full');
+    const { events, stop } = collectEvents(projectId);
+
+    await startGeneration({
+      storage,
+      projectId,
+      userMessage: REQUIREMENT,
+      mode: 'full',
+      mentions: [],
+      signal: new AbortController().signal,
+    });
+    stop();
+
+    expect(events.some((e) => e.meta?.kind === 'agent-report')).toBe(false);
+    // 领导收尾汇报照旧
+    expect(events.some((e) => e.event === 'message' && (e.content ?? '').includes('领导汇报'))).toBe(true);
   }, 30000);
 
   it('⑨ 排队轮的请求断开不越界：只停本轮，在跑轮照常完成到 done', async () => {
