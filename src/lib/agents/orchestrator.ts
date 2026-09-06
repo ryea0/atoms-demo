@@ -16,12 +16,14 @@
 import { projectEventBus, type StreamEvent } from '@/lib/agents/events';
 import { roleRegistry } from '@/lib/agents/registry';
 import {
+  addTaskSubtasks,
   appendProgressLine,
   fileDoneLine,
   fileFailedLine,
   filePausedLine,
   fileResumedLine,
   fileSkippedLine,
+  markFileLine,
   markTaskLine,
   startRoundPlan,
   taskDoneLine,
@@ -34,7 +36,7 @@ import { isAbortError } from '@/lib/agents/roles/run-support';
 import { normalizePreferences } from '@/lib/settings/types';
 import { routeLeader, type TaskAssignment } from '@/lib/agents/roles/leader';
 import { PRD_PATH, runPm } from '@/lib/agents/roles/pm';
-import { FILE_TREE_PATH, parseFileTree, runArchitect } from '@/lib/agents/roles/architect';
+import { ARCHITECT_DOC_PATHS, FILE_TREE_PATH, parseFileTree, runArchitect } from '@/lib/agents/roles/architect';
 import { buildFastFileTree, runEngineerFile, runEngineerReview, type FileTree } from '@/lib/agents/roles/engineer';
 import { EXPERT_REPORT_PATHS, runExpert, type ExpertRole } from '@/lib/agents/roles/experts';
 import { runCloser, type CloserRoundOutcome } from '@/lib/agents/roles/closer';
@@ -447,7 +449,7 @@ async function negotiateSoftLock(c: TaskContext, path: string): Promise<boolean>
     content: question.content,
     meta: { role: 'assistant', kind: 'softlock', path, messageId: question.id },
   });
-  await appendProgressLine(storage, projectId, filePausedLine(path));
+  await markFileLine(storage, projectId, c.plan, path, filePausedLine(path));
 
   const ruling = await awaitSoftLockRuling(c, path);
   if (ruling === 'later') return false; // 不动：文件任务保持挂起状态收场
@@ -469,7 +471,7 @@ async function negotiateSoftLock(c: TaskContext, path: string): Promise<boolean>
       },
       projectId,
     );
-    await appendProgressLine(storage, projectId, fileSkippedLine(path));
+    await markFileLine(storage, projectId, c.plan, path, fileSkippedLine(path));
     return false;
   }
 
@@ -477,7 +479,7 @@ async function negotiateSoftLock(c: TaskContext, path: string): Promise<boolean>
   // 释放是裁决的一部分——用户已选择放弃未保存修改，锁留着只会让下一文件边界再问一遍。
   const row = await storage.getFile(projectId, path);
   if (row !== null) await storage.setSoftLock(projectId, row.id, false);
-  await appendProgressLine(storage, projectId, fileResumedLine(path));
+  await markFileLine(storage, projectId, c.plan, path, fileResumedLine(path));
   return true;
 }
 
@@ -868,6 +870,8 @@ function dispatchTask(c: TaskContext, round: RoundState): Promise<TaskDispatchRe
 async function dispatchPm(c: TaskContext, round: RoundState): Promise<TaskDispatchResult> {
   const { storage, projectId, task } = c;
   c.emit({ runId: null, event: 'agent_start', agent: 'pm', meta: { taskKey: task.taskKey } });
+  // 子任务拆解：交付物路径事前可知，先登记复选框、完成时打勾
+  await addTaskSubtasks(storage, projectId, c.plan, task.taskKey, [PRD_PATH]);
   const requirement = appendInterventions(pmRequirementText(c.project, c.userMessage), c.interventions);
 
   c.emit({ runId: null, event: 'file_start', agent: 'pm', path: PRD_PATH });
@@ -882,6 +886,7 @@ async function dispatchPm(c: TaskContext, round: RoundState): Promise<TaskDispat
   });
   const row = await storage.getFile(projectId, PRD_PATH);
   c.emit({ runId: result.runId, event: 'file_end', agent: 'pm', path: PRD_PATH, meta: { version: row?.version } });
+  await markFileLine(storage, projectId, c.plan, PRD_PATH, fileDoneLine(PRD_PATH, row?.version ?? 1));
 
   round.producedThisRound.add(PRD_PATH);
   const summary = await runSummaryOf(storage, projectId, result.runId);
@@ -893,6 +898,8 @@ async function dispatchPm(c: TaskContext, round: RoundState): Promise<TaskDispat
 async function dispatchArchitect(c: TaskContext, round: RoundState): Promise<TaskDispatchResult> {
   const { storage, projectId, task } = c;
   c.emit({ runId: null, event: 'agent_start', agent: 'architect', meta: { taskKey: task.taskKey } });
+  // 子任务拆解：交付物清单事前可知（ARCHITECT_DOC_PATHS 8 项）——预登记复选框，产出后逐项打勾
+  await addTaskSubtasks(storage, projectId, c.plan, task.taskKey, ARCHITECT_DOC_PATHS);
   // 架构师无文本入参通道（T14 契约）：干预指令无法拼入其 prompt，仅留痕不静默吞
   for (const item of c.interventions) {
     console.warn(`[orchestrator] 架构师任务无文本通道，干预指令未拼入（messageId=${item.id}）：${item.content}`);
@@ -906,6 +913,7 @@ async function dispatchArchitect(c: TaskContext, round: RoundState): Promise<Tas
     c.emit({ runId: result.runId, event: 'file_start', agent: 'architect', path });
     const row = await storage.getFile(projectId, path);
     c.emit({ runId: result.runId, event: 'file_end', agent: 'architect', path, meta: { version: row?.version } });
+    await markFileLine(storage, projectId, c.plan, path, fileDoneLine(path, row?.version ?? 1));
     round.producedThisRound.add(path);
   }
   const summary = await runSummaryOf(storage, projectId, result.runId);
@@ -989,13 +997,18 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
   // 编辑能力开关（DESIGN §3.9）：关 = 只读查看器，持锁文件也照常生成（开关乎人工侧，不关 agent 写入）
   const editingEnabled = await editingEnabledFor(c);
 
+  // 工作集 = file_tree 去掉 docs 交付物与本轮上游产物（原循环内 continue 条件上提）；
+  // 子任务拆解按工作集登记复选框——工程师的大任务拆成逐文件小任务
+  const workNodes = tree.filter(
+    (node) => node.path !== 'docs' && !node.path.startsWith('docs/') && !round.producedThisRound.has(node.path),
+  );
+  await addTaskSubtasks(storage, projectId, c.plan, task.taskKey, workNodes.map((node) => node.path));
+
   let okCount = 0;
   let lastRunId: number | null = null;
   const failedFiles: string[] = [];
 
-  for (const node of tree) {
-    if (node.path === 'docs' || node.path.startsWith('docs/')) continue;
-    if (round.producedThisRound.has(node.path)) continue;
+  for (const node of workNodes) {
 
     // ① 人工软锁：每个文件边界重读（锁可能在轮内被裁决/释放/过期，不能只在任务边界看一次）。
     //    必须先于干预注入：若该文件任务因裁决「跳过/稍后」而不跑，此边界不能消费干预——
@@ -1028,7 +1041,7 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
 
     if (result.ok) {
       okCount += 1;
-      await appendProgressLine(storage, projectId, fileDoneLine(result.path, result.version));
+      await markFileLine(storage, projectId, c.plan, result.path, fileDoneLine(result.path, result.version));
       // 写后自审（DESIGN §5⑤′，agent 版 lint）：同一单文件上下文再跑一次廉价 review；
       // 失败不阻断该文件（自审是增强项），仅留痕 console + PROGRESS ⚠ 行
       try {
@@ -1050,7 +1063,7 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
     } else {
       failedFiles.push(result.path);
       c.emit({ runId: result.runId, event: 'error', agent: 'engineer', path: result.path, error: (result.errors ?? []).join('；') });
-      await appendProgressLine(storage, projectId, fileFailedLine(result.path, result.errors ?? []));
+      await markFileLine(storage, projectId, c.plan, result.path, fileFailedLine(result.path, result.errors ?? []));
     }
   }
 
@@ -1067,6 +1080,8 @@ async function dispatchExpert(c: TaskContext, round: RoundState): Promise<TaskDi
   const path = EXPERT_REPORT_PATHS[role];
 
   c.emit({ runId: null, event: 'agent_start', agent: role, meta: { taskKey: task.taskKey } });
+  // 子任务拆解：专家交付物路径固定，先登记复选框、完成时打勾
+  await addTaskSubtasks(storage, projectId, c.plan, task.taskKey, [path]);
   const instruction = appendInterventions(task.instruction, c.interventions);
   c.emit({ runId: null, event: 'file_start', agent: role, path });
   const result = await runExpert({
@@ -1080,6 +1095,7 @@ async function dispatchExpert(c: TaskContext, round: RoundState): Promise<TaskDi
   });
   const row = await storage.getFile(projectId, path);
   c.emit({ runId: result.runId, event: 'file_end', agent: role, path, meta: { version: row?.version } });
+  await markFileLine(storage, projectId, c.plan, path, fileDoneLine(path, row?.version ?? 1));
 
   round.producedThisRound.add(path);
   const summary = await runSummaryOf(storage, projectId, result.runId);

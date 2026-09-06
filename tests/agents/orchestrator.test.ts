@@ -374,6 +374,10 @@ describe('startGeneration（mock 全链路）', () => {
     expect(progress.content).toMatch(/^- \[x\] engineer-app（工程师）/m);
     expect(progress.content.indexOf('- [x]')).toBeLessThan(progress.content.indexOf(CLOSING_SECTION_HEADING));
     expect(progress.content).not.toMatch(/—— 🔄/m); // 全部完成，无进行中残留
+    // 子任务拆解（大任务→小任务复选框）：PM/架构师/工程师的确定性交付物逐项打勾
+    expect(progress.content).toMatch(/^  - \[x\] docs\/prd\.md（v\d+）$/m);
+    expect((progress.content.match(/^  - \[x\] docs\//gm) ?? []).length).toBeGreaterThanOrEqual(8); // 架构师 8 交付物
+    expect(progress.content).toMatch(/^  - \[x\] app\/backend\/api\.js（v\d+）$/m);
 
     // 项目收口：done；每任务前有检查点
     expect((await storage.getProject(projectId))?.status).toBe('done');
@@ -471,6 +475,9 @@ describe('startGeneration（mock 全链路）', () => {
     const progress = await progressRow(storage, projectId);
     expect(progress.content).toContain('❌');
     expect(progress.content).toContain('app/frontend/index.html');
+    // 失败子任务保持未勾选 + ❌ 注记（勾上 = 完成的语义边界）；成功文件照常打勾
+    expect(progress.content).toMatch(/^  - \[ \] app\/frontend\/index\.html：❌ /m);
+    expect(progress.content).toMatch(/^  - \[x\] app\/backend\/api\.js（v\d+）$/m);
   }, 30000);
 
   it('⑤ 环依赖 DAG：断环不死锁、警告入 run summary 与 PROGRESS、其余任务照常', async () => {
