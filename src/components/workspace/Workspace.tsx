@@ -22,9 +22,11 @@ import { EditSwitch } from '@/components/common/EditSwitch';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Toaster } from '@/components/ui/sonner';
 import { FRONTEND_INDEX_PATH, PreviewPane } from '@/components/preview/PreviewPane';
+import { TerminalPane } from '@/components/terminal/TerminalPane';
 import { createWorkspaceStore, useWorkspace } from '@/lib/client/store';
 import { checkpointIdForRun, checkpointLabelOf } from '@/lib/client/checkpoint';
 import { fetchWorkspaceSnapshot, restoreProjectCheckpoint } from '@/lib/client/session';
+import { useTerminal } from '@/lib/client/terminal';
 import type { AgentRole } from '@/lib/db/provider/types';
 import { FileTree } from '@/components/tree/FileTree';
 import { ViewerTabs } from '@/components/viewer/ViewerTabs';
@@ -48,6 +50,9 @@ function isMobilePane(value: string): value is MobilePane {
 
 export function Workspace({ projectId }: { projectId: number }) {
   const state = useWorkspace(projectId);
+  // 终端控制器：hook 无条件挂载（生命周期绑定 Workspace）——切到编辑器/预览视图只是
+  // TerminalPane 卸载，运行中的命令与读流不打断，切回终端输出仍在。
+  const terminal = useTerminal(projectId);
   const [view, setView] = useState<WorkspaceView>('editor');
   const [pane, setPane] = useState<MobilePane>('chat');
   /** 当前打开的文件（文件树高亮 + 查看器激活页签的唯一事实来源） */
@@ -198,6 +203,8 @@ export function Workspace({ projectId }: { projectId: number }) {
         >
           {view === 'preview' ? (
             <PreviewPane projectId={projectId} hasFrontend={state.files.has(FRONTEND_INDEX_PATH)} />
+          ) : view === 'terminal' ? (
+            <TerminalPane terminal={terminal} />
           ) : (
             <ViewerTabs initialPath={activePath} onActivePathChange={handleActivePathChange} />
           )}

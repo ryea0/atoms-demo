@@ -30,8 +30,8 @@ import { formatRelativeTime, modeLabel, statusBadgeVariant, statusLabel } from '
 import { openProjectExport } from '@/lib/client/session';
 import type { AgentRole, Project } from '@/lib/db/provider/types';
 
-/** 查看器主区视图（编辑器 / 预览；预览档由 T22 PreviewPane 填充） */
-export type WorkspaceView = 'editor' | 'preview';
+/** 查看器主区视图（编辑器 / 预览 / 终端；预览档由 T22 PreviewPane、终端档由 TerminalPane 填充） */
+export type WorkspaceView = 'editor' | 'preview' | 'terminal';
 
 export interface TopBarProps {
   /** 项目（快照未就绪时为 null：顶栏先渲染骨架） */
@@ -108,7 +108,7 @@ export function TopBar({ project, runningRoles, connected, view, onViewChange, a
 
   const handleViewChange = useCallback(
     (value: string) => {
-      onViewChange(value === 'preview' ? 'preview' : 'editor');
+      onViewChange(value === 'preview' ? 'preview' : value === 'terminal' ? 'terminal' : 'editor');
     },
     [onViewChange],
   );
@@ -187,6 +187,9 @@ export function TopBar({ project, runningRoles, connected, view, onViewChange, a
             </TabsTrigger>
             <TabsTrigger value="preview" className="max-lg:h-11">
               预览
+            </TabsTrigger>
+            <TabsTrigger value="terminal" className="max-lg:h-11">
+              终端
             </TabsTrigger>
           </TabsList>
         </Tabs>
