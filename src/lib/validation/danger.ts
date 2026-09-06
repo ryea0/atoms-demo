@@ -22,7 +22,11 @@ export type DangerRule =
   | 'post_message_parent'
   | 'external_script'
   | 'infinite_loop'
-  | 'external_fetch';
+  | 'external_fetch'
+  | 'py_exec'
+  | 'py_subprocess'
+  | 'py_socket'
+  | 'py_net_import';
 
 /** 一条危险/警告：severity=hard 拦截，soft 仅警告 */
 export interface Danger {
