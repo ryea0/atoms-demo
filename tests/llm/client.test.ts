@@ -109,6 +109,14 @@ function firstFetchCall(fn: { mock: { calls: unknown[] } }): { url: string; init
   return { url: String(url), init: asRecordOf(args['1'] ?? {}) };
 }
 
+/** 取第 index 次（0 起）fetch 请求体；越界即失败 */
+function fetchBodyAt(fn: { mock: { calls: unknown[] } }, index: number): Record<string, unknown> {
+  const call = fn.mock.calls[index];
+  expect(call).toBeDefined();
+  const init = asRecordOf(asRecordOf(call)['1'] ?? {});
+  return JSON.parse(String(init.body)) as Record<string, unknown>;
+}
+
 /** unknown 收窄为 Error（断言错误信息用） */
 function asError(e: unknown): Error {
   expect(e).toBeInstanceOf(Error);
@@ -574,6 +582,243 @@ describe('openai 兼容客户端', () => {
     );
     const result = await getLlmProvider().complete(makeReq());
     expect(result.toolCalls[0]?.args).toBe('截断的参数{');
+  });
+
+  /* T35：工具参数双层编码兜底（真机 ARK doubao 实证）----------------------- */
+
+  it('complete：arguments 双层编码（字符串里套字符串）→ 有界解出内层对象', async () => {
+    stubOpenAiEnv();
+    const inner = JSON.stringify({ path: 'app/x.html', content: '<p>hi</p>' });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          Response.json({
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: '',
+                  tool_calls: [
+                    { id: 'c2', type: 'function', function: { name: 'write_file', arguments: JSON.stringify(inner) } },
+                  ],
+                },
+              },
+            ],
+            usage: { prompt_tokens: 3, completion_tokens: 2 },
+          }),
+        ),
+      ),
+    );
+    const result = await getLlmProvider().complete(makeReq());
+    // 只解一层会得到 string → runner 的 zod 根级校验失败（expected object, received string）
+    expect(result.toolCalls[0]?.args).toEqual({ path: 'app/x.html', content: '<p>hi</p>' });
+  });
+
+  it('stream：双层编码 arguments 增量聚合后同样解出内层对象', async () => {
+    stubOpenAiEnv();
+    const inner = JSON.stringify({ path: 'app/x.html', content: '<p>hi</p>' });
+    const doubleEncoded = JSON.stringify(inner);
+    const mid = Math.floor(doubleEncoded.length / 2); // 现实场景：arguments 分多个 delta 送达
+    const fragments = [doubleEncoded.slice(0, mid), doubleEncoded.slice(mid)];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          sseResponse([
+            {
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    tool_calls: [
+                      { index: 0, id: 'c3', type: 'function', function: { name: 'write_file', arguments: fragments[0] } },
+                    ],
+                  },
+                },
+              ],
+            },
+            { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: fragments[1] } }] } }] },
+            { choices: [], usage: { prompt_tokens: 5, completion_tokens: 3 } },
+          ]),
+        ),
+      ),
+    );
+    const result = await getLlmProvider().stream(makeReq(), () => {});
+    expect(result.toolCalls).toEqual([
+      { id: 'c3', name: 'write_file', args: { path: 'app/x.html', content: '<p>hi</p>' } },
+    ]);
+  });
+
+  it('arguments 是 JSON 字符串但内层非 JSON → 保留一层解码结果（字符串交由上层校验回喂）', async () => {
+    stubOpenAiEnv();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          Response.json({
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: '',
+                  tool_calls: [
+                    { id: 'c4', type: 'function', function: { name: 'write_file', arguments: JSON.stringify('截断的参数{') } },
+                  ],
+                },
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+          }),
+        ),
+      ),
+    );
+    const result = await getLlmProvider().complete(makeReq());
+    expect(result.toolCalls[0]?.args).toBe('截断的参数{');
+  });
+
+  it('三层以上病态嵌套 → 只解两层（有界，不递归不穷举）', async () => {
+    stubOpenAiEnv();
+    const triple = JSON.stringify(JSON.stringify(JSON.stringify({ path: 'app/x.html' })));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          Response.json({
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: '',
+                  tool_calls: [{ id: 'c5', type: 'function', function: { name: 'write_file', arguments: triple } }],
+                },
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+          }),
+        ),
+      ),
+    );
+    const result = await getLlmProvider().complete(makeReq());
+    // 两次 parse 后停在「内层 JSON 文本」，不再往下解：宁交上层校验回喂，不做无界解码
+    expect(result.toolCalls[0]?.args).toBe(JSON.stringify({ path: 'app/x.html' }));
+  });
+
+  it('round-trip：双层编码解码后回喂历史，再编码结果与单层场景一致', async () => {
+    stubOpenAiEnv();
+    const inner = JSON.stringify({ path: 'app/x.html', content: '<p>hi</p>' });
+    let callIndex = 0;
+    const fetchMock = vi.fn(() => {
+      callIndex += 1;
+      if (callIndex === 1) {
+        return Promise.resolve(
+          Response.json({
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: '写入文件',
+                  tool_calls: [
+                    { id: 'c6', type: 'function', function: { name: 'write_file', arguments: JSON.stringify(inner) } },
+                  ],
+                },
+              },
+            ],
+            usage: { prompt_tokens: 3, completion_tokens: 2 },
+          }),
+        );
+      }
+      return Promise.resolve(
+        Response.json({
+          choices: [{ index: 0, message: { role: 'assistant', content: '完成' } }],
+          usage: { prompt_tokens: 6, completion_tokens: 1 },
+        }),
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = getLlmProvider();
+    const first = await provider.complete(makeReq());
+    const call = first.toolCalls[0];
+    if (call === undefined) throw new Error('预期至少一条工具调用'); // noUncheckedIndexedAccess 显式收窄
+    // 模拟 runner 工具循环：assistant 决策 + tool 结果进历史后再次请求
+    await provider.complete(
+      makeReq({
+        messages: [
+          { role: 'system', content: '你是工程师' },
+          { role: 'user', content: '做一个待办事项应用' },
+          { role: 'assistant', content: first.content, toolCalls: first.toolCalls },
+          { role: 'tool', toolCallId: call.id, content: 'ok' },
+        ],
+      }),
+    );
+
+    const body = fetchBodyAt(fetchMock, 1);
+    const messages = body.messages as unknown;
+    expect(Array.isArray(messages)).toBe(true);
+    const assistant = asRecordOf((messages as unknown[])[2]); // system/user/assistant/tool
+    const historyCalls = asRecordOf(assistant)['tool_calls'] as unknown;
+    const firstCall = asRecordOf((historyCalls as unknown[])[0]);
+    // 解码后的对象再编码 = 单层 JSON 文本，与模型首发就是单层时的历史完全一致（不断链）
+    expect(asRecordOf(firstCall['function'] as unknown)).toEqual({ name: 'write_file', arguments: inner });
+  });
+
+  it('round-trip：字符串 args 回喂历史原样透传，不被二次编码回双层形态', async () => {
+    stubOpenAiEnv();
+    let callIndex = 0;
+    const fetchMock = vi.fn(() => {
+      callIndex += 1;
+      if (callIndex === 1) {
+        return Promise.resolve(
+          Response.json({
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: '',
+                  tool_calls: [
+                    { id: 'c7', type: 'function', function: { name: 'write_file', arguments: '截断的参数{' } },
+                  ],
+                },
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+          }),
+        );
+      }
+      return Promise.resolve(
+        Response.json({
+          choices: [{ index: 0, message: { role: 'assistant', content: '完成' } }],
+          usage: { prompt_tokens: 2, completion_tokens: 1 },
+        }),
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = getLlmProvider();
+    const first = await provider.complete(makeReq());
+    const call = first.toolCalls[0];
+    if (call === undefined) throw new Error('预期至少一条工具调用'); // noUncheckedIndexedAccess 显式收窄
+    await provider.complete(
+      makeReq({
+        messages: [
+          { role: 'system', content: '你是工程师' },
+          { role: 'user', content: '做一个待办事项应用' },
+          { role: 'assistant', content: first.content, toolCalls: first.toolCalls },
+          { role: 'tool', toolCallId: call.id, content: '参数无法解析' },
+        ],
+      }),
+    );
+
+    const assistant = asRecordOf((fetchBodyAt(fetchMock, 1).messages as unknown[])[2]);
+    const historyCall = asRecordOf((assistant['tool_calls'] as unknown[])[0]);
+    // 若在这里 JSON.stringify，字符串会被重新包成 JSON 字面量 → 历史里重现双层编码
+    expect(asRecordOf(historyCall['function'] as unknown)).toEqual({ name: 'write_file', arguments: '截断的参数{' });
   });
 });
 
