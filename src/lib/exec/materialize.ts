@@ -10,6 +10,7 @@ import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { StorageProvider } from '@/lib/db/provider/types';
 import { normalizeProjectPath } from '@/lib/agents/tools/sandbox';
+import { transpileBackend } from '@/lib/languages/profiles/typescript';
 
 export const WORKSPACES_DIR_DEFAULT = 'data/workspaces';
 const ATOMS_DIR = '__atoms';
@@ -69,6 +70,11 @@ export async function syncWorkspace(
     await mkdir(path.join(dir, ATOMS_DIR), { recursive: true });
     await writeFile(path.join(dir, ATOMS_DIR, 'server.js'), SERVER_JS_SOURCE, 'utf8');
 
+    // TS 项目：转译投影进 __atoms/（平台内置区语义：幂等覆写、不参与导出/回滚；
+    // server.js 候选链优先消费，js 项目投影为空串自然回退 app/backend/api.js）
+    const tsEntry = wanted.get('app/backend/api.ts');
+    await writeFile(path.join(dir, ATOMS_DIR, 'backend.js'), tsEntry === undefined ? '' : transpileBackend(tsEntry), 'utf8');
+
     return { dir, fileCount: wanted.size };
   });
 }
@@ -118,13 +124,17 @@ const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
 const indexPath = path.join(root, 'app/frontend/index.html');
-const apiPath = path.join(root, 'app/backend/api.js');
 
 let backend = null;
-try {
-  backend = require(apiPath);
-} catch (err) {
-  console.error('[atoms] 加载 app/backend/api.js 失败：', err && err.message);
+const candidates = [path.join(__dirname, 'backend.js'), path.join(root, 'app/backend/api.js')];
+for (var i = 0; i < candidates.length; i++) {
+  try {
+    var loaded = require(candidates[i]);
+    if (loaded && typeof loaded.handle === 'function') { backend = loaded; break; }
+  } catch (err) { /* 空投影/缺文件：尝试下一候选 */ }
+}
+if (backend === null) {
+  console.error('[atoms] 未找到可用后端（__atoms/backend.js 或 app/backend/api.js）');
 }
 
 function envelope(res, status, payload) {
