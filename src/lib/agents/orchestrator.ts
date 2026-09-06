@@ -14,6 +14,7 @@
  * 服务端专用（读 env 的角色在下游），不得进入客户端 bundle。
  */
 import { projectEventBus, type StreamEvent } from '@/lib/agents/events';
+import { roleRegistry } from '@/lib/agents/registry';
 import {
   appendProgressLine,
   fileDoneLine,
@@ -504,6 +505,80 @@ async function emitLeaderMessage(
 }
 
 /* ------------------------------------------------------------------ */
+/* @直派成员的自身名义汇报（T32 b 方案）                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @直派任务键前缀（leader.ts 直派分支的 `user-${agent}-${index}`）。
+ * 这是「用户 @ 点名的任务」的确定性标记——领导自拟的 task_key 不用该前缀（本项目的分派约定）。
+ */
+const USER_DISPATCH_PREFIX = 'user-';
+
+/** 各角色承接任务的名词（汇报首句用）。@直派不会派 leader，补全键只为类型完备 */
+const AGENT_TASK_NOUN: Record<AgentRole, string> = {
+  leader: '任务',
+  pm: 'PRD 撰写',
+  architect: '架构设计',
+  engineer: '代码实现',
+  analyst: '数据分析',
+  seo: 'SEO 分析',
+  ads: '广告投放方案',
+};
+
+/** 汇报正文里摘要要点的截断上限（字符）：交接摘要可能多行长句，聊天区只取一句 */
+const AGENT_REPORT_SUMMARY_CAP = 100;
+
+/** run.summary → 要点一句（取首个非空行，超长截断）；无可用摘要返回空串 */
+function reportSummaryClause(summary: string): string {
+  const firstLine = summary
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line !== '');
+  if (firstLine === undefined) return '';
+  const clipped =
+    firstLine.length > AGENT_REPORT_SUMMARY_CAP ? `${firstLine.slice(0, AGENT_REPORT_SUMMARY_CAP)}…` : firstLine;
+  return `要点：${clipped}`;
+}
+
+/**
+ * @直派任务完成 → 承接成员以**自身名义**落一条 assistant 消息并 emit（T32 用户拍板的 b 方案）。
+ * 背景：@ PM 出 PRD 时产出走文件（docs/prd.md），聊天里此前只有领导收尾汇报，观感是
+ * 「@ 了 PM、出来讲话的却是领导」——这里补一条该成员的完成通报，让 @ 谁谁出声。
+ * 领导收尾汇报保留不动（它承担多任务轮的聚合视角）。
+ *
+ * 主产出路径取值：**只认该 run 实际写的首个文件**（任务结果带回的是落库真路径，如 PM 的
+ * docs/prd.md、专家的 docs/seo_report.md、架构师的首个产物）。任务结果不带文件清单时
+ * **省略路径子句**、不退回 writesPaths 前缀（T32 R1 评审）：@工程师直派的 writesPaths 是
+ * ['docs/','app/']，而工程师明确跳过 docs/ 只写 app/*，退回前缀会说出「产物已写入 docs/」
+ * 这种事实错误；且多文件交付本就没有单一「主产出」可指。
+ */
+async function emitAgentReport(
+  storage: StorageProvider,
+  projectId: number,
+  emit: (e: Omit<StreamEvent, 'seq' | 'projectId'>) => StreamEvent,
+  task: TaskAssignment,
+  result: TaskDispatchResult,
+): Promise<void> {
+  const primaryPath = result.files[0];
+  const pathClause = primaryPath === undefined ? '' : `产物已写入 ${primaryPath}。`;
+  const content = `✅ ${roleRegistry[task.agent].name}：${AGENT_TASK_NOUN[task.agent]}已完成。${pathClause}${reportSummaryClause(result.summary)}`;
+  // meta 随消息落库：刷新后徽章（agent）与产物路径（path）仍可还原（kind 区别于领导收尾卡）
+  const meta: MessageMeta = {
+    kind: 'agent-report',
+    agent: task.agent,
+    ...(primaryPath === undefined ? {} : { path: primaryPath }),
+  };
+  const row = await storage.addMessage({ projectId, role: 'assistant', content, meta });
+  emit({
+    runId: result.runId,
+    event: 'message',
+    agent: task.agent,
+    content,
+    meta: { role: 'assistant', messageId: row.id, ...meta },
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* 主流程                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -610,6 +685,12 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
           );
         }
         await note(taskDoneLine(task.agent, taskKey, result.summary));
+
+        // @直派成员以自身名义汇报（T32 b 方案）：在任务级 agent_end（dispatchTask 内发出）之后
+        // 补一条该成员的完成通报；非 @直派任务不发（领导收尾汇报负责聚合视角）
+        if (taskKey.startsWith(USER_DISPATCH_PREFIX)) {
+          await emitAgentReport(storage, projectId, emit, task, result);
+        }
       } catch (error) {
         if (isAbortError(error)) throw error; // 停止语义交给顶层统一收口
         const message = errorMessage(error);

@@ -4,7 +4,7 @@
  * 聊天区「直播转录块」（T31）：把活跃成员的思考流与产出尾流实时播进聊天区，
  * 取代 T30 的单行活动播报（ActivityFeed）——窄屏单栏下过程信息不再只藏在文件树/查看器。
  *
- * 数据来自 store.liveAgents（SSE reasoning/file_start/delta/agent_end 推进，ephemeral）。
+ * 数据来自 store.liveAgents（SSE reasoning/file_start/delta/agent_end/任务级 error 推进，ephemeral）。
  * 取舍：
  * - 只直播当下：块随轮次收口整体清空，历史交时间线与消息流（与 T30 同一口径）。
  * - 思考流默认展开、可折叠；容器滚动贴底用 ref 操作（规则 03：流式文本不逐字符 setState）。
@@ -20,7 +20,7 @@ function isAgentRole(value: string): value is AgentRole {
   return value in roleRegistry;
 }
 
-/** 状态徽章：思考中… / 正在写 {path}（可点） / 已完成 */
+/** 状态徽章：思考中… / 正在写 {path}（可点） / 已完成 / 已失败（T32 I1：任务级错误终态） */
 function StatusBadge({
   state,
   onOpenFile,
@@ -42,6 +42,9 @@ function StatusBadge({
   }
   if (state.status === 'done') {
     return <span className="shrink-0 text-[11px] text-emerald-700">已完成</span>;
+  }
+  if (state.status === 'failed') {
+    return <span className="shrink-0 text-[11px] text-destructive">已失败</span>;
   }
   return (
     <span className="text-muted-foreground shrink-0 animate-pulse text-[11px]">
@@ -73,7 +76,9 @@ function LiveAgentCard({
   return (
     <div className="rounded-lg border border-border bg-panel px-2.5 py-2">
       <div className="flex min-w-0 items-center gap-1.5">
-        {state.status !== 'done' && <span aria-hidden className="bg-brand size-1.5 shrink-0 animate-pulse rounded-full" />}
+        {(state.status === 'thinking' || state.status === 'writing') && (
+          <span aria-hidden className="bg-brand size-1.5 shrink-0 animate-pulse rounded-full" />
+        )}
         <span aria-hidden className="shrink-0" style={{ color: meta.color }}>
           {meta.emoji}
         </span>

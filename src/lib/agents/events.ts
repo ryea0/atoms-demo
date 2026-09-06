@@ -49,7 +49,8 @@ export interface StreamEvent {
   /**
    * 事件附属信息（按 event 语义选填，自由形状）：
    * - message：role（user/assistant）+ messageId（落库行 id，前端按正数 id 去重防重放重复）；
-   *   leader 卡片另带 kind（softlock=软锁裁决 / restore=回滚通知）与 path
+   *   leader 卡片另带 kind（softlock=软锁裁决 / restore=回滚通知）与 path；
+   *   @直派成员的自身汇报（T32）带 kind=agent-report + agent（归属角色）+ path（主产出路径）
    * - intervention_injected：messageId + targetTask（注入到哪个任务/文件边界）
    * - file_end：version（落库版本号）+ ok（校验是否通过）
    * - agent_start/agent_end/error：taskKey

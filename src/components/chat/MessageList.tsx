@@ -34,6 +34,10 @@ interface MessageMetaView {
   mentions: AgentRole[];
   kind: string | null;
   path: string | null;
+  /** 消息归属角色（kind=agent-report 的成员自身汇报，T32） */
+  agent: AgentRole | null;
+  /** 干预注入边界对应的任务键（收尾边界 leader-closing 的措辞分支靠它判定，T32 M4） */
+  targetTask: string | null;
 }
 
 function isAgentRole(value: unknown): value is AgentRole {
@@ -46,10 +50,14 @@ function metaViewOf(meta: Message['meta']): MessageMetaView {
   const rawMentions = Array.isArray(record['mentions']) ? record['mentions'] : [];
   const rawKind = record['kind'];
   const rawPath = record['path'];
+  const rawAgent = record['agent'];
+  const rawTargetTask = record['targetTask'];
   return {
     mentions: rawMentions.filter(isAgentRole),
     kind: typeof rawKind === 'string' && rawKind !== '' ? rawKind : null,
     path: typeof rawPath === 'string' && rawPath !== '' ? rawPath : null,
+    agent: isAgentRole(rawAgent) ? rawAgent : null,
+    targetTask: typeof rawTargetTask === 'string' && rawTargetTask !== '' ? rawTargetTask : null,
   };
 }
 
@@ -112,7 +120,7 @@ function MentionChips({ mentions, alignEnd }: { mentions: readonly AgentRole[]; 
   );
 }
 
-/** 干预队列卡：待注入（delivered_at 为空）= 排队中；已注入 = 显示注入边界对应的文件 */
+/** 干预队列卡：待注入（delivered_at 为空）= 排队中；已注入 = 显示注入边界（收尾边界/对应文件） */
 function InterventionCard({ message, view }: { message: Message; view: MessageMetaView }) {
   const pending = message.deliveredAt === null;
   return (
@@ -126,9 +134,11 @@ function InterventionCard({ message, view }: { message: Message; view: MessageMe
         <p className={cn('text-[11px] font-medium', pending ? 'text-amber-800' : 'text-emerald-700')}>
           {pending
             ? '📥 排队中，将注入下一任务边界'
-            : view.path === null
-              ? '已注入下一步骤'
-              : `已注入 ${view.path}`}
+            : view.targetTask === 'leader-closing'
+              ? '已注入收尾汇报'
+              : view.path === null
+                ? '已注入下一步骤'
+                : `已注入 ${view.path}`}
         </p>
         <p className="mt-1 whitespace-pre-wrap break-words text-foreground">{message.content}</p>
       </div>
@@ -235,6 +245,28 @@ export function MessageList({
         }
         if (message.role === 'assistant' && view.kind === 'restore') {
           return <RestoreCard key={message.id} message={message} />;
+        }
+        // @直派成员的自身汇报（T32）：普通消息气泡 + 角色归属徽章，先于收尾卡启发式返回，
+        // 避免「收尾后最后一条 assistant」的判定把它误标成领导汇报卡
+        if (message.role === 'assistant' && view.kind === 'agent-report') {
+          const reporter = view.agent;
+          const reporterMeta = reporter === null ? null : roleRegistry[reporter];
+          return (
+            <div key={message.id} className="flex flex-col items-start gap-1">
+              {reporterMeta !== null && (
+                <span
+                  className="inline-flex items-center gap-1 text-[11px] font-medium"
+                  style={{ color: reporterMeta.color }}
+                >
+                  <span aria-hidden>{reporterMeta.emoji}</span>
+                  {reporterMeta.name}
+                </span>
+              )}
+              <div className="max-w-[88%] rounded-2xl rounded-bl-sm border border-border bg-background px-3 py-2 text-sm break-words whitespace-pre-wrap text-foreground">
+                {message.content}
+              </div>
+            </div>
+          );
         }
         if (message.role === 'system') {
           return (

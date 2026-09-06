@@ -63,6 +63,9 @@ export function ChatPanel({ state, onOpenFile, onRollback }: ChatPanelProps): Re
       });
       setSending(true);
       try {
+        // 发送前取号（T32 I2）：fire-and-forget 轮可能在响应返回前就 done，
+        // 号对不上时 beginRound 不复位 finished（不把已完成的背景轮拉回 running）
+        const ticket = store.roundTicket();
         const result = await sendProjectMessage(projectId, input);
         if (result.delivered === 'intervention' && result.messageId !== undefined) {
           // 入队分支只落库不发 SSE：用响应 messageId 本地补登待注入卡，「📥 排队中」即时可见，
@@ -77,7 +80,7 @@ export function ChatPanel({ state, onOpenFile, onRollback }: ChatPanelProps): Re
           store.removeLocalMessage(projectId, localId);
         } else {
           // 新一轮开跑：复位上一轮遗留的 finished，停止钮/干预黄条/直播块立即生效
-          store.beginRound(projectId);
+          store.beginRound(projectId, ticket);
         }
         return true;
       } catch (error) {

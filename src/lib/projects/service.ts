@@ -263,6 +263,8 @@ export async function regenerateFile(
     signal,
     callbacks: {
       onDelta: (text) => emit({ runId: null, event: 'delta', agent: 'engineer', path: file.path, content: text }),
+      // 思考流与轮次行为一致（T32 M3）：重试同样透传 reasoning（ephemeral，不进环形缓冲）
+      onReasoning: (text) => emit({ runId: null, event: 'reasoning', agent: 'engineer', content: text }),
     },
   });
 

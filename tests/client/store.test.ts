@@ -269,11 +269,26 @@ describe('workspaceStore 事件分流', () => {
       meta: { kind: 'softlock', path: 'app/main.js' },
     });
 
-    // targetTask 解析不出路径（非 engineer:{path} 形态）时不写 path
+    // targetTask 解析不出路径（非 engineer:{path} 形态）时不写 path，但 targetTask 本身保留
+    // （收尾边界的「已注入收尾汇报」措辞分支靠它判定，T32 M4）
     store.applyEvent(
       ev({ event: 'intervention_injected', content: '再排一条', meta: { messageId: 10, targetTask: 'pm-prd' } }),
     );
-    expect(store.getState().messages.at(-1)).toMatchObject({ id: 10, meta: null });
+    expect(store.getState().messages.at(-1)).toMatchObject({ id: 10, meta: { targetTask: 'pm-prd' } });
+
+    // 收尾边界（leader-closing）：targetTask 原样进 meta，刷新前的聊天区也能分辨注入边界
+    store.applyEvent(
+      ev({
+        event: 'intervention_injected',
+        content: '汇报里补一句下一步方向',
+        meta: { messageId: 11, targetTask: 'leader-closing' },
+      }),
+    );
+    expect(store.getState().messages.at(-1)).toMatchObject({
+      id: 11,
+      role: 'intervention',
+      meta: { targetTask: 'leader-closing' },
+    });
   });
 
   it('error 记录错误并清该路径在流标记；stopped 收尾且项目转 paused', () => {
@@ -464,6 +479,49 @@ describe('workspaceStore 直播转录（liveAgents）', () => {
     expect(store.getState().liveAgents).toEqual({});
   });
 
+  it('error{agent} 是该 run 终态（T32 I1）：该成员直播块标 failed（不再脉冲）；文件级失败不算终态', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+
+    store.applyEvent(start()); // pm thinking
+    store.applyEvent(ev({ event: 'agent_start', agent: 'engineer', meta: { taskKey: 'engineer:app/main.js' } }));
+    store.applyEvent(ev({ event: 'file_start', agent: 'engineer', path: 'app/main.js' }));
+    store.applyEvent(ev({ event: 'reasoning', agent: 'engineer', content: '读依赖' }));
+
+    // 任务级失败（带 agent、无 path）：该成员块收口为 failed，摘要保留
+    store.applyEvent(ev({ event: 'error', agent: 'pm', error: 'PRD 生成失败', meta: { taskKey: 'pm-prd' } }));
+    expect(store.getState().liveAgents['pm']).toMatchObject({ status: 'failed' });
+    // 其他成员不受牵连：工程师照常在写
+    expect(store.getState().liveAgents['engineer']).toMatchObject({ status: 'writing' });
+
+    // 文件级失败（带 path）：不是该 run 的终态，块保持 writing（工程师继续下一个文件）
+    store.applyEvent(ev({ event: 'error', agent: 'engineer', path: 'app/main.js', error: '校验未过' }));
+    expect(store.getState().liveAgents['engineer']?.status).toBe('writing');
+  });
+
+  it('顶层 error（无 agent 无 path）：直播块整体清空，对齐 done/stopped 的收口行为（T32 I1）', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+
+    store.applyEvent(start({ agent: 'engineer', meta: { taskKey: 'engineer:app/main.js' } }));
+    expect(Object.keys(store.getState().liveAgents)).toEqual(['engineer']);
+
+    store.applyEvent(ev({ event: 'error', error: '编排器异常退出' }));
+    expect(store.getState().liveAgents).toEqual({});
+    expect(store.getState().finished).toBe(true);
+  });
+
+  it('全部块收口（done/failed 混合）后开新块：旧块整体让位（T32 I1 的 failed 也是终态）', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+
+    store.applyEvent(start()); // pm
+    store.applyEvent(ev({ event: 'error', agent: 'pm', error: 'PRD 生成失败', meta: { taskKey: 'pm-prd' } }));
+    store.applyEvent(ev({ event: 'agent_start', agent: 'architect', meta: { taskKey: 'arch-design' } }));
+    // 唯一既有块已终态（failed）→ 开新块时整体清场，不残留失败块的脉冲
+    expect(Object.keys(store.getState().liveAgents)).toEqual(['architect']);
+  });
+
   it('hydrate 播种在场占位：running 任务 → thinking 块（工程师带目标路径）；思考流本身不恢复', () => {
     const store = createWorkspaceStore();
     const running: AgentRun[] = [
@@ -547,6 +605,74 @@ describe('workspaceStore 本地乐观补登（T31 Commit B）', () => {
     const before = store.getState();
     store.beginRound(PROJECT_ID);
     expect(store.getState()).toBe(before);
+  });
+
+  it('beginRound 竞态守卫（T32 I2）：本轮在响应返回前已 done → 不把已完成的背景轮拉回 running', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot({ project: makeProject({ status: 'done' }) }));
+    expect(store.getState().finished).toBe(true);
+
+    // 发送前取号（记录「此刻已收口多少轮」）
+    const ticket = store.roundTicket();
+    // fire-and-forget 轮在 POST 响应返回前就跑完：done 先到
+    store.applyEvent(ev({ event: 'done' }));
+    expect(store.getState().finished).toBe(true);
+
+    // 响应此刻才回来：若照旧复位 finished，UI 会假运行（停止钮/干预黄条全部空转）
+    store.beginRound(PROJECT_ID, ticket);
+    expect(store.getState().finished).toBe(true);
+    expect(store.getState().project?.status).toBe('done');
+
+    // 正常路径（号未被消费）：照常复位，进入运行态
+    store.beginRound(PROJECT_ID, store.roundTicket());
+    expect(store.getState().finished).toBe(false);
+    expect(store.getState().project?.status).toBe('running');
+  });
+
+  it('轮次收口计数覆盖 stopped 与顶层 error（beginRound 守卫的两种终态同样生效）', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot({ project: makeProject({ status: 'paused' }) }));
+
+    const ticket = store.roundTicket();
+    store.applyEvent(ev({ event: 'stopped' }));
+    store.beginRound(PROJECT_ID, ticket);
+    expect(store.getState().finished).toBe(true);
+
+    const ticket2 = store.roundTicket();
+    store.applyEvent(ev({ event: 'error', error: '编排器异常退出' }));
+    store.beginRound(PROJECT_ID, ticket2);
+    expect(store.getState().finished).toBe(true);
+    expect(store.getState().project?.status).toBe('failed');
+  });
+
+  it('agent_start 自校正重开（T32 R1）：上一轮 done 在途导致复位被守卫跳过时，新轮 agent_start 兜回运行态', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot({ project: makeProject({ status: 'done' }) }));
+    expect(store.getState().finished).toBe(true);
+
+    // 上一轮的 done 恰在 SSE 在途：POST 已被服务端判为新一轮，但取号到响应之间收到了旧轮 done
+    const ticket = store.roundTicket();
+    store.applyEvent(ev({ event: 'done' }));
+    store.beginRound(PROJECT_ID, ticket); // 号对不上 → 保守不复位
+    expect(store.getState().finished).toBe(true);
+
+    // 新轮 agent_start 到达：按事件单调序自校正，停止钮/干预黄条不缺席到整轮结束
+    store.applyEvent(ev({ event: 'agent_start', agent: 'pm', meta: { taskKey: 'pm-prd' } }));
+    expect(store.getState().finished).toBe(false);
+    expect(store.getState().project?.status).toBe('running');
+    // 同一事件的其余补丁照常生效（直播块、时间线）
+    expect(store.getState().liveAgents['pm']?.status).toBe('thinking');
+    expect(store.getState().runs.at(-1)).toMatchObject({ agent: 'pm', status: 'running' });
+  });
+
+  it('agent_start 在运行态不产生收尾翻转（finished 已 false 时不动 project 之外的语义）', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot({ project: makeProject({ status: 'running' }) }));
+    expect(store.getState().finished).toBe(false);
+
+    store.applyEvent(ev({ event: 'agent_start', agent: 'architect', meta: { taskKey: 'arch-design' } }));
+    expect(store.getState().finished).toBe(false);
+    expect(store.getState().project?.status).toBe('running');
   });
 });
 
