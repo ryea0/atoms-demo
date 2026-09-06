@@ -9,6 +9,7 @@
 - **双层架构**：LLM 只做决策（路由、分派、产出），确定性代码做执行（串行 DAG 调度、SSE、落库、进度）
 - **SSE 实时直播**：自写事件协议（`seq` / `Last-Event-ID` 重放）、断线刷新恢复现场、正在生成的文件可续读
 - **全栈可运行预览**：生成应用在 iframe 沙箱里真实可交互（CRUD 全流程，浏览器内内存后端）
+- **终端在线运行**：工作台终端面板逐条执行命令（SSE 流式输出、停止按钮、进程组强杀）；生成项目物化到工作区 + 内置 `__atoms/server.js` 运行器，`curl` 直测真实后端；engineer 可用 bash 自检（`node --check` / 冒烟）——受控宿主执行，仅限本机/内网演示
 - **人机共编**：人工编辑与 agent 写入走同一 write API + CAS 乐观锁，冲突 409 → 三选一对话框；软锁 + 语义防冲突
 - **检查点回滚**：任务前自动打点，事务内恢复，回滚可撤销
 - **可观测**：每次 LLM 调用落 `llm_calls`（token/费用，缺失 usage 按中文校准公式估算并标 `estimated`）
@@ -25,7 +26,7 @@ flowchart LR
   User["用户"] -->|"一句话需求 / @成员 / 干预 / 停止"| UI["Next.js App Router<br/>卡片墙 · IDE 工作台 · 设置页"]
   UI -->|"POST /api/projects<br/>(fire-and-forget)"| Orch["编排器（确定性代码）<br/>串行 DAG · 步骤边界 · 干预注入"]
   Orch -->|"run(role, prompt, tools, context)"| Runner["AgentRunner<br/>通用工具循环"]
-  Runner -->|"zod 校验的工具调用"| Tools["工具层<br/>write_file / read_file / list / grep<br/>路径沙箱 + project_id 绑定"]
+  Runner -->|"zod 校验的工具调用"| Tools["工具层<br/>write_file / read_file / list / grep / bash 自检<br/>路径沙箱 + project_id 绑定 + 受控执行层"]
   Tools --> VFS[("虚拟文件系统<br/>SQLite files 表")]
   Runner -->|"complete / stream"| LLM["LLM Provider 抽象<br/>OpenAI 兼容 · mock · probe/fallback"]
   Runner -->|"file_end 才落库"| DB[("SQLite + Drizzle<br/>WAL · data/app.db")]
@@ -36,7 +37,7 @@ flowchart LR
   UI --> IDE["IDE 式可视化<br/>文件树 · 打字机 · mermaid · 时间线 · 预览 iframe"]
 ```
 
-一次生成的数据流：`POST /api/projects` 建项目并后台起跑 → 编排器按拓扑序逐任务执行（工程师按 `file_tree` 逐文件派发单文件任务）→ AgentRunner 循环调 LLM，工具写入**虚拟文件系统**（SQLite，不碰宿主磁盘）→ 事件总线把 `agent_start / file_start / delta / file_end / agent_end / message / intervention_injected / done / stopped / error` 推给 SSE → 前端先取快照对齐状态，再消费增量渲染 IDE。
+一次生成的数据流：`POST /api/projects` 建项目并后台起跑 → 编排器按拓扑序逐任务执行（工程师按 `file_tree` 逐文件派发单文件任务）→ AgentRunner 循环调 LLM，工具写入**虚拟文件系统**（SQLite，唯一事实源）→ 事件总线把 `agent_start / file_start / delta / file_end / agent_end / message / intervention_injected / done / stopped / error` 推给 SSE → 前端先取快照对齐状态，再消费增量渲染 IDE。终端/bash 执行前把 files 表**物化**为磁盘工作区投影（`data/workspaces/`，不回写）。
 
 ---
 
@@ -94,7 +95,7 @@ docker compose up --build      # 构建并启动，映射 3000 端口，数据�
 | # | 决策 | 换来什么 | 代价 / 不做什么 |
 |---|---|---|---|
 | **D1** | **工程师混合执行模式**：编排器按 `file_tree` 逐文件派发单文件任务，任务内工程师自主（`read_file` 任意 / `write_file` 目标文件+可覆写修正） | 骨架确定 → 进度可预测、失败只重试该文件（单文件重试 = 重跑该单文件任务）、上下文可控 | 拆分质量依赖架构师；跨文件一致性靠注入 file_tree 全文 + 自审，不做全局类型推断（[§3.2](docs/DESIGN.md#32-执行层按角色分配自主权)） |
-| **D2** | **浏览器内全栈**：backend 只能是无框架同构模块 `handle(method, path, body)`（内存态、禁 fs/net）；预览 = 服务端把 api.js + fetch 拦截垫片注入 index.html | 零基础设施、零服务端执行风险、演示效果等价；api.js 是真交付物（未来可直接挂 Node） | 内存态刷新即重置；无真持久层；服务端真执行需容器沙箱，列为演进（[§3.7](docs/DESIGN.md#37-全栈可运行预览契约d2)） |
+| **D2** | **浏览器内全栈**：backend 只能是无框架同构模块 `handle(method, path, body)`（内存态、禁 fs/net）；预览 = 服务端把 api.js + fetch 拦截垫片注入 index.html | 零基础设施、零服务端执行风险、演示效果等价；api.js 是真交付物（未来可直接挂 Node） | 内存态刷新即重置；无真持久层；服务端真执行：受控终端已落地（2026-09-06，演示姿态），容器沙箱列为演进（[§3.7](docs/DESIGN.md#37-全栈可运行预览契约d2)） |
 | **D3** | **快速模式 + 预置项目**：默认精简 PRD/设计 → 按内置应用模板骨架直接出单文件应用；完整模式产全量文档与 mermaid 图 | 快速模式 1-2 分钟出活，演示不翻车；完整模式供评委追问 | 双路径双倍 prompt 维护；模板库覆盖面有限（[§3.8](docs/DESIGN.md#38-快速模式d3)） |
 | **D4** | **全量范围交付**（双层架构 + 人机共编 + 检查点回滚 + 可观测 + 安全层全做） | 工程完整度与叙事完整度，非单点炫技 | 48h 时间盒内砍掉：多用户账户、三向合并、并行执行、真 git（[DESIGN §1](docs/DESIGN.md#1-产品定义)） |
 
@@ -106,13 +107,15 @@ docker compose up --build      # 构建并启动，映射 3000 端口，数据�
 
 服务端跑用户生成的代码必须容器沙箱（Docker/Firecracker），成本与攻击面都大；生成应用跑在用户浏览器 `sandbox="allow-scripts"` iframe 里，威胁边界天然收敛到用户自己的会话。取运输费用为零的等价演示效果，把「服务端沙箱」列为演进（[DESIGN §3.7](docs/DESIGN.md#37-全栈可运行预览契约d2)）。已知限制：无 same-origin → 生成应用不可用 localStorage/cookie（prompt 引导用内存/后端模块存态）。
 
+**2026-09-06 增补（受控终端）**：预览契约不变，另落地**受控宿主执行**（`src/lib/exec/`，`EXEC_PROVIDER=local|disabled`）——工作台终端面板（逐条命令 + SSE 流式输出 + 停止）与 engineer bash 自检共用同一执行层；生成项目物化到 `data/workspaces/p-<id>/` 并注入内置 `__atoms/server.js` 运行器（零依赖 node:http，仅绑 127.0.0.1），`node __atoms/server.js` 起真服务、curl 直测。守卫与已知限制见 `.claude/rules/07-security.md`「受控执行层」——**仅限本机/内网演示，不可公网裸奔**；容器沙箱仍是公网部署的前置条件。
+
 ### 为什么不上 RAC / agent 框架
 
 不上 LangGraph/LangChain：编排需求是**确定性调度**（拓扑序、步骤边界、干预注入、停止），写进 prompt 不可靠、写进框架黑盒不可控——手写 ~400 行编排器把「智能」留给 LLM（拆分/收尾），把「执行」留给代码。V1 纯串行即无并发写路径，因此**不需要 RAC/分布式锁**：per-path 写锁只是防御层，files 表乐观锁（version CAS）兜人工编辑并发（[DESIGN §3.3](docs/DESIGN.md#33-运行时手写确定性编排器-400-行)、[§5②](docs/DESIGN.md#5-关键设计决策与取舍)）。
 
 ### 威胁模型
 
-生成代码只跑在用户浏览器 iframe 沙箱：无服务端执行、无跨租户暴露。真实风险是**质量差**与 LLM **无意**危险模式（eval / 死循环 / 外部 fetch），不是蓄意攻击。纵深 5 道：① iframe 能力隔离 ② preview CSP（`connect-src 'none'` + script-src 白名单）③ 危险 API AST 扫描（acorn 自写规则：硬违规拒绝落库+重试，软警告标 ⚠）④ 写后 LLM 自审 ⑤ 人工兜底（编辑开关 + 回滚）。平台自身：密钥只经 env、路径沙箱（拒 `../`/绝对路径/`\0`）、所有查询强制 `project_id`、无 bash/exec 类工具（[DESIGN §5⑤′](docs/DESIGN.md#5-关键设计决策与取舍)、`.claude/rules/07-security.md`）。**不做**：eslint 全规则 / semgrep / RASP；生成物零依赖 = 无供应链风险，不需要依赖漏洞扫描。
+生成代码只跑在用户浏览器 iframe 沙箱：无跨租户暴露。真实风险是**质量差**与 LLM **无意**危险模式（eval / 死循环 / 外部 fetch），不是蓄意攻击。纵深 5 道：① iframe 能力隔离 ② preview CSP（`connect-src 'none'` + script-src 白名单）③ 危险 API AST 扫描（acorn 自写规则：硬违规拒绝落库+重试，软警告标 ⚠）④ 写后 LLM 自审 ⑤ 人工兜底（编辑开关 + 回滚）。平台自身：密钥只经 env、路径沙箱（拒 `../`/绝对路径/`\0`）、所有查询强制 `project_id`。**受控执行层（2026-09-06）**：终端与 bash 自检是宿主真实执行而非沙箱——env 白名单（密钥不进子进程）、进程组强杀、输出上限、单项目单槽、防手滑 denylist、`EXEC_PROVIDER=disabled` 一键全关；已知限制（宿主同权、cd 逃逸拦不住等）与红线见 `.claude/rules/07-security.md`——**仅限本机/内网演示**（[DESIGN §5⑤′](docs/DESIGN.md#5-关键设计决策与取舍)）。**不做**：eslint 全规则 / semgrep / RASP；生成物零依赖 = 无供应链风险，不需要依赖漏洞扫描。
 
 ### 并发演进路径
 

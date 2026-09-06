@@ -147,6 +147,7 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 - **预览装配（服务端拼接）**：`GET /api/projects/[id]/preview` 取 index.html，在 `<head>` 顶部注入运行时垫片：① api.js 源码（内联）② fetch 拦截器把 `/api/*` 路由到内存 handler ③ 再执行应用代码。模型无法"忘记"垫片（注入是服务端行为）
 - 效果：CRUD 全流程在预览中真实可用（内存态，刷新重置）；api.js 是真交付物（同构模块，未来可直接挂 Node 服务）
 - 取舍（写进 README）：服务端真执行需容器沙箱（Docker/Firecracker），列为演进方向；浏览器内全栈零基础设施、零安全风险、演示效果等价
+- **终端与 agent 自检执行（2026-09-06 增补，预览契约不变）**：新增受控执行层（§12「执行」行）——files 表物化为磁盘工作区（`data/workspaces/p-<id>/`，含平台内置 `__atoms/server.js` 运行器：零依赖 node:http、同一信封协议、仅绑 127.0.0.1）。工作台终端面板逐条执行命令（POST 提交 + SSE 流式输出 + 停止按钮），`node __atoms/server.js` 即可让 api.js 真正起服务、curl 直测后端；engineer 另有 bash 自检工具（§4.5）。D2 预览（iframe 模拟）与终端（真实进程）互补并存；安全姿态见 §5⑤′ 与 `.claude/rules/07-security.md`「受控执行层」
 - **iframe 已知限制**：`sandbox="allow-scripts"`（无 allow-same-origin）→ 生成应用不可用 localStorage/cookie（工程师 prompt 明确引导用内存/后端模块存态）；Tailwind CDN 正常可用
 
 ### 3.8 快速模式（D3）
@@ -209,7 +210,7 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 - 不引入 RAG（演进方向）
 
 ### 4.5 工具与沙箱
-模型只发起调用，执行者是 AgentRunner 内核注册的服务端函数（schema+实现+策略）。工具集：`write_file/read_file`（必备）、`list_files/glob`（轻量）、`grep`（可选 LIKE）；**不做 bash**。沙箱两级：文件沙箱=虚拟文件系统（files 表 per project_id，路径校验拒绝 `../`/绝对路径）；执行沙箱=iframe sandbox（§3.7）。
+模型只发起调用，执行者是 AgentRunner 内核注册的服务端函数（schema+实现+策略）。工具集：`write_file/read_file`（必备）、`list_files/grep`（轻量）+ **bash（engineer 专属自检，2026-09-06 增补）**——一次性命令（`node --check` 验语法 / `node -e` require+handle 冒烟），每任务 ≤5 次、每次 ≤30s、输出截断回喂，走受控执行层（§12「执行」行），不占用户终端槽。沙箱两级：文件沙箱=虚拟文件系统（files 表 per project_id，路径校验拒绝 `../`/绝对路径）；执行沙箱=iframe sandbox（§3.7）+ 受控执行层（宿主演示姿态，§5⑤′）。
 
 ### 4.6 防失控
 工具结果截断（大文件首尾 200 行+行数提示）、maxSteps、token 预算、单步超时重试。超时语义按路径区分（2026-09-06 真机探针修订：ARK plan + seed 推理模型流式健康——均隔 0.04s、最大间隙 9.3s——但 PRD 总时长 >90s，原「总时长 90s」一刀切误杀健康流）：complete 非流式 = 总时长 90s；stream 流式 = 空闲超时 45s（无新 chunk 即判死，阈值须大于实测最大间隙）+ 总时长上限 300s。均 env 可调（`LLM_TIMEOUT_MS` / `LLM_STREAM_IDLE_TIMEOUT_MS` / `LLM_STREAM_TOTAL_TIMEOUT_MS`）；超时/中止的调用也须落 llm_calls 计量（completion 按已收部分估算并标 estimated）。
@@ -236,6 +237,8 @@ event: agent_start | file_start | delta | file_end | agent_end | message | inter
 *安全检测（纵深 5 道）*：① iframe sandbox 能力隔离（已设计，威胁模型天然小）② preview 响应 CSP：`connect-src 'none'`/白名单 + `script-src` 白名单 CDN（堵数据外传）③ **危险 API AST 扫描**（acorn 遍历，~100 行自写规则）：硬违规拒绝落库+带错重试——eval/new Function/字符串 setTimeout（注入）、postMessage to parent（逃逸）、非白名单 script src；软警告标 ⚠——无限 while(true) 无 break、非白名单外部 fetch ④ LLM 安全审查：复用写后自审调用，清单含 innerHTML 拼接用户输入（XSS）、敏感信息硬编码 ⑤ 人工兜底（编辑开关+回滚）。
 
 *不做*：eslint 全规则/semgrep/CodeQL（超时间盒）；**依赖漏洞扫描不需要——生成物零依赖=无供应链风险**（无框架生成的隐藏收益）；运行时 RASP。威胁模型：生成代码只跑在用户浏览器沙箱 iframe，无服务端执行无跨租户暴露；真实风险是质量差与 LLM 无意危险模式（eval/死循环），非蓄意攻击——安全层价值=工程完整度+拦截无意危险。
+
+*受控执行层（2026-09-06 增补，演示姿态）*：工作台终端与 engineer bash 自检引入**宿主真实执行**——上段「无服务端执行」的前提自此收窄为「生成物落库与预览路径不变」。守卫（全部在 `src/lib/exec/` 收口，两类消费方自动继承）：子进程 env 白名单（PATH/HOME 等七键，一切密钥不进子进程）、detached 进程组 SIGKILL（断连/停止按钮/硬超时三路收敛同一 kill）、输出上限保尾丢头、终端 per-project 单槽（运行中 409）、命令 ≤500 字符、防手滑 denylist（rm -rf /、mkfs、dd of=/dev/、关机类）、内置 runner 仅绑 127.0.0.1、`EXEC_PROVIDER=disabled` 一键全关。**已知限制（诚实清单）**：宿主同权执行、非沙箱（`cd ../` 逃逸/读家目录/监听端口拦不住）；无容器隔离（Docker 不可用是既定前提）；Windows 不支持（POSIX 进程组语义）；dev 热更重载不追踪已起子进程；终端手敲命令不过危险 API AST 扫描（终端本意）——**仅限本机/内网演示，绝不可公网裸奔**（匿名 session + 任意命令 = 直接 RCE）。容器沙箱（Docker/Firecracker）仍列为演进。
 
 *LLM 自审*=工程师写完文件后一次廉价 review 调用（质量+安全清单），可覆写修复（agent 版 lint）。不做：完整 eslint 规则集、AST 级重构、跨文件类型推断。
 
@@ -331,7 +334,8 @@ DB 决策：本机无 Postgres/docker；编排器单写者，SQLite 够用零配
 | LLM | `LlmProvider.complete/stream` | `OpenAICompatProvider` + `MockProvider` | Anthropic 原生、多模态、Race 双通道 |
 | Agent 内核 | `AgentRunner.run()` / `AgentAdapter` | 自写工具循环 | 接入现成 coding agent（pi/Claude Agent SDK）作为引擎 |
 | 角色注册表 | `RoleRegistry`（role→{prompt, tools, model 绑定} 配置） | 领导/PM/架构师/工程师/3 专家 | 用户自定义角色（UI 配置 prompt+工具集） |
-| 工具注册表 | `ToolRegistry`（schema+impl+policy 三件套） | write/read/list/grep | 外部检索、图片生成、代码执行（沙箱成熟后） |
+| 工具注册表 | `ToolRegistry`（schema+impl+policy 三件套） | write/read/list/grep + bash（engineer 自检，2026-09-06） | 外部检索、图片生成 |
+| 执行 | `ExecutionProvider.run()`（受控宿主执行/禁用） | `LocalExecutionProvider`（child_process + 守卫，`EXEC_PROVIDER=local`，src/lib/exec/，2026-09-06；终端面板与 bash 工具共用） | 容器沙箱（Docker/Firecracker，`EXEC_PROVIDER` 切换） |
 | 检索 | `RetrievalProvider.search()`（RankedHit[]，bm25 可选） | GrepRetriever（RegExp 扫 files，默认）+ FtsRetriever（trigram/bm25，`RETRIEVAL_PROVIDER=fts5`，T28 已落地） | Postgres 全文检索（pg_trgm/tsvector）复用同一接口 |
 | 查看器渲染 | `RendererRegistry`（按文件类型/扩展名） | markdown/代码(Shiki)/mermaid | plantuml、CSV 表格、图片 |
 | 传输层 | `TransportAdapter`（事件发布） | SSE（EventSource） | WebSocket 双向、Webhook 外发 |

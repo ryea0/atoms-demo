@@ -47,6 +47,7 @@ src/components/          # file-tree/ viewer/ chat/ timeline/
 src/lib/agents/          # runner.ts(AgentRunner) orchestrator.ts(串行DAG+干预+停止) roles/(角色prompt+工具)
 src/lib/agents/roles/samples/   # 黄金样例（few-shot + seed 用）
 src/lib/agents/tools/    # write_file 等（路径沙箱校验在此，闭包绑定 project_id）
+src/lib/exec/            # 受控执行层（终端/bash 自检：物化+守卫+进程管理，EXEC_PROVIDER 开关）
 src/lib/db/              # schema.ts、index.ts、repo/（强制 project_id 过滤）
 src/lib/llm/             # client.ts(openai兼容+mock)、usage.ts(llm_calls 落库+估算降级)
 scripts/seed.ts          # 预置项目
@@ -60,7 +61,7 @@ docs/DESIGN.md           # 设计文档（单一事实来源）
 3. **工程师混合模式（D1）**：编排器按 file_tree 逐文件派发单文件任务；工程师任务内自主（read_file 任意、write_file 目标文件+可覆写修正）。**单文件重试 = 重跑该单文件任务**。
 4. **全栈预览契约（D2）**：backend 只能是无框架同构模块 `handle(method, path, body)`（内存态、禁 fs/net）；预览 = 服务端把 api.js + fetch 拦截垫片注入 index.html。生成应用禁用 localStorage（iframe 无 same-origin）。
 5. **可靠性三段式**（所有 LLM 工具调用）：zod 校验 → 带错误重试一次 → 回退默认流水线。
-6. **虚拟文件系统**：agent 读写只操作 files 表（per project_id），路径必须过沙箱校验（拒 `../`、绝对路径）；不碰宿主磁盘，不做 bash。
+6. **虚拟文件系统**：agent 读写只操作 files 表（per project_id），路径必须过沙箱校验（拒 `../`、绝对路径）；命令执行一律走**受控执行层** `src/lib/exec/`（2026-09-06 增补：终端面板 + engineer bash 自检，演示姿态守卫见 rules/07——仅限本机/内网，物化投影 `data/workspaces/`）。
 7. **子任务交接**：任务间零历史共享，只传 agent_runs.summary + 按需重读文件；中断无 summary 用文件清单拼降级摘要。
 8. **SSE 协议**：`{seq, projectId, runId, event, agent?, path?, content?, summary?, error?}`；**落库时机=file_end**（delta 只走 SSE，内存缓冲）；断线重连 Last-Event-ID 重放。新增状态要同时改协议与前端。
 9. **仓库层纪律**：所有查询强制 `WHERE project_id = ?`；干预队列 = messages 表（role=intervention AND delivered_at IS NULL）。
