@@ -196,6 +196,7 @@ export function architectSystemPrompt(): string {
     '- 前端为单页 app/frontend/index.html，统一 fetch(\'/api/...\') 调后端；禁 localStorage/cookie（浏览器沙箱无 same-origin）。',
     '- 生成应用零依赖、无构建步骤；图一律 mermaid（不用 PlantUML）。',
     '- 全文中文。',
+    '- 后端入口：默认 app/backend/api.js；leader 交接写明「后端语言=typescript|python」时改用 api.ts/api.py（同构 handle 契约不变，语言差异由工程师契约段约束）。',
     '',
     '【黄金样例（只学结构、粒度与分段格式，内容必须来自本次 PRD，禁止照抄样例主题）】',
     readSample('design.md'),

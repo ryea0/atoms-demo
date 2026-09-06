@@ -105,6 +105,7 @@ export const LEADER_SYSTEM_PROMPT = [
   '按当前模式控制任务粒度与 instruction 的详略。',
   '',
   '【结束】分派完毕（或无需分派）时调用 finish()；不需要产出文件的问题用 reply_to_user()。',
+  '语言路由：用户明确要求 TypeScript/Python 时，在交接 summary 写明「后端语言=typescript|python」，架构师据此定后端入口后缀；未写明默认 JavaScript。',
 ].join('\n');
 
 /* ------------------------------------------------------------------ */

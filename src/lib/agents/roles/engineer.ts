@@ -18,6 +18,7 @@ import { runAgent } from '@/lib/agents/runner';
 import { AgentAbortError, AgentValidationError, type RunnerCallbacks } from '@/lib/agents/types';
 import { bashTool, fsTools, type Tool } from '@/lib/agents/tools';
 import { javascriptProfile, resolveProfileByPaths } from '@/lib/languages';
+import type { LanguageId } from '@/lib/languages/types';
 import type { FileTree, FileTreeNode } from './file-tree';
 import { renderApiJs, renderIndexHtml, renderStartSh } from './samples/app-skeleton';
 import { resolveModel } from '@/lib/llm/client';
@@ -112,19 +113,41 @@ function pickTemplate(requirement: string): FastTemplate {
   return 'landing';
 }
 
+/** 语言关键词 → LanguageId；中文紧邻场景用环视（\b 对非 ASCII 不成立） */
+const LANGUAGE_KEYWORDS: ReadonlyArray<readonly [RegExp, LanguageId]> = [
+  [/\btypescript\b|(?<![a-z])ts(?![a-z])/i, 'typescript'],
+  [/\bpython\b|(?<![a-z])py(?![a-z])/i, 'python'],
+];
+
+/** 快速模式确定性选型（先例：pickTemplate）；默认 javascript */
+export function pickLanguage(requirement: string): LanguageId {
+  for (const [pattern, id] of LANGUAGE_KEYWORDS) {
+    if (pattern.test(requirement)) return id;
+  }
+  return 'javascript';
+}
+
+/** 各语言的后端入口（完整模式由架构师 prompt 决定同一约定） */
+const FAST_ENTRY: Record<LanguageId, string> = {
+  javascript: 'app/backend/api.js',
+  typescript: 'app/backend/api.ts',
+  python: 'app/backend/api.py',
+};
+
 /**
  * 快速模式文件树：关键词确定性选型，返回 4 节点固定树（拓扑序）。
  * app/frontend/index.html depends app/backend/api.js（D2 全栈契约的骨架表达）。
  */
 export function buildFastFileTree(requirement: string): FileTree {
   const kind = pickTemplate(requirement);
+  const lang = pickLanguage(requirement);
   const routes = TEMPLATE_ROUTES[kind];
   const primary = routes[0] ?? TEMPLATE_ROUTES.crud[0];
   if (primary === undefined) throw new Error('快速模板缺少资源路由（不可达：TEMPLATE_ROUTES 恒非空）');
   return [
     {
-      path: 'app/backend/api.js',
-      desc: `内存态后端 handle(method,path,body)，资源 ${primary}（REST，状态码 200/201/400/404/405）`,
+      path: FAST_ENTRY[lang],
+      desc: `内存态后端 handle(method,path,body)（${lang}），资源 ${primary}（REST，状态码 200/201/400/404/405）`,
       depends: [],
     },
     {
