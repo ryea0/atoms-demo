@@ -6,7 +6,8 @@
  * 2. runEngineerFile：D1 单文件任务 = assembleContext（依赖文件全文注入）→ runAgent（fsTools，
  *    模型必须 write_file 目标文件）→ validateFile；语法/硬违规 → 带错误反馈**重跑该单文件任务一次**
  *    （重试 = 第二次完整 runAgent，非 in-runner 重试）；仍未过 → ok=false、文件保留落库、⚠ 记入
- *    softWarnings；两次都没写文件 → 回退保底模板（三段式第 3 步，保底模板即质量下限）
+ *    softWarnings；两次都没写文件 → 回退保底模板（三段式第 3 步，保底模板即质量下限）；
+ *    工具协议失误（AgentValidationError，如 bash 命令超 500 字符）→ 按已落盘产物收口，不炸任务
  * 3. runEngineerReview：写后自审（agent 版 lint）——一次廉价 review 调用，发现问题覆写一次即止
  *
  * 计量契约（CLAUDE.md 规则 10）：每个入口只做一次 resolveModel('engineer')，
@@ -14,7 +15,7 @@
  */
 import { assembleContext } from '@/lib/agents/context';
 import { runAgent } from '@/lib/agents/runner';
-import { AgentAbortError, type RunnerCallbacks } from '@/lib/agents/types';
+import { AgentAbortError, AgentValidationError, type RunnerCallbacks } from '@/lib/agents/types';
 import { bashTool, fsTools, type Tool } from '@/lib/agents/tools';
 import type { FileTree, FileTreeNode } from './file-tree';
 import { renderApiJs, renderIndexHtml, renderStartSh } from './samples/app-skeleton';
@@ -163,7 +164,7 @@ export const ENGINEER_SYSTEM_PROMPT = [
   '- 每个任务只实现一个目标文件；依赖文件全文已注入上下文，其他已生成文件可用 read_file 按需查阅。',
   '- 目标文件必须由你调用 write_file 写入完整内容（整体覆盖）；发现写错可再次 write_file 覆写修正。',
   '- 写完目标文件即任务完成：输出一句简短结论即可，不要复述全文。',
-  '- 写完 JS 文件后可用 bash 自检：node --check <文件> 验语法、node -e "require + handle 冒烟" 验行为；单任务最多 5 次、每次 ≤30s；不要用 bash 启动长驻服务、安装依赖或改文件（写文件一律走 write_file）。',
+  '- 写完 JS 文件后可用 bash 自检：node --check <文件> 验语法、node -e "require + handle 冒烟" 验行为；单任务最多 5 次、每次 ≤30s、命令 ≤500 字符（超长会被直接拒绝——过长自检拆成多条短命令，或只跑 node --check）；不要用 bash 启动长驻服务、安装依赖或改文件（写文件一律走 write_file）。',
 ].join('\n');
 
 /** 写后自审 system prompt：一次廉价 review（语法/逻辑/遗漏/XSS），覆写一次即止 */
@@ -317,29 +318,46 @@ export async function runEngineerFile(ctx: EngineerFileContext): Promise<Enginee
         extraFiles: ctx.target.depends,
       });
 
-      await runAgent({
-        role: 'engineer',
-        systemPrompt: assembled.system,
-        userPrompt: assembled.user,
-        tools: engineerTools,
-        model,
-        ctx: { storage: ctx.storage, projectId: ctx.projectId, role: 'engineer' },
-        provider: wrapMetered({
-          storage: ctx.storage,
-          projectId: ctx.projectId,
-          agentRole: 'engineer',
+      /**
+       * 三段式第 3 步（runner 契约：AgentValidationError 的回退由调用方做）：
+       * 工具协议连续失误（如 bash 命令超 500 字符两轮未过）只终止本轮决策循环，不炸整个
+       * 文件任务——交付物可能已经写好（线上案例：api.js 落库后死于自检超限）。
+       * 停止（Abort）/步数超限/provider 错误语义不变，照旧上抛。
+       */
+      let toolProtocolError: string | undefined;
+      try {
+        await runAgent({
+          role: 'engineer',
+          systemPrompt: assembled.system,
+          userPrompt: assembled.user,
+          tools: engineerTools,
           model,
-          provider: ctx.provider,
-        }),
-        callbacks: ctx.callbacks,
-        signal: ctx.signal,
-      });
+          ctx: { storage: ctx.storage, projectId: ctx.projectId, role: 'engineer' },
+          provider: wrapMetered({
+            storage: ctx.storage,
+            projectId: ctx.projectId,
+            agentRole: 'engineer',
+            model,
+            provider: ctx.provider,
+          }),
+          callbacks: ctx.callbacks,
+          signal: ctx.signal,
+        });
+      } catch (error) {
+        if (!(error instanceof AgentValidationError)) throw error;
+        toolProtocolError = error.message;
+      }
 
       const row = await ctx.storage.getFile(ctx.projectId, ctx.target.path);
       if (row === null) {
         // 模型没有 write_file 目标文件：带反馈重跑；两次都没写 → 保底模板（三段式第 3 步）
         if (attempt < MAX_ATTEMPTS) {
-          feedback = ['上次运行没有调用 write_file 写入目标文件——本任务必须以 write_file 写入完整内容。'];
+          feedback = toolProtocolError === undefined
+            ? ['上次运行没有调用 write_file 写入目标文件——本任务必须以 write_file 写入完整内容。']
+            : [
+                `上次运行中${toolProtocolError}。请改用 write_file 写入目标文件完成本任务；`
+                + '如仍要 bash 自检，命令必须 ≤500 字符（过长请拆成多条短命令或只跑 node --check）。',
+              ];
           continue;
         }
         const content = renderFallbackFile(ctx.target.path, ctx.requirement, apiRoutesOfTree(ctx.fileTree));
@@ -375,9 +393,11 @@ export async function runEngineerFile(ctx: EngineerFileContext): Promise<Enginee
 
       if (errors.length === 0) {
         const suffix = softWarnings.length > 0 ? `（⚠ ${softWarnings.length} 条软警告）` : '';
+        // 工具协议失误被容忍收口：summary 留痕（错误不静默吞），不改判 ok
+        const fumbleNote = toolProtocolError === undefined ? '' : '（含一次工具校验失误，已按落盘产物收口）';
         await finishRun(ctx.storage, ctx.projectId, run.id, {
           status: 'done',
-          summary: `${row.path} v${row.version} 完成${suffix}`,
+          summary: `${row.path} v${row.version} 完成${suffix}${fumbleNote}`,
         });
         return { runId: run.id, path: row.path, version: row.version, ok: true, softWarnings };
       }

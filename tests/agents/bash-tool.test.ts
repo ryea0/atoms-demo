@@ -48,6 +48,13 @@ describe('bashTool：schema 校验', () => {
     expect(result.output).toContain('参数校验失败');
   });
 
+  it('超长命令 → 错误说明含 500 上限与缩短指引（回喂一次就能自纠）', async () => {
+    const result = await bashTool.execute({ command: 'x'.repeat(501) }, ctx);
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('500');
+    expect(result.output).toContain('缩短');
+  });
+
   it('timeout_seconds 缺省为 15（zod default 生效，可正常执行）', async () => {
     const result = await bashTool.execute({ command: 'echo ok' }, ctx);
     expect(result.ok).toBe(true);

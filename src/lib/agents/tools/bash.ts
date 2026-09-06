@@ -22,7 +22,13 @@ const BASH_MAX_OUTPUT_CHARS = 16000;
 const runCallCounts = new WeakMap<ToolContext, number>();
 
 const bashSchema = z.object({
-  command: z.string().min(1).max(500).describe('要在项目根目录执行的 bash 命令（一次性自检用，不要启动长驻服务/安装依赖）'),
+  // 上限必须前置告知（describe 进工具协议）且校验消息可自纠（线上缺陷：模型不知情，
+  // node -e 冒烟脚本动辄超 500 字符，回喂英文 zod 术语后重试照旧超限 → 任务白死）
+  command: z
+    .string()
+    .min(1)
+    .max(500, '命令超过 500 字符上限——请大幅缩短（例如只跑 node --check），或拆成多条短命令')
+    .describe('要在项目根目录执行的 bash 命令（≤500 字符，超长会被直接拒绝；一次性自检用，不要启动长驻服务/安装依赖）'),
   timeout_seconds: z.number().int().min(1).max(30).default(15).describe('超时秒数（上限 30，超时强杀）'),
 });
 
@@ -78,6 +84,7 @@ export const bashTool: Tool = defineTool({
   description:
     '一次性 bash 自检命令，在项目根目录执行。典型用法：node --check app/backend/api.js 验语法；'
     + ' node -e "const m=require(\'./app/backend/api.js\'); console.log(JSON.stringify(m.handle(\'GET\',\'/api/todos\',null)))" 冒烟验行为。'
+    + ' 命令长度上限 500 字符——超长自检请拆成多条短命令，或只跑 node --check。'
     + ' 不要启动长驻服务、不要安装依赖；写文件一律走 write_file，不要用 bash 改文件。',
   schema: bashSchema,
   async execute(args, ctx) {

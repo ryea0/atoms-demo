@@ -342,6 +342,7 @@ describe('runEngineerFile：校验失败重试（D1：重跑单文件任务）',
     expect(system).toContain('handle(method, path, body)');
     expect(system).toContain('localStorage');
     expect(system).toContain("fetch('/api/");
+    expect(system).toContain('500'); // bash 命令长度上限必须前置告知（线上缺陷：模型不知情导致连续超限）
 
     // 任务指令里目标路径逐字出现，且是最后一条用户消息里最后一个路径样 token（mock 路由契约）
     const user = provider.requests[0]?.messages.find((m) => m.role === 'user')?.content ?? '';
@@ -369,6 +370,60 @@ describe('runEngineerFile：校验失败重试（D1：重跑单文件任务）',
     expect(row).not.toBeNull();
     expect(row?.version).toBe(2);
     expect(row?.content).toContain('eval');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* ⑦ 工具协议失误降级（AgentValidationError 的调用方回退，三段式第 3 步） */
+/* ------------------------------------------------------------------ */
+
+describe('runEngineerFile：bash 自检超限等工具协议失误不再炸任务', () => {
+  // 复现线上缺陷（projectId=7）：写完 api.js 后 bash 自检命令 >500 字符，
+  // 回喂重试仍超限 → runner 抛 AgentValidationError → 整个文件任务 failed（文件白写）。
+  const LONG_CMD = 'x'.repeat(601);
+
+  it('⑦ 文件已写好 + bash 连续超限 → 按已落盘产物收口：ok=true、run done', async () => {
+    const base = await newProject('做一个待办清单', { seedTree: false });
+    const provider = new FakeProvider(
+      {
+        toolCalls: [
+          { id: 'w1', name: 'write_file', args: { path: 'app/backend/api.js', content: GOOD_API } },
+          { id: 'b1', name: 'bash', args: { command: LONG_CMD } },
+        ],
+      },
+      // 第二轮仍发超长命令：连续两次校验失败 → runner 抛 AgentValidationError
+      { toolCalls: [{ id: 'b2', name: 'bash', args: { command: LONG_CMD } }] },
+    );
+
+    const result = await runEngineerFile(fileCtx(base, nodeOf(base.tree, 'app/backend/api.js'), provider));
+
+    expect(result.ok).toBe(true);
+    expect(result.version).toBe(1);
+    const row = await base.storage.getFile(base.projectId, 'app/backend/api.js');
+    expect(row?.content).toBe(GOOD_API);
+    const runs = await base.storage.listAgentRuns(base.projectId);
+    const run = runs.find((item) => item.id === result.runId);
+    expect(run?.status).toBe('done');
+    expect(run?.summary).toContain('工具校验失误'); // 失误可见，不静默吞
+  });
+
+  it('⑦ 失误且未写文件 → 带真实原因反馈重跑，第二次写对 → ok=true', async () => {
+    const base = await newProject('做一个待办清单', { seedTree: false });
+    const provider = new FakeProvider(
+      { toolCalls: [{ id: 'b1', name: 'bash', args: { command: LONG_CMD } }] },
+      { toolCalls: [{ id: 'b2', name: 'bash', args: { command: 'y'.repeat(700) } }] },
+      { toolCalls: [{ id: 'w1', name: 'write_file', args: { path: 'app/backend/api.js', content: GOOD_API } }] },
+      { content: '完成' },
+    );
+
+    const result = await runEngineerFile(fileCtx(base, nodeOf(base.tree, 'app/backend/api.js'), provider));
+
+    expect(result.ok).toBe(true);
+    expect(result.version).toBe(1);
+    // 重跑的任务文本带上真实失误原因与 500 上限指引（而非误导性的「没有调用 write_file」）
+    const retryUser = provider.requests[2]?.messages.find((m) => m.role === 'user')?.content ?? '';
+    expect(retryUser).toContain('工具 bash');
+    expect(retryUser).toContain('500');
   });
 });
 
