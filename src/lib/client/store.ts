@@ -891,6 +891,7 @@ export function useWorkspace(projectId: number): WorkspaceState {
     const controller = new AbortController();
     let source: EventSource | null = null;
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = (lastSeq: number): void => {
       // 首连重放入口：快照 lastSeq 进 query（原生 EventSource 首连带不了自定义头，DESIGN §3.6
@@ -909,21 +910,39 @@ export function useWorkspace(projectId: number): WorkspaceState {
       source.onerror = () => store.setConnected(false);
     };
 
-    void fetchWorkspaceSnapshot(projectId, controller.signal)
-      .then((snapshot) => {
-        if (cancelled) return;
-        store.hydrate(snapshot);
-        connect(snapshot.lastSeq);
-      })
-      .catch((error: unknown) => {
-        if (cancelled || controller.signal.aborted) return;
-        console.error('[workspace] 快照加载失败：', error);
-        store.patchError(error instanceof Error ? `快照加载失败：${error.message}` : '快照加载失败，请刷新重试');
-      });
+    /**
+     * 快照加载带退避重试（2026-09-06 /p/3 实测事故修复）：
+     * dev 首访编译窗口/网关抖动的一次性失败，此前会让红条挂起且**永不连 SSE**——页面失聪，
+     * 服务端整轮跑完（文件/汇报齐全）前端毫无反应。故：瞬时失败重试两次（递增退避）；
+     * 重试耗尽仍失败 → 保留红条提示，但**降级直连 SSE**（lastEventId=0 从环形缓冲头重放，
+     * 事件增量应用到未初始化的 store，消息/直播块/文件树逐步自愈）——直播不能因快照失败而断。
+     */
+    const SNAPSHOT_MAX_RETRY = 2;
+    const SNAPSHOT_RETRY_BASE_MS = 800;
+    const loadSnapshot = (attempt: number): void => {
+      void fetchWorkspaceSnapshot(projectId, controller.signal)
+        .then((snapshot) => {
+          if (cancelled) return;
+          store.hydrate(snapshot);
+          connect(snapshot.lastSeq);
+        })
+        .catch((error: unknown) => {
+          if (cancelled || controller.signal.aborted) return;
+          console.error(`[workspace] 快照加载失败（第 ${attempt + 1} 次）：`, error);
+          if (attempt < SNAPSHOT_MAX_RETRY) {
+            retryTimer = setTimeout(() => loadSnapshot(attempt + 1), SNAPSHOT_RETRY_BASE_MS * (attempt + 1));
+            return;
+          }
+          store.patchError(error instanceof Error ? `快照加载失败：${error.message}` : '快照加载失败，请刷新重试');
+          connect(0); // 降级：无快照对齐也要收直播（重放缓冲自愈大部分状态）
+        });
+    };
+    loadSnapshot(0);
 
     return () => {
       cancelled = true;
       controller.abort();
+      if (retryTimer !== null) clearTimeout(retryTimer);
       source?.close();
       store.setConnected(false);
     };

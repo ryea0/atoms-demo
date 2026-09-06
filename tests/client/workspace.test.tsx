@@ -131,6 +131,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers(); // 快照重试用例开假时钟：失败也可能发生在 useFakeTimers 之后，统一复位
   vi.unstubAllGlobals();
 });
 
@@ -553,5 +554,62 @@ describe('跨面板接线（T25）', () => {
     fireEvent.click(buttons[0] as HTMLElement);
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
     expect(calls.some((call) => call.method === 'POST')).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 快照加载失败恢复（2026-09-06 /p/3 实测事故）：直播不因快照失败而断       */
+/* ------------------------------------------------------------------ */
+
+describe('快照加载失败恢复', () => {
+  /** 按调用序编排 fetch：前两次拒绝、第三次给快照（模拟 dev 首访编译窗口的瞬时失败） */
+  function mountWithFetchSequence(...behaviors: Array<() => Promise<Response>>): void {
+    let call = 0;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(() => {
+      const behavior = behaviors[Math.min(call, behaviors.length - 1)] as () => Promise<Response>;
+      call += 1;
+      return behavior();
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
+    MockEventSource.instances.length = 0;
+    render(createElement(Workspace, { projectId: PROJECT_ID }));
+  }
+
+  const rejectFetch = (): Promise<Response> => Promise.reject(new TypeError('Failed to fetch'));
+
+  it('瞬时失败（前 2 次）退避重试后成功：正常 hydrate + 建立 SSE 连接', async () => {
+    vi.useFakeTimers();
+    mountWithFetchSequence(rejectFetch, rejectFetch, () => Promise.resolve(jsonResponse(makeSnapshot())));
+
+    // 第一次失败 → 800ms 后重试（又失败）→ 1600ms 后第三次成功
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(800);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_600);
+    });
+
+    // 快照终于到位：顶栏标题出现，SSE 连接建立
+    expect(screen.getByText('番茄钟应用')).toBeInTheDocument();
+    expect(MockEventSource.instances).toHaveLength(1);
+    // 快照成功路径不出红条
+    expect(screen.queryByText(/快照加载失败/)).not.toBeInTheDocument();
+  });
+
+  it('持续失败也不断直播：重试耗尽后红条提示 + 降级直连 SSE（lastEventId=0 重放）', async () => {
+    vi.useFakeTimers();
+    mountWithFetchSequence(rejectFetch);
+
+    // 走完 2 次退避重试（800 + 1600）+ 一点余量
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+
+    // 红条如实提示快照失败（用户可读，不静默吞）
+    expect(screen.getByText(/快照加载失败/)).toBeInTheDocument();
+    // 但 EventSource 必须照常建立——页面不能因快照失败而失聪（服务端事件照收，直播块/消息自愈）
+    expect(MockEventSource.instances).toHaveLength(1);
+    expect(MockEventSource.instances[0]?.url).toBe(`/api/projects/${PROJECT_ID}/stream?lastEventId=0`);
   });
 });
