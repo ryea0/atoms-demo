@@ -398,6 +398,8 @@ describe('跨面板接线（T25）', () => {
 
   it('时间线「回到此任务前」→ 确认对话框 → POST restore → 快照刷新（未保存修改将被覆盖）', async () => {
     const snapshot = makeSnapshot({
+      // 空闲态（status=running 会被「运行中禁用回滚」分支拦下，见 Timeline/T25 R2）
+      project: makeProject({ status: 'done' }),
       agentRuns: [makeRun({ id: 42, agent: 'engineer', status: 'done', taskKey: 'engineer:index.html' })],
       checkpoints: [
         {

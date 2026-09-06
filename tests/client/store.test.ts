@@ -293,6 +293,62 @@ describe('workspaceStore 事件分流', () => {
     expect(store.getState().project?.status).toBe('paused');
   });
 
+  it('error{agent} 视为该 agent 当前 run 的终态：running 节点置 failed（不再蓝点脉冲到刷新）', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+
+    store.applyEvent(ev({ event: 'agent_start', agent: 'pm', meta: { taskKey: 'pm-prd' } }));
+    expect(store.getState().runs[0]).toMatchObject({ agent: 'pm', status: 'running', endedAt: null });
+
+    store.applyEvent(ev({ event: 'error', agent: 'pm', error: 'PRD 生成失败：模型返回无法解析', meta: { taskKey: 'pm-prd' } }));
+    expect(store.getState().runs).toHaveLength(1);
+    expect(store.getState().runs[0]).toMatchObject({
+      agent: 'pm',
+      status: 'failed',
+      error: 'PRD 生成失败：模型返回无法解析',
+    });
+    expect(store.getState().runs[0]?.endedAt).not.toBeNull();
+    // 任务级失败不是收尾：运行可继续
+    expect(store.getState().finished).toBe(false);
+  });
+
+  it('error{agent} 找不到运行中节点时补一个 failed 合成节点（runId 关联优先）', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(
+      makeSnapshot({
+        agentRuns: [
+          {
+            id: 42,
+            projectId: PROJECT_ID,
+            taskKey: 'engineer:app/main.js',
+            agent: 'engineer',
+            task: '实现 app/main.js',
+            status: 'running',
+            summary: null,
+            startedAt: 1,
+            endedAt: null,
+            error: null,
+          },
+        ],
+      }),
+    );
+
+    // runId 能对上：按 id 收尾
+    store.applyEvent(ev({ event: 'error', runId: 42, agent: 'engineer', error: '文件写入失败' }));
+    expect(store.getState().runs).toHaveLength(1);
+    expect(store.getState().runs[0]).toMatchObject({ id: 42, status: 'failed', error: '文件写入失败' });
+
+    // 对不上（无 running 节点）：补 failed 合成节点，错误信息不丢
+    store.applyEvent(ev({ event: 'error', agent: 'engineer', error: '重试仍失败', meta: { taskKey: 'engineer:app/api.js' } }));
+    expect(store.getState().runs).toHaveLength(2);
+    expect(store.getState().runs[1]).toMatchObject({
+      agent: 'engineer',
+      taskKey: 'engineer:app/api.js',
+      status: 'failed',
+      error: '重试仍失败',
+    });
+  });
+
   it('无 path 且无 agent 的 error 为运行级失败：置 failed 并收尾（项目不再停留「生成中」）', () => {
     const store = createWorkspaceStore();
     store.hydrate(makeSnapshot());
@@ -609,6 +665,15 @@ const listItem: ProjectListItem = {
 };
 
 describe('组件渲染冒烟', () => {
+  /** 按路由分发：/api/settings → 偏好；其余 → {project}（HomeHero 建项目） */
+  function homeFetchMock(preferences: unknown = { editing_enabled: true, default_mode: 'full' }) {
+    return vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : String(input);
+      if (url.includes('/api/settings')) return jsonResponse({ preferences });
+      return jsonResponse({ project: makeProject({ id: 9 }) });
+    });
+  }
+
   it('HomeHero：标题/角色头像排/示例 chips/公告条/模式胶囊，提交后跳转项目页', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ project: makeProject({ id: 9 }) }));
     vi.stubGlobal('fetch', fetchMock);
@@ -648,6 +713,50 @@ describe('组件渲染冒烟', () => {
     vi.unstubAllGlobals();
   });
 
+  it('HomeHero：模式胶囊初值接 preferences.default_mode（T23 偏好的本意消费位），随建项目请求上送', async () => {
+    const fetchMock = homeFetchMock({ editing_enabled: true, default_mode: 'full' });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { HomeHero } = await import('@/components/home/HomeHero');
+    render(createElement(HomeHero));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /完整模式/ })).toHaveAttribute('aria-pressed', 'true'));
+    fireEvent.change(screen.getByPlaceholderText('描述你想要的应用，团队替你实现'), {
+      target: { value: '做一个看板' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+
+    await waitFor(() => expect(pushMock).toHaveBeenCalledWith('/p/9'));
+    const calls = fetchMock.mock.calls as Array<[RequestInfo | URL, RequestInit?]>;
+    const createCall = calls.find((call) => String(call[0]).endsWith('/api/projects'));
+    expect(createCall).toBeDefined();
+    const body = JSON.parse(String(createCall?.[1]?.body)) as { requirement: string; mode: string };
+    expect(body).toEqual({ requirement: '做一个看板', mode: 'full' });
+
+    vi.unstubAllGlobals();
+  });
+
+  it('HomeHero：偏好读取失败静默回退 fast，建项目仍可用', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : String(input);
+      if (url.includes('/api/settings')) return jsonResponse({}, false, 500);
+      return jsonResponse({ project: makeProject({ id: 9 }) });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { HomeHero } = await import('@/components/home/HomeHero');
+    render(createElement(HomeHero));
+    expect(screen.getByRole('button', { name: /快速模式/ })).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.change(screen.getByPlaceholderText('描述你想要的应用，团队替你实现'), {
+      target: { value: '做一个待办' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(pushMock).toHaveBeenCalledWith('/p/9'));
+
+    vi.unstubAllGlobals();
+  });
+
   it('HomeHero：IME 组词中的 Enter 不提交（中文输入确认不建项目）', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
@@ -656,10 +765,12 @@ describe('组件渲染冒烟', () => {
     render(createElement(HomeHero));
     const input = screen.getByPlaceholderText('描述你想要的应用，团队替你实现');
 
+    const createCalls = (): number => fetchMock.mock.calls.filter((call) => String(call[0]).endsWith('/api/projects')).length;
     fireEvent.change(input, { target: { value: '做一个番茄钟' } });
     // 组词（isComposing）中的 Enter：只确认候选词，不触发提交
+    // （挂载时的 GET /api/settings 偏好读取照常发生，与建项目无关）
     fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(createCalls()).toBe(0);
     expect(pushMock).not.toHaveBeenCalled();
 
     // 组词结束后的 Enter：正常提交

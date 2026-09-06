@@ -411,15 +411,30 @@ describe('任务时间线', () => {
   it('「回到此任务前」按钮回调 onRollback(runId)；未接线时禁用', () => {
     const onRollback = vi.fn();
     const runs = [makeRun({ id: 12, task: '实现 app/main.js', status: 'done', endedAt: Date.now() })];
-    const { unmount } = mount(makeState({ runs }), { onRollback });
+    // 空闲态（夹具默认 status=running 会命中「运行中禁用」分支，见下一用例）
+    const idle = { runs, finished: true, project: makeProject({ status: 'done' }) };
+    const { unmount } = mount(makeState(idle), { onRollback });
 
     fireEvent.click(screen.getByRole('button', { name: '回到此任务前：实现 app/main.js' }));
     expect(onRollback).toHaveBeenCalledWith(12);
     unmount();
 
     // 未接线（onRollback 缺省）：按钮禁用态占位
-    mount(makeState({ runs }));
+    mount(makeState(idle));
     expect(screen.getByRole('button', { name: '回到此任务前：实现 app/main.js' })).toBeDisabled();
+  });
+
+  it('运行中禁用回滚（串行写模型：回滚不与在跑轮次并发），title 说明原因', () => {
+    const onRollback = vi.fn();
+    const runs = [makeRun({ id: 12, task: '实现 app/main.js', status: 'done', endedAt: Date.now() })];
+    mount(makeState({ runs, project: makeProject({ status: 'running' }) }), { onRollback });
+
+    const button = screen.getByRole('button', { name: '回到此任务前：实现 app/main.js' });
+    expect(button).toBeDisabled();
+    expect(button.getAttribute('title')).toContain('生成进行中');
+
+    fireEvent.click(button);
+    expect(onRollback).not.toHaveBeenCalled();
   });
 });
 
@@ -495,17 +510,27 @@ describe('输入区', () => {
     expect(input.value).toBe('@seo');
   });
 
-  it('模式胶囊初值取 preferences.default_mode；读取失败静默回退完整模式', async () => {
-    const fast = makeFetchMock({ editing_enabled: true, default_mode: 'fast' });
-    vi.stubGlobal('fetch', fast.fetchMock as unknown as typeof fetch);
-    const { unmount } = mount(makeState());
-    await waitFor(() => expect(screen.getByRole('button', { name: '生成模式' }).textContent).toContain('快速'));
-    unmount();
+  it('模式胶囊只读展示 project.mode：badge 非开关、不读偏好、发送不带 mode', async () => {
+    const { calls, fetchMock } = makeFetchMock({ editing_enabled: true, default_mode: 'fast' });
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+    mount(makeState({ project: makeProject({ mode: 'full' }) }));
 
-    const fallback = makeFetchMock();
-    vi.stubGlobal('fetch', fallback.fetchMock as unknown as typeof fetch);
-    mount(makeState());
-    await waitFor(() => expect(screen.getByRole('button', { name: '生成模式' }).textContent).toContain('完整'));
+    const badge = screen.getByLabelText('生成模式');
+    expect(badge.textContent).toContain('完整');
+    expect(badge.getAttribute('title')).toContain('模式在创建项目时确定');
+    // 只读：不再是可切换按钮（诚实化——mode 在创建项目时已定，运行中不可切）
+    expect(screen.queryByRole('button', { name: '生成模式' })).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '再补一个深色模式' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+    await waitFor(() => {
+      expect(lastPost(calls, `/api/projects/${PROJECT_ID}/messages`)?.body).toEqual({
+        content: '再补一个深色模式',
+        mentions: [],
+      });
+    });
+    // 偏好读取已随「死控件」一起移除（不再发无消费的 GET /api/settings）
+    expect(calls.some((call) => call.url.includes('/api/settings'))).toBe(false);
   });
 
   it('IME 组词中的 Enter：不误选 @ 候选、不把半截拼音当消息发出', async () => {

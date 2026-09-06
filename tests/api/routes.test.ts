@@ -649,6 +649,32 @@ describe('POST /api/projects/[id]/checkpoints/[cpId]/restore', () => {
     expect(messages.some((text) => text.includes('回滚'))).toBe(true);
   });
 
+  it('生成进行中 → 409（与 regenerate 同一串行守卫，运行中时间线不可回滚）', async () => {
+    const { id } = await seedProject();
+    await storage().upsertFile({ projectId: id, path: 'app/frontend/index.html', content: '旧内容', editor: 'engineer' });
+    const cpId = await storage().createCheckpoint(id, '任务前:engineer:app/frontend/index.html', null, await storage().latestRunId(id));
+
+    vi.stubEnv('LLM_MOCK_DELAY_MS', '40');
+    const round = startGeneration({
+      storage: storage(),
+      projectId: id,
+      userMessage: '做一次 SEO 分析',
+      mode: 'fast',
+      mentions: ['seo'],
+      signal: new AbortController().signal,
+    });
+    await waitUntil(() => orchestratorStatus(id) === 'running', 5000);
+    const conflict = await RESTORE_POST(
+      makeRequest(`http://localhost/api/projects/${id}/checkpoints/${cpId}/restore`, { method: 'POST' }, SESSION_A),
+      checkpointCtx(id, cpId),
+    );
+    expect(conflict.status).toBe(409);
+    expect(((await conflict.json()) as { error: string }).error).toContain('生成进行中');
+    // 回滚确实没有发生（文件未被恢复出别的版本）
+    expect((await storage().getFile(id, 'app/frontend/index.html'))?.version).toBe(1);
+    await round;
+  }, 30000);
+
   it('检查点不存在或归属不符 → 404', async () => {
     const { id } = await seedProject();
     const response = await RESTORE_POST(

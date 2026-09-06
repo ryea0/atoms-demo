@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "db:push": "drizzle-kit push",
+    "db:push": "mkdir -p data && drizzle-kit push",
     "seed": "tsx scripts/seed.ts"
   },
   "dependencies": {

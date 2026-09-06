@@ -673,6 +673,13 @@ describe('超时配置解析（非法值回退默认）', () => {
     expect(readPositiveIntMs(' 45000 ', 90_000)).toBe(45_000);
   });
 
+  it('2^31-1 边界原样通过；2^31 及以上封顶（setTimeout 超过 2^31-1 会立即触发/抛 RangeError）', () => {
+    const MAX_INT32_MS = 2_147_483_647;
+    expect(readPositiveIntMs(String(MAX_INT32_MS), 90_000)).toBe(MAX_INT32_MS);
+    expect(readPositiveIntMs(String(MAX_INT32_MS + 1), 90_000)).toBe(MAX_INT32_MS);
+    expect(readPositiveIntMs('99999999999999', 90_000)).toBe(MAX_INT32_MS);
+  });
+
   it('默认值：complete 90000 / stream idle 45000 / stream total 300000', () => {
     expect(DEFAULT_COMPLETE_TIMEOUT_MS).toBe(90_000);
     expect(DEFAULT_STREAM_IDLE_TIMEOUT_MS).toBe(45_000);

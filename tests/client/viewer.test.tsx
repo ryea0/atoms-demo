@@ -605,6 +605,100 @@ describe('ConflictDialog 冲突三选', () => {
 /* 编辑态：软锁 + 保存 + 冲突                                             */
 /* ------------------------------------------------------------------ */
 
+describe('单文件重试（regenerate 入口，终审修复轮 #4）', () => {
+  /** 项目空闲快照（夹具默认 status=running 会被判为「生成中」） */
+  function idleSnapshot(): WorkspaceSnapshot {
+    return makeSnapshot({ project: makeProject({ status: 'done' }) });
+  }
+
+  it('空闲 + 文件已落库：展示「重新生成」入口，点击 POST /files/[fid]/regenerate', async () => {
+    const regenBodies: unknown[] = [];
+    hydrateStore(idleSnapshot());
+    stubFetch([
+      ...baseRoutes(),
+      {
+        method: 'POST',
+        prefix: `/api/projects/${PROJECT_ID}/files/103/regenerate`,
+        respond: (body) => {
+          regenBodies.push(body);
+          return jsonResponse({ ok: true, path: 'app/main.js', version: 3, runId: 77 });
+        },
+      },
+    ]);
+    await mountViewer({ initialPath: 'app/main.js' });
+
+    const button = await screen.findByRole('button', { name: '重新生成 app/main.js' });
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      const call = vi.mocked(globalThis.fetch).mock.calls.find(
+        (item) => String(item[0]).includes(`/files/103/regenerate`),
+      );
+      expect(call).toBeDefined();
+      expect((call?.[1] as RequestInit | undefined)?.method).toBe('POST');
+    });
+    expect(regenBodies).toEqual([null]); // regenerate 无请求体
+  });
+
+  it('快照缺 fileId（本轮会话内生成、未刷新）：点击先拉快照补 id，再 POST regenerate', async () => {
+    const regenBodies: unknown[] = [];
+    // 快照里只有 docs/prd.md：app/main.js 由 SSE 事件生成（store 无它的 id）
+    hydrateStore(
+      makeSnapshot({
+        project: makeProject({ status: 'done' }),
+        files: [makeSnapshot().files[0] as NonNullable<WorkspaceSnapshot['files'][number]>],
+      }),
+    );
+    createWorkspaceStore(PROJECT_ID).applyEvent({ seq: 1, projectId: PROJECT_ID, runId: null, event: 'file_start', agent: 'engineer', path: 'app/main.js' });
+    createWorkspaceStore(PROJECT_ID).applyEvent({
+      seq: 2,
+      projectId: PROJECT_ID,
+      runId: null,
+      event: 'file_end',
+      agent: 'engineer',
+      path: 'app/main.js',
+      meta: { version: 2 },
+    });
+    stubFetch([
+      ...baseRoutes(),
+      { method: 'GET', prefix: `/api/projects/${PROJECT_ID}`, respond: () => jsonResponse(makeSnapshot({ project: makeProject({ status: 'done' }) })) },
+      {
+        method: 'POST',
+        prefix: `/api/projects/${PROJECT_ID}/files/103/regenerate`,
+        respond: (body) => {
+          regenBodies.push(body);
+          return jsonResponse({ ok: true, path: 'app/main.js', version: 3, runId: 78 });
+        },
+      },
+    ]);
+    await mountViewer({ initialPath: 'app/main.js' });
+
+    const button = await screen.findByRole('button', { name: '重新生成 app/main.js' });
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+
+    await waitFor(() => expect(regenBodies).toEqual([null]));
+    const urls = vi.mocked(globalThis.fetch).mock.calls.map((item) => `${String(item[0])}`);
+    expect(urls.some((url) => url.endsWith(`/api/projects/${PROJECT_ID}`))).toBe(true);
+    expect(urls.some((url) => url.includes('/files/103/regenerate'))).toBe(true);
+  });
+
+  it('生成进行中禁用（title 说明原因），点击不发请求', async () => {
+    hydrateStore(); // 默认 status=running → 生成中
+    stubFetch(baseRoutes());
+    await mountViewer({ initialPath: 'app/main.js' });
+
+    const button = await screen.findByRole('button', { name: '重新生成 app/main.js' });
+    expect(button).toBeDisabled();
+    expect(button.getAttribute('title')).toContain('生成进行中');
+
+    fireEvent.click(button);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(vi.mocked(globalThis.fetch).mock.calls.some((item) => String(item[0]).includes('/regenerate'))).toBe(false);
+  });
+});
+
 describe('查看器编辑态（软锁 / 保存 / 冲突）', () => {
   it('偏好开关关闭时不渲染编辑按钮', async () => {
     hydrateStore();

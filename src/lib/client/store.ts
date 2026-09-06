@@ -347,7 +347,53 @@ export class WorkspaceStore {
     if (path === undefined && event.agent === undefined) {
       return { ...patch, finished: true, project: withStatus(this.state.project, 'failed') };
     }
+    // 任务级失败（带 agent、无 path）：该 agent 当前 run 视为终态（协议见 events.ts）。
+    // 编排器任务失败只发 error{agent,taskKey} 不发 agent_end——若不在此收口，时间线的
+    // 合成 run 会一直「进行中」（蓝点脉冲到刷新）。
+    if (path === undefined && event.agent !== undefined) {
+      return { ...patch, ...this.failedRunPatchFor(event) };
+    }
     return patch;
+  }
+
+  /**
+   * error{agent} → 该 agent 最近 running run 置 failed（形状镜像 runsPatchForEnd）：
+   * runId 能对上按 id，否则收尾该角色最近的运行中节点；都找不到则补 failed 合成节点
+   * （错误信息不丢，时间线红字透出）。找不到时用事件里的 taskKey，便于定位失败任务。
+   */
+  private failedRunPatchFor(event: StreamEvent): Partial<WorkspaceState> {
+    const runs = [...this.state.runs];
+    const endedAt = Date.now();
+    const error = event.error ?? null;
+
+    const finishAt = (index: number): Partial<WorkspaceState> => {
+      const run = runs[index];
+      if (run !== undefined) runs[index] = { ...run, status: 'failed', endedAt, error };
+      return { runs };
+    };
+
+    if (event.runId !== null) {
+      const index = runs.findIndex((run) => run.id === event.runId);
+      if (index >= 0) return finishAt(index);
+    }
+    const agent = event.agent;
+    const index = lastIndexOf(runs, (run) => (agent === undefined || run.agent === agent) && run.status === 'running');
+    if (index >= 0) return finishAt(index);
+
+    this.syntheticId -= 1;
+    runs.push({
+      id: this.syntheticId,
+      projectId: event.projectId,
+      taskKey: typeof event.meta?.taskKey === 'string' ? event.meta.taskKey : '',
+      agent: agent ?? 'leader',
+      task: '',
+      status: 'failed',
+      summary: null,
+      startedAt: null,
+      endedAt,
+      error,
+    });
+    return { runs };
   }
 
   /** agent_start：runId 能对上库里的 run 就置 running；否则补一个运行中的合成节点（同任务去重） */

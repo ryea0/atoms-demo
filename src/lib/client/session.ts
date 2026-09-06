@@ -37,6 +37,23 @@ async function parseBody(response: Response): Promise<unknown> {
   }
 }
 
+/**
+ * 服务端错误信封解析（projects 族统一 `{ error: "<中文>" }`，见 route-support.ts）：
+ * 顶层 error 字符串即 message；`{code, message}` 形状优先（兼容带 code 的路由）；
+ * 两者皆缺省时回退 HTTP 兜底文案。缺这一层，所有 4xx/5xx 都降级成「请求失败（HTTP xxx）」，
+ * 服务端的校验/冲突/归属文案全部被吞。
+ */
+function apiErrorOf(payload: unknown, status: number): ApiError {
+  const body = (payload ?? {}) as { error?: unknown; code?: unknown; message?: unknown };
+  if (typeof body.code === 'string' && body.code !== '' && typeof body.message === 'string' && body.message !== '') {
+    return new ApiError(status, body.code, body.message);
+  }
+  if (typeof body.error === 'string' && body.error !== '') {
+    return new ApiError(status, 'http_error', body.error);
+  }
+  return new ApiError(status, 'http_error', `请求失败（HTTP ${status}）`);
+}
+
 /** 统一请求入口：同源携带会话 cookie，非 2xx 转 ApiError */
 export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -45,15 +62,7 @@ export async function requestJson<T>(path: string, init?: RequestInit): Promise<
     headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
   });
   const body = await parseBody(response);
-  if (!response.ok) {
-    const payload = (body ?? {}) as { code?: unknown; message?: unknown };
-    const code = typeof payload.code === 'string' ? payload.code : 'http_error';
-    const message =
-      typeof payload.message === 'string' && payload.message !== ''
-        ? payload.message
-        : `请求失败（HTTP ${response.status}）`;
-    throw new ApiError(response.status, code, message);
-  }
+  if (!response.ok) throw apiErrorOf(body, response.status);
   return body as T;
 }
 
@@ -138,13 +147,8 @@ export async function saveHumanFile(
       version: typeof body?.version === 'number' ? body.version : baseVersion,
     };
   }
-  const payload = (await parseBody(response)) as { code?: unknown; message?: unknown } | null;
-  const code = typeof payload?.code === 'string' ? payload.code : 'http_error';
-  const message =
-    typeof payload?.message === 'string' && payload.message !== ''
-      ? payload.message
-      : `请求失败（HTTP ${response.status}）`;
-  throw new ApiError(response.status, code, message);
+  const payload = await parseBody(response);
+  throw apiErrorOf(payload, response.status);
 }
 
 /**
@@ -215,6 +219,25 @@ export function restoreProjectCheckpoint(projectId: number, checkpointId: number
 /** 停止当前生成（空闲项目为幂等 no-op；stopped 事件与状态收口由运行中轮次负责） */
 export function stopProjectGeneration(projectId: number): Promise<void> {
   return requestJson<void>(`/api/projects/${projectId}/stop`, { method: 'POST' });
+}
+
+/** POST /api/projects/[id]/files/[fid]/regenerate 响应（服务层 EngineerFileResult 投影） */
+export interface RegenerateFileResult {
+  ok: boolean;
+  path: string;
+  version: number;
+  runId: number;
+}
+
+/**
+ * 单文件重试（CLAUDE.md 规则 3：单文件重试 = 重跑该单文件任务）。
+ * 服务端会补发完整事件链（agent_start → file_start → delta → file_end → agent_end），
+ * store 由 SSE 推进，**无需**客户端再拉快照。运行中调用会得到 409（串行写模型）。
+ */
+export function regenerateProjectFile(projectId: number, fileId: number): Promise<RegenerateFileResult> {
+  return requestJson<RegenerateFileResult>(`/api/projects/${projectId}/files/${fileId}/regenerate`, {
+    method: 'POST',
+  });
 }
 
 /* ------------------------------------------------------------------ */

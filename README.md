@@ -44,7 +44,7 @@ flowchart LR
 
 ```bash
 npm install
-npm run db:push     # 应用 Drizzle schema 到 SQLite（data/app.db 自动建目录）
+npm run db:push     # 建 data/ 目录并应用 Drizzle schema 到 SQLite（data/app.db）
 npm run dev         # 默认 mock provider，无需任何密钥
 ```
 

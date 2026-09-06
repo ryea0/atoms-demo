@@ -15,6 +15,8 @@ import type { AgentRun, RunStatus } from '@/lib/db/provider/types';
 export interface TimelineProps {
   runs: readonly AgentRun[];
   onRollback?: (runId: number) => void;
+  /** 生成进行中：回滚禁用（串行写模型，规则 2——服务端 restore 路由同守卫兜底 409） */
+  running?: boolean;
 }
 
 /** 任务状态 → 圆点配色 / 标记字符 / 中文标签（brief：pending 灰 / running 蓝脉冲 / done 绿✓ / failed 红 / stopped 灰⏸） */
@@ -39,7 +41,7 @@ function taskLabel(run: AgentRun): string {
   return run.taskKey;
 }
 
-export function Timeline({ runs, onRollback }: TimelineProps) {
+export function Timeline({ runs, onRollback, running = false }: TimelineProps) {
   return (
     <section aria-label="任务时间线" className="border-t border-border bg-panel px-3 py-2.5">
       <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">任务时间线</h3>
@@ -87,8 +89,12 @@ export function Timeline({ runs, onRollback }: TimelineProps) {
                 variant="ghost"
                 size="xs"
                 aria-label={`回到此任务前：${label}`}
-                title="回到此任务生成前的检查点（项目级回滚）"
-                disabled={onRollback === undefined}
+                title={
+                  running
+                    ? '生成进行中，暂不能回滚：请先停止或等待本轮完成'
+                    : '回到此任务生成前的检查点（项目级回滚）'
+                }
+                disabled={onRollback === undefined || running}
                 onClick={() => onRollback?.(run.id)}
                 className="mt-0.5 -ml-1 w-fit text-muted-foreground max-lg:h-11"
               >

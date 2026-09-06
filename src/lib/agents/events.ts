@@ -7,6 +7,11 @@
  *
  * 模块级单例 projectEventBus：内部按 projectId 分桶（每 project 独立 seq/缓冲/订阅者），
  * 与「每 project 一个、单例 Map」的语义一致——切 project 互不串扰。
+ *
+ * 协议备注（error 事件的终态语义）：**error{agent}（无 path）视为该 agent 当前 run 的终态**，
+ * 等价于一次带错误信息的 agent_end——编排器任务失败只发 error{agent,taskKey}，不再补发
+ * agent_end；客户端（store.errorPatchFor）据此把该角色最近 running run 置 failed。
+ * 新增事件消费方（时间线、进度条等）必须遵守同一约定，否则任务级失败会永久停留在「进行中」。
  */
 import type { AgentRole } from '@/lib/db/provider/types';
 

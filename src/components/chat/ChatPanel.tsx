@@ -110,7 +110,7 @@ export function ChatPanel({ state, onOpenFile, onRollback }: ChatPanelProps): Re
           onOpenFile={onOpenFile}
           onSend={handleSendText}
         />
-        {state.runs.length > 0 && <Timeline runs={state.runs} onRollback={onRollback} />}
+        {state.runs.length > 0 && <Timeline runs={state.runs} onRollback={onRollback} running={running} />}
       </div>
 
       {/* 运行中：发送即干预入队（DESIGN §3.5 两级边界注入） */}
@@ -121,7 +121,13 @@ export function ChatPanel({ state, onOpenFile, onRollback }: ChatPanelProps): Re
         </p>
       )}
 
-      <ChatInput onSend={handleSend} onStop={handleStop} running={running} disabled={projectId === null} />
+      <ChatInput
+        onSend={handleSend}
+        onStop={handleStop}
+        running={running}
+        mode={state.project?.mode ?? 'full'}
+        disabled={projectId === null}
+      />
     </div>
   );
 }

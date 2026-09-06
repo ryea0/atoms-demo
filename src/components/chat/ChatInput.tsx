@@ -2,21 +2,22 @@
 
 /**
  * 聊天输入区（Task 19）：受控 textarea + 成员 chips（多选）+ @ 浮层（↑↓/Enter/Esc/点击，
- * 前缀过滤）+ 模式胶囊 + 发送/停止。
+ * 前缀过滤）+ 模式徽标 + 发送/停止。
  *
  * 语义：空闲发送 = 新一轮生成；运行中发送 = 干预入队（黄条提示在 ChatPanel），
- * 输入框保持可用；运行中左下显示停止钮（POST stop）。模式胶囊初值取 session 偏好
- * `preferences.default_mode`（读取失败静默保持「完整」），messages 路由暂不接收 mode，
- * 先做本地记忆，与 createProject 的 mode 语义一致。
+ * 输入框保持可用；运行中左下显示停止钮（POST stop）。
+ * 模式徽标是**只读展示**：mode 在创建项目时确定（POST /api/projects 的 body.mode），
+ * 生成中途不可切——消息路由不接收 mode，此前的可点胶囊是无上送通道的死控件（终审 #6）。
+ * 新建项目的模式选择在首页 HomeHero（消费 preferences.default_mode 作为初值）。
  */
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import type { ChangeEvent, KeyboardEvent, ReactElement, TextareaHTMLAttributes } from 'react';
 import { AtSign, Send, Square, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { roleOrder, roleRegistry } from '@/lib/agents/registry';
+import { modeLabel } from '@/lib/client/format';
 import type { AgentRole } from '@/lib/db/provider/types';
-import { fetchPreferences } from '@/lib/settings/client';
 import { applyMention, extractMentions, matchRoles, parseMention } from '@/lib/client/mentions';
 
 /** 发送载荷（POST /api/projects/[id]/messages 请求体） */
@@ -32,6 +33,8 @@ export interface ChatInputProps {
   onStop: () => void;
   /** 生成进行中：显示停止钮，发送语义变为「干预入队」 */
   running: boolean;
+  /** 本项目的生成模式（创建时确定；只读徽标展示） */
+  mode: 'fast' | 'full';
   /** 快照未就绪时禁用整个输入区 */
   disabled?: boolean;
 }
@@ -80,32 +83,16 @@ function MentionPopover({
   );
 }
 
-export function ChatInput({ onSend, onStop, running, disabled = false }: ChatInputProps): ReactElement {
+export function ChatInput({ onSend, onStop, running, mode, disabled = false }: ChatInputProps): ReactElement {
   const [text, setText] = useState('');
   const [caret, setCaret] = useState(0);
   /** chips 多选（与正文里的 @ 提及取并集发送） */
   const [picked, setPicked] = useState<AgentRole[]>([]);
-  const [mode, setMode] = useState<'fast' | 'full'>('full');
   const [sending, setSending] = useState(false);
   /** Esc 关闭浮层时记录的过滤词：换词（继续输入）即重新打开 */
   const [dismissedQuery, setDismissedQuery] = useState<string | null>(null);
   const [highlight, setHighlight] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-
-  // 模式胶囊初值 = session 偏好（外部系统同步收在 effect，React 规则 3）；失败静默保持「完整」
-  useEffect(() => {
-    let cancelled = false;
-    void fetchPreferences()
-      .then((preferences) => {
-        if (!cancelled && preferences !== null) setMode(preferences.default_mode);
-      })
-      .catch((error: unknown) => {
-        console.error('[chat] 偏好读取失败，模式胶囊回退完整模式：', error);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   const mention = disabled ? null : parseMention(text, caret);
   const candidates = mention === null ? [] : matchRoles(mention.query);
@@ -296,17 +283,14 @@ export function ChatInput({ onSend, onStop, running, disabled = false }: ChatInp
             <Square className="size-4" aria-hidden />
           </Button>
         )}
-        <Button
-          variant="outline"
-          size="sm"
+        {/* 模式徽标：只读展示（mode 在创建项目时确定，见组件头注释） */}
+        <span
           aria-label="生成模式"
-          title="切换本轮生成模式（快速=模板加速 / 完整=全量流水线）"
-          onClick={() => setMode((current) => (current === 'fast' ? 'full' : 'fast'))}
-          disabled={disabled}
-          className="h-8 shrink-0 max-lg:h-11"
+          title="模式在创建项目时确定（首页可改），生成中不可切换"
+          className="border-border bg-panel text-muted-foreground inline-flex h-8 shrink-0 items-center gap-1 rounded-full border px-3 text-xs max-lg:h-11"
         >
-          {mode === 'fast' ? '⚡ 快速' : '🧩 完整'}
-        </Button>
+          {mode === 'fast' ? '⚡' : '🧩'} {modeLabel(mode)}
+        </span>
 
         <span className="min-w-0 flex-1 truncate text-right text-[11px] text-muted-foreground">
           {mentions.length > 0 ? `将发给 ${mentions.length} 位成员` : null}

@@ -14,14 +14,25 @@
  *
  * 与顶栏「视图切换 tabs[编辑器|预览]」是两层：这里管理的是文件页签，不感知全局视图。
  */
-import { Suspense, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, type Ref } from 'react';
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type Ref,
+} from 'react';
 import dynamic from 'next/dynamic';
 import { useParams } from 'next/navigation';
 import { toast } from 'sonner';
-import { X } from 'lucide-react';
+import { RefreshCw, X } from 'lucide-react';
 import { roleRegistry } from '@/lib/agents/registry';
 import { createWorkspaceStore, useWorkspaceFile } from '@/lib/client/store';
-import { saveHumanFile, setFileSoftLock } from '@/lib/client/session';
+import { isGenerationRunning } from '@/lib/client/format';
+import { fetchWorkspaceSnapshot, regenerateProjectFile, saveHumanFile, setFileSoftLock } from '@/lib/client/session';
 import { Button } from '@/components/ui/button';
 import { ConflictDialog } from '@/components/viewer/ConflictDialog';
 import { EditToggle } from '@/components/viewer/EditToggle';
@@ -226,6 +237,24 @@ function baseNameOf(path: string): string {
   return segments[segments.length - 1] ?? path;
 }
 
+/**
+ * 项目是否生成中（单文件重试入口的可用性信号，口径同 ChatPanel 的 isGenerationRunning）。
+ * 订阅返回布尔原始值：值不变不重渲染，其他文件的 delta 流不会牵连本组件。
+ */
+function useGenerationRunning(projectId: number): boolean {
+  const store = createWorkspaceStore(projectId);
+  const getSnapshot = useCallback((): boolean => {
+    const state = store.getState();
+    return isGenerationRunning({
+      finished: state.finished,
+      projectStatus: state.project?.status ?? null,
+      runningRunCount: state.runs.filter((run) => run.status === 'running').length,
+      livePathCount: state.livePaths.length,
+    });
+  }, [store]);
+  return useSyncExternalStore(store.subscribe, getSnapshot, getSnapshot);
+}
+
 /** M 角标：蓝=agent 产出、绿=人工/预置（与文件树 M 角标同一口径） */
 function EditorFlag({ editor }: { editor: FileEditor }): React.ReactElement {
   const isAgent = editor in roleRegistry;
@@ -271,10 +300,13 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
   const kind = viewerKindForPath(path);
   // 与 useWorkspaceFile 同一 per-project 单例：人工保存成功后需要就地推进 store
   const store = createWorkspaceStore(projectId);
+  const running = useGenerationRunning(projectId);
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
+  /** 单文件重试请求在途（重试完成前禁用入口，防重复触发） */
+  const [regenerating, setRegenerating] = useState(false);
   /** 409 冲突上下文：服务端当前内容（并排 diff）+ 当前版本号（「用我的」就地重发用，T25） */
   const [conflictWith, setConflictWith] = useState<{ current: string; version: number } | null>(null);
   /** 拒存提示（流式生成中保存被拒；内联展示，不吞草稿） */
@@ -288,6 +320,47 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
 
   const fileId = file.id;
   const editable = fileId !== null && !file.streaming;
+
+  /**
+   * 单文件重试（CLAUDE.md 规则 3 / DESIGN §3.10③）：仅空闲可用。
+   * 服务端补发完整事件链，store 由 SSE 推进（打字机可见），无需客户端重拉快照。
+   * SSE 事件不带 files.id：本轮会话内生成的文件在快照 hydrate 前 id 为 null——
+   * 点击时惰性拉一次快照按 path 补齐（顺带回填编辑入口），不落库的 path 才报错。
+   */
+  const handleRegenerate = useCallback((): void => {
+    if (regenerating) return;
+    const resolveId = async (): Promise<number> => {
+      const known = fileRef.current.id;
+      if (known !== null) return known;
+      store.hydrate(await fetchWorkspaceSnapshot(projectId));
+      const resolved = store.getState().files.get(path)?.id;
+      if (resolved === null || resolved === undefined) {
+        throw new Error(`文件尚未落库，无法重试：${path}`);
+      }
+      return resolved;
+    };
+    setRegenerating(true);
+    void resolveId()
+      .then((currentId) => regenerateProjectFile(projectId, currentId))
+      .then((result) => {
+        // ok=false = 内容已落库但校验未过（服务端语义：文件保留），降级 warning 提示
+        const description = `v${result.version}${result.ok ? '（校验通过）' : '（校验未过，文件已保留）'}`;
+        if (result.ok) toast.success(`已重新生成 ${result.path}`, { description });
+        else toast.warning(`已重新生成 ${result.path}`, { description });
+      })
+      .catch((error: unknown) => {
+        console.error('[viewer] 单文件重试失败：', error);
+        toast.error('重新生成失败', { description: error instanceof Error ? error.message : '请稍后重试' });
+      })
+      .finally(() => setRegenerating(false));
+  }, [projectId, path, regenerating, store]);
+
+  /** 重试入口禁用原因（title 与读屏可见） */
+  const regenerateDisabledReason = file.streaming
+    ? '该文件正在生成中'
+    : running
+      ? '生成进行中，暂不能重试单文件：请先停止或等待本轮完成'
+      : '';
 
   const leaveEditing = useCallback((): void => {
     setEditing(false);
@@ -409,14 +482,30 @@ function FilePane({ projectId, path }: FilePaneProps): React.ReactElement {
               </Button>
             </>
           ) : (
-            <EditToggle
-              disabled={!editable}
-              disabledReason={file.streaming ? '文件正在生成，暂不可编辑' : '文件尚未落库，稍后再试'}
-              onEnterEditing={() => {
-                setDraft(file.content);
-                setEditing(true);
-              }}
-            />
+            <>
+              {/* 单文件重试（空闲 + 已落库才可用；服务端 409 兜底，SSE 事件驱动更新） */}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                aria-label={`重新生成 ${path}`}
+                title={regenerateDisabledReason !== '' ? regenerateDisabledReason : '重跑该单文件任务（工程师重写这一份）'}
+                disabled={file.streaming || running || regenerating}
+                onClick={handleRegenerate}
+                className="max-lg:h-11 gap-1.5"
+              >
+                <RefreshCw className={cn('size-3.5', regenerating && 'animate-spin')} aria-hidden />
+                {regenerating ? '重新生成中…' : '重新生成'}
+              </Button>
+              <EditToggle
+                disabled={!editable}
+                disabledReason={file.streaming ? '文件正在生成，暂不可编辑' : '文件尚未落库，稍后再试'}
+                onEnterEditing={() => {
+                  setDraft(file.content);
+                  setEditing(true);
+                }}
+              />
+            </>
           )}
         </div>
       </header>

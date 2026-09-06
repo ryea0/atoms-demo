@@ -25,7 +25,14 @@ export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 45_000;
 export const DEFAULT_STREAM_TOTAL_TIMEOUT_MS = 300_000;
 
 /**
- * 解析正整数毫秒配置：缺省/空串/非数字/≤0/小数一律回退默认，不抛错。
+ * 单个 setTimeout 所能接受的最大毫秒数（2^31-1，约 24.8 天）。
+ * 超过它 Node 会把延时钳到 1ms（stream 计时器瞬间判死），AbortSignal.timeout 则直接抛 RangeError。
+ */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * 解析正整数毫秒配置：缺省/空串/非数字/≤0/小数一律回退默认，不抛错；
+ * 荒谬大值封顶到 MAX_TIMEOUT_MS（保留「尽量长」的意图，同时保证计时器可用）。
  * 配置写错宁可退回保守默认，也不让一次手滑把超时打成 0 或 NaN。
  */
 export function readPositiveIntMs(raw: string | undefined, fallback: number): number {
@@ -34,7 +41,7 @@ export function readPositiveIntMs(raw: string | undefined, fallback: number): nu
   if (trimmed === '') return fallback;
   const parsed = Number(trimmed);
   if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
-  return parsed;
+  return Math.min(parsed, MAX_TIMEOUT_MS);
 }
 
 /** 超时类别与实际生效值（错误消息必须带上，便于探针/日志定位是哪一刀） */

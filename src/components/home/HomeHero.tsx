@@ -5,6 +5,9 @@
  * ⊕ 占位 + 黑色圆形发送）、示例 chips、可关闭公告条。
  * 提交 → POST /api/projects → router.push(`/p/${id}`)。
  * @ 成员浮层只在输入卡里预留位置（T19 接线），本组件不实现浮层逻辑。
+ * 模式胶囊是 mode 的**唯一可选举**（工作台内为只读徽标）：初值接 session 偏好
+ * `preferences.default_mode`（GET /api/settings，T23 的本意消费位），随建项目请求上送；
+ * 读取失败静默保持 fast（normalizePreferences 兜底口径一致）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
@@ -12,6 +15,7 @@ import { ArrowUp, Plus, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { roleOrder, roleRegistry } from '@/lib/agents/registry';
 import { ApiError, createProject, dismissAnnouncement, isAnnouncementDismissed } from '@/lib/client/session';
+import { fetchPreferences } from '@/lib/settings/client';
 
 /** 示例 chips（点击回填输入框） */
 const SAMPLES = [
@@ -34,6 +38,21 @@ export function HomeHero() {
   // 公告条关闭标记在 sessionStorage（会话级）；只在挂载时读一次外部存储
   useEffect(() => {
     if (isAnnouncementDismissed()) setAnnouncementOpen(false);
+  }, []);
+
+  // 模式初值 = session 偏好（外部系统同步收在 effect，React 规则 3）；失败静默保持 fast
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPreferences()
+      .then((preferences) => {
+        if (!cancelled && preferences !== null) setMode(preferences.default_mode);
+      })
+      .catch((error: unknown) => {
+        console.error('[home] 偏好读取失败，模式胶囊回退快速模式：', error);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const autoResize = useCallback(() => {
