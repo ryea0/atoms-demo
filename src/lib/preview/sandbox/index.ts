@@ -2,9 +2,11 @@
 import type { PreviewRuntime } from '@/lib/languages/types';
 import type { PreviewSandboxProvider } from './types';
 import { browserJsSandbox } from './browser-js';
+import { browserPyodideSandbox } from './browser-pyodide';
 
 const SANDBOXES: Partial<Record<PreviewRuntime, PreviewSandboxProvider>> = {
   'browser-js': browserJsSandbox,
+  'browser-pyodide': browserPyodideSandbox,
 };
 
 /** 未注册 runtime 回退 browser-js（先例：EXEC_PROVIDER 回退 local；只告警一次） */
