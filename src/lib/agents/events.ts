@@ -34,6 +34,27 @@ export type StreamEventName =
   | 'stopped'
   | 'error';
 
+/**
+ * 协议全部事件名（StreamEventName 的值清单，单一事实来源）。
+ * 客户端 EventSource 必须按名逐个 addEventListener：原生 EventSource 只把
+ * 「无 event: 字段」的帧派发给 onmessage，自定义 event: 类型的帧只会按类型派发——
+ * 只挂 onmessage 的连接收不到任何协议事件（2026-09-06 /p/7 事故：直播/文件树/时间线
+ * 全部冻结，页面只剩挂载时快照，文件要手动刷新才出现）。
+ */
+export const STREAM_EVENT_NAMES = [
+  'agent_start',
+  'file_start',
+  'delta',
+  'file_end',
+  'agent_end',
+  'message',
+  'intervention_injected',
+  'reasoning',
+  'done',
+  'stopped',
+  'error',
+] as const satisfies readonly StreamEventName[];
+
 /** 单条流事件：seq/projectId 由总线分配，其余字段按事件语义选填 */
 export interface StreamEvent {
   seq: number;

@@ -880,7 +880,9 @@ describe('workspaceStore 单例', () => {
 /* useWorkspace 连接管道（EventSource stub；T17 R2 首连重放入口）         */
 /* ------------------------------------------------------------------ */
 
-/** jsdom 无 EventSource：用可观察 stub 捕获连接 URL / onmessage / close */
+/** jsdom 无 EventSource：可观察 stub——捕获连接 URL / 事件监听器 / close。
+ * 分发语义与浏览器一致（2026-09-06 /p/7 事故补齐）：自定义 `event: <type>` 的帧
+ * 只派发给对应 addEventListener 监听器；只有 message 类型才触发 onmessage。 */
 class MockEventSource {
   static readonly instances: MockEventSource[] = [];
 
@@ -888,9 +890,23 @@ class MockEventSource {
   onopen: ((event: MessageEvent) => void) | null = null;
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
+  private readonly listeners = new Map<string, Set<(event: Event) => void>>();
 
   constructor(public readonly url: string) {
     MockEventSource.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: (event: Event) => void): void {
+    const set = this.listeners.get(type) ?? new Set();
+    set.add(listener);
+    this.listeners.set(type, set);
+  }
+
+  /** 测试侧派发：按类型调用监听器（'message' 额外触发 onmessage——与浏览器一致） */
+  dispatch(type: string, data: string): void {
+    const event = new MessageEvent(type, { data });
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+    if (type === 'message' && this.onmessage !== null) this.onmessage(event);
   }
 
   close(): void {
@@ -899,7 +915,7 @@ class MockEventSource {
 }
 
 describe('useWorkspace 连接管道', () => {
-  it('快照 lastSeq 进首连 URL（?lastEventId=），重放事件经 onmessage 入 store，卸载关闭连接', async () => {
+  it('快照 lastSeq 进首连 URL（?lastEventId=），重放的自定义类型事件经 addEventListener 入 store，卸载关闭连接', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(makeSnapshot({ lastSeq: 12 })));
     vi.stubGlobal('fetch', fetchMock);
     vi.stubGlobal('EventSource', MockEventSource as unknown as typeof EventSource);
@@ -916,12 +932,13 @@ describe('useWorkspace 连接管道', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/projects/7', expect.anything());
     expect(MockEventSource.instances[0]?.url).toBe('/api/projects/7/stream?lastEventId=12');
 
-    // 重放的 delta 事件经 onmessage 进 store（首连重放不依赖 Last-Event-ID 头）
+    // 重放的 delta（自定义 event: 类型）经 addEventListener 进 store（首连重放不依赖 Last-Event-ID 头）。
+    // 只挂 onmessage 收不到自定义类型帧——/p/7 事故根因，此处按浏览器语义驱动
     const source = MockEventSource.instances[0];
     expect(source).toBeDefined();
     if (source === undefined) return;
     act(() => {
-      source.onmessage?.(new MessageEvent('message', { data: JSON.stringify(ev({ event: 'delta', path: 'app/x.js', content: 'hi' })) }));
+      source.dispatch('delta', JSON.stringify(ev({ event: 'delta', path: 'app/x.js', content: 'hi' })));
     });
     expect(createWorkspaceStore(7).getState().files.get('app/x.js')?.content).toBe('hi');
 

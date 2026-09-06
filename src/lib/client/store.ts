@@ -16,7 +16,7 @@
  * 保证 getSnapshot 引用稳定。合成节点用负数 id，绝不与库里的自增 id 冲突。
  */
 import { useEffect, useSyncExternalStore } from 'react';
-import type { StreamEvent } from '@/lib/agents/events';
+import { STREAM_EVENT_NAMES, type StreamEvent } from '@/lib/agents/events';
 import { roleRegistry } from '@/lib/agents/registry';
 import type {
   AgentRole,
@@ -899,13 +899,21 @@ export function useWorkspace(projectId: number): WorkspaceState {
       // 头接管（route 侧头优先于 query，重连不受 URL 里的旧值影响）
       source = new EventSource(`/api/projects/${projectId}/stream?lastEventId=${lastSeq}`);
       source.onopen = () => store.setConnected(true);
-      source.onmessage = (messageEvent: MessageEvent<string>) => {
+      // 按协议事件名逐个 addEventListener（2026-09-06 /p/7 事故修复）：服务端每帧都带自定义
+      // `event: <type>` 字段，原生 EventSource 只把「无 event: 字段」的帧派发给 onmessage——
+      // 此前只挂 onmessage，reasoning/delta/agent_* 等全部自定义类型被静默丢弃，直播块/文件树/
+      // 时间线全部冻结在挂载时快照（文件要手动刷新才出现，直播块只剩快照播种的空壳）。
+      // 'message' 也在清单里，addEventListener('message') 完整替代 onmessage 语义。
+      const apply = (event: Event): void => {
+        const data = (event as MessageEvent<string>).data;
+        if (typeof data !== 'string') return;
         try {
-          store.applyEvent(JSON.parse(messageEvent.data) as StreamEvent);
+          store.applyEvent(JSON.parse(data) as StreamEvent);
         } catch (error) {
           console.error('[workspace] SSE 事件解析失败：', error);
         }
       };
+      for (const name of STREAM_EVENT_NAMES) source.addEventListener(name, apply);
       // onerror 只更新指示灯；EventSource 浏览器原生自动重连并携带 Last-Event-ID
       source.onerror = () => store.setConnected(false);
     };

@@ -83,7 +83,11 @@ function makeSnapshot(over: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot 
   };
 }
 
-/* jsdom 无 EventSource：只记录 URL 与关闭动作（连接细节在 store 测试里断言） */
+/* jsdom 无 EventSource：记录 URL/关闭动作，并实现浏览器的事件分发语义
+ * （连接细节在 store 测试里断言）。分发语义（2026-09-06 /p/7 事故补齐）：
+ * 帧带自定义 `event: <type>` 时按类型派发给 addEventListener 注册的监听器；
+ * 只有「无 event: 字段 / event: message」才触发 onmessage——只挂 onmessage 的
+ * 连接收不到任何自定义类型事件，这正是直播/文件树冻结的根因，mock 必须如实模拟。 */
 class MockEventSource {
   static instances: MockEventSource[] = [];
 
@@ -91,14 +95,44 @@ class MockEventSource {
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
   closed = false;
+  private readonly listeners = new Map<string, Set<(event: Event) => void>>();
 
   constructor(public readonly url: string) {
     MockEventSource.instances.push(this);
   }
 
+  addEventListener(type: string, listener: (event: Event) => void): void {
+    const set = this.listeners.get(type) ?? new Set();
+    set.add(listener);
+    this.listeners.set(type, set);
+  }
+
+  removeEventListener(type: string, listener: (event: Event) => void): void {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  /** 测试侧派发：按类型调用监听器（'message' 额外触发 onmessage——与浏览器一致） */
+  dispatch(type: string, data: string): void {
+    const event = { type, data } as unknown as MessageEvent<string>;
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+    if (type === 'message' && this.onmessage !== null) this.onmessage(event);
+  }
+
   close(): void {
     this.closed = true;
   }
+}
+
+/** 通过第 index 个连接派发一条协议事件（payload 即 SSE data 单行 JSON） */
+function dispatchSse(index: number, event: Record<string, unknown>): void {
+  const source = MockEventSource.instances[index];
+  if (source === undefined) throw new Error(`MockEventSource[${index}] 不存在`);
+  act(() => {
+    source.dispatch(
+      typeof event.event === 'string' ? event.event : 'message',
+      JSON.stringify({ projectId: PROJECT_ID, runId: null, ...event }),
+    );
+  });
 }
 
 /** fetch mock 帮手：JSON 响应（session 层读 text 后自行解析） */
@@ -611,5 +645,41 @@ describe('快照加载失败恢复', () => {
     // 但 EventSource 必须照常建立——页面不能因快照失败而失聪（服务端事件照收，直播块/消息自愈）
     expect(MockEventSource.instances).toHaveLength(1);
     expect(MockEventSource.instances[0]?.url).toBe(`/api/projects/${PROJECT_ID}/stream?lastEventId=0`);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* SSE 事件分发（自定义 event: 类型，2026-09-06 /p/7 事故回归）          */
+/* ------------------------------------------------------------------ */
+
+describe('SSE 自定义事件类型分发', () => {
+  it('reasoning/file_start/delta 经 addEventListener 进入 store：直播块出思考链路、文件树长文件（不依赖刷新快照）', async () => {
+    mountWorkspace();
+    await screen.findByRole('tree', { name: '项目文件' });
+    expect(MockEventSource.instances).toHaveLength(1);
+
+    // 快照里没有该文件与思考文本（防串测前置）
+    expect(screen.queryByText('api.js')).toBeNull();
+    expect(screen.queryByText(/先写接口层/)).toBeNull();
+
+    // 自定义类型逐帧派发——只挂 onmessage 的旧实现在这里全聋（直播冻结的根因）
+    dispatchSse(0, { event: 'agent_start', agent: 'engineer', seq: 1 });
+    dispatchSse(0, { event: 'reasoning', agent: 'engineer', content: '先写接口层，再写渲染', seq: 2 });
+    expect(await screen.findByText(/先写接口层/)).toBeInTheDocument(); // 💭 思考链路上屏
+
+    dispatchSse(0, { event: 'file_start', agent: 'engineer', path: 'app/api.js', seq: 3 });
+    dispatchSse(0, { event: 'delta', agent: 'engineer', path: 'app/api.js', content: 'export function handle', seq: 4 });
+    dispatchSse(0, { event: 'file_end', agent: 'engineer', path: 'app/api.js', meta: { version: 1 }, seq: 5 });
+    // 文件树长出文件；T30 自动跟随同时打开查看器页签（两处出现，用 findAll）
+    const hits = await screen.findAllByText('api.js');
+    expect(hits.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('无 event: 字段的裸帧才走 onmessage：message 类型仍可达（聊天消息不丢）', async () => {
+    mountWorkspace();
+    await screen.findByRole('tree', { name: '项目文件' });
+
+    dispatchSse(0, { event: 'message', content: '直播中的收尾汇报', meta: { role: 'assistant', messageId: 9001 }, seq: 6 });
+    expect(await screen.findByText(/直播中的收尾汇报/)).toBeInTheDocument();
   });
 });
