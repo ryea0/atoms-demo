@@ -244,7 +244,7 @@ function fileTreeRepairSystemPrompt(): string {
     '你是架构师，执行一次窄任务：上一轮单发产出被截断，机读文件树缺失。',
     '只输出一份 file_tree JSON（裸 JSON 或 ```json 围栏均可），不要输出任何其他文件、图或解释文字。',
     '结构：[{"path":"...","desc":"职责一句话","depends":["..."]}]，按依赖拓扑序排列，depends 只指向树内已有路径。',
-    '后端固定 app/backend/api.js（无框架同构模块，导出 handle(method, path, body)，数据存内存）；'
+    '后端入口默认 app/backend/api.js；leader 交接 summary 写明「后端语言=typescript|python」时改用 api.ts/api.py（同构 handle 契约不变）。'
       + "前端固定 app/frontend/index.html（单页，fetch('/api/...')，禁 localStorage）。生成应用零依赖、无构建步骤。",
   ].join('\n');
 }
