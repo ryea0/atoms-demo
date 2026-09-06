@@ -20,6 +20,8 @@ interface ScriptedStep {
   content?: string;
   toolCalls?: ToolCall[];
   deltas?: string[];
+  /** 工具参数分片：经 req.onToolCallDelta 回调（runner 未接线则收不到，测试即失败） */
+  toolArgFragments?: string[];
 }
 
 /** 脚本耗尽时抛出的哨兵错误（让"多跑了一步"的测试显式失败，而不是静默通过） */
@@ -51,6 +53,9 @@ class FakeProvider implements LlmProvider {
     this.cursor += 1;
     if (step === undefined) throw new ScriptExhaustedError();
     for (const text of step.deltas ?? []) onDelta(text);
+    for (const fragment of step.toolArgFragments ?? []) {
+      req.onToolCallDelta?.({ index: 0, id: 'call_fake', name: 'write_file', fragment });
+    }
     return { content: step.content ?? '', toolCalls: step.toolCalls ?? [], usage: null };
   }
 
@@ -253,6 +258,31 @@ describe('runAgent：校验重试与终止', () => {
     expect(result.steps).toBe(1);
     expect(result.toolCalls).toEqual([]);
     expect(requestAt(provider, 0).tools).toBeUndefined();
+  });
+
+  it('④′ onToolCallDelta 收到工具参数流分片（内核原样透传，不缓冲不裁剪）', async () => {
+    const { ctx } = await newCtx();
+    const provider = new FakeProvider(
+      {
+        toolCalls: [{ id: 'call_fake', name: 'write_file', args: { path: 'app/a.js', content: 'x' } }],
+        toolArgFragments: ['{"path":"app/a.js","con', 'tent":"x"}'],
+      },
+      { content: '完成' },
+    );
+    const seen: Array<{ index: number; id: string; name: string; fragment: string }> = [];
+    await runAgent(
+      makeOpts(ctx, provider, {
+        callbacks: { onToolCallDelta: (d) => seen.push({ ...d }) },
+      }),
+    );
+
+    expect(seen).toHaveLength(2);
+    expect(seen.map((d) => d.fragment).join('')).toBe('{"path":"app/a.js","content":"x"}');
+    for (const d of seen) {
+      expect(d.index).toBe(0);
+      expect(d.id).toBe('call_fake');
+      expect(d.name).toBe('write_file');
+    }
   });
 });
 

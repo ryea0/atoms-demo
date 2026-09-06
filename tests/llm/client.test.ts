@@ -208,6 +208,28 @@ describe('mock provider 流式', () => {
     ).rejects.toThrow(/中止|abort/i);
     expect(seen).toHaveLength(0);
   });
+
+  it('工程师 + write_file 工具：文件全文走参数流分片（onToolCallDelta），正文通道不再吐全文', async () => {
+    const provider = createMockProvider();
+    const contentDeltas: string[] = [];
+    const argFragments: string[] = [];
+    const result = await provider.stream(
+      makeReq({
+        tools: [{ name: 'write_file', description: '写文件', parameters: { type: 'object' } }],
+        onToolCallDelta: (d) => argFragments.push(d.fragment),
+      }),
+      (t: string) => contentDeltas.push(t),
+    );
+
+    const writeCall = result.toolCalls.find((c) => c.name === 'write_file');
+    expect(writeCall).toBeDefined();
+    expect(argFragments.length).toBeGreaterThan(1); // 分片流（打字机粒度）
+    const parsed = JSON.parse(argFragments.join('')) as { path: string; content: string };
+    expect(parsed).toEqual(writeCall?.args);
+    expect(parsed.content.length).toBeGreaterThan(0);
+    // 与真模型同语义：工具轮的正文 content 不承载文件全文（content 通道只属于零工具角色）
+    expect(contentDeltas.join('')).toBe('');
+  });
 });
 
 describe('mock provider 角色路由', () => {
@@ -446,6 +468,81 @@ describe('openai 兼容客户端', () => {
     expect(payload.model).toBe('qwen-test');
     expect(payload.stream).toBe(true);
     expect(payload.stream_options).toEqual({ include_usage: true });
+  });
+
+  it('stream：tool_calls 参数分片经 req.onToolCallDelta 透传（真机形态：首片带 id+name，后续只带 arguments）', async () => {
+    stubOpenAiEnv();
+    const fragments = ['{"path": "', 'app/a.js', '", "content": "', 'console.log(1)\\n"', '}'];
+    const chunks: unknown[] = [
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                { index: 0, id: 'call_wf', type: 'function', function: { name: 'write_file', arguments: fragments[0] } },
+              ],
+            },
+          },
+        ],
+      },
+      ...fragments.slice(1).map((fragment) => ({
+        choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: fragment } }] } }],
+      })),
+      { choices: [], usage: { prompt_tokens: 9, completion_tokens: 5 } },
+    ];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(sseResponse(chunks))),
+    );
+
+    const provider = getLlmProvider();
+    const argDeltas: Array<{ index: number; id: string; name: string; fragment: string }> = [];
+    const result = await provider.stream(
+      makeReq({
+        model: 'qwen-test',
+        onToolCallDelta: (d) => argDeltas.push({ ...d }),
+      }),
+      () => {},
+    );
+
+    // 分片原样透传（provider 不做语义解析），拼回完整 arguments
+    expect(argDeltas).toHaveLength(fragments.length);
+    expect(argDeltas.map((d) => d.fragment).join('')).toBe(fragments.join(''));
+    for (const d of argDeltas) {
+      expect(d.index).toBe(0);
+      expect(d.id).toBe('call_wf');
+      expect(d.name).toBe('write_file');
+    }
+    // 聚合结果不受新通道影响
+    expect(result.toolCalls).toEqual([
+      { id: 'call_wf', name: 'write_file', args: { path: 'app/a.js', content: 'console.log(1)\n' } },
+    ]);
+  });
+
+  it('stream：分片所在调用一直无 id → 不回调（打字机缺段，聚合不受影响）', async () => {
+    stubOpenAiEnv();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          sseResponse([
+            { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'write_file', arguments: '{"path"' } }] } }] },
+            { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: ':"a.js"}' } }] } }] },
+          ]),
+        ),
+      ),
+    );
+
+    const provider = getLlmProvider();
+    const argDeltas: unknown[] = [];
+    const result = await provider.stream(
+      makeReq({ model: 'qwen-test', onToolCallDelta: (d) => argDeltas.push(d) }),
+      () => {},
+    );
+
+    expect(argDeltas).toHaveLength(0);
+    expect(result.toolCalls).toEqual([{ id: 'call_0', name: 'write_file', args: { path: 'a.js' } }]);
   });
 
   it('complete：非流式请求（stream=false），解析 message/tool_calls/usage', async () => {

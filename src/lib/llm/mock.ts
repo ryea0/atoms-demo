@@ -414,10 +414,21 @@ export function createMockProvider(): LlmProvider {
           await sleep(mockDelayMs(), req.signal);
         }
       }
-      for (const chunk of chunkText(content)) {
-        throwIfAborted(req.signal);
-        onDelta(chunk);
-        await sleep(mockDelayMs(), req.signal);
+      // 工程师 write_file 轮：与真模型同语义——文件全文走 tool_calls.arguments 参数流分片
+      // （真机正文 content 在工具轮基本为空，旧 mock 把全文塞 content 的做法只适配零工具角色）
+      const writeCall = toolCalls.find((call) => call.name === 'write_file');
+      if (writeCall === undefined) {
+        for (const chunk of chunkText(content)) {
+          throwIfAborted(req.signal);
+          onDelta(chunk);
+          await sleep(mockDelayMs(), req.signal);
+        }
+      } else {
+        for (const chunk of chunkText(JSON.stringify(writeCall.args))) {
+          throwIfAborted(req.signal);
+          req.onToolCallDelta?.({ index: 0, id: writeCall.id, name: 'write_file', fragment: chunk });
+          await sleep(mockDelayMs(), req.signal);
+        }
       }
       return { content, toolCalls, usage: plausibleUsage(req, content, toolCalls) };
     },

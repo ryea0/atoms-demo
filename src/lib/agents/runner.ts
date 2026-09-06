@@ -82,6 +82,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       tools: toolDefs.length > 0 ? toolDefs : undefined,
       // 思考流通道（T31）：挂在请求对象上，计量装饰器/测试桩透传 req 即可拿到
       onReasoning: opts.callbacks?.onReasoning,
+      // 工具参数流通道（同上挂请求对象）：真模型文件打字机的增量来源
+      onToolCallDelta: opts.callbacks?.onToolCallDelta,
       signal,
     };
 

@@ -340,6 +340,10 @@ describe('startGeneration（mock 全链路）', () => {
     expect(mustFind(events, (e) => e.event === 'file_end' && e.path === 'docs/prd.md').agent).toBe('pm');
     expect(mustFind(events, (e) => e.event === 'file_start' && e.path === 'app/backend/api.js').agent).toBe('engineer');
     expect(mustFind(events, (e) => e.event === 'delta' && e.path === 'app/backend/api.js').content?.length).toBeGreaterThan(0);
+    // 工程师文件打字机来自 write_file 参数流：delta 拼接必须与落库内容一致（正文废话不混入文件）
+    const apiDeltas = events.filter((e) => e.event === 'delta' && e.path === 'app/backend/api.js');
+    const apiRow = (await storage.readAllFiles(projectId)).find((row) => row.path === 'app/backend/api.js');
+    expect(apiDeltas.map((e) => e.content ?? '').join('')).toBe(apiRow?.content ?? '');
     expect(mustFind(events, (e) => e.event === 'file_end' && e.path === 'app/frontend/index.html').agent).toBe('engineer');
     // 架构师产物按 files 清单补发 file_start/file_end（无逐段 delta，T14 现状）
     expect(mustFind(events, (e) => e.event === 'file_end' && e.path === 'docs/system_design.md').agent).toBe('architect');

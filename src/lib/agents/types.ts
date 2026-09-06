@@ -9,7 +9,7 @@
  */
 import type { Tool, ToolContext } from '@/lib/agents/tools';
 import type { AgentRole } from '@/lib/db/provider/types';
-import type { LlmProvider } from '@/lib/llm/types';
+import type { LlmProvider, ToolCallStreamDelta } from '@/lib/llm/types';
 
 /** 内核回调：编排器用来落库/发 SSE 与转发打字机流 */
 export interface RunnerCallbacks {
@@ -27,6 +27,12 @@ export interface RunnerCallbacks {
    * 也不计入用量（completion 口径只算正文）。编排器接成 SSE reasoning 事件（ephemeral，不重放）。
    */
   onReasoning?: (text: string) => void;
+  /**
+   * 工具参数流分片：真实模型写文件的全文走 tool_calls.arguments 增量（正文 content 在
+   * 工具轮基本为空）。内核原样透传 provider 的 onToolCallDelta，不缓冲不裁剪、不计用量；
+   * 消费方（编排器 write-file-stream）增量解出 write_file 的 content 字段接成文件打字机。
+   */
+  onToolCallDelta?: (delta: ToolCallStreamDelta) => void;
 }
 
 /** 一次 agent 运行的入参：角色四要素（prompt/工具/模型/上下文）+ 防失控与回调 */

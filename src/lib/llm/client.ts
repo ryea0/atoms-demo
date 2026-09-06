@@ -499,7 +499,18 @@ export function createOpenAiProvider(env: NodeJS.ProcessEnv = process.env): LlmP
             content += text;
             onDelta(text);
           }
-          for (const call of delta?.tool_calls ?? []) accumulateToolCall(toolCallMap, call);
+          for (const call of delta?.tool_calls ?? []) {
+            accumulateToolCall(toolCallMap, call);
+            // 参数分片通道：id 已知才透传（真机首片带 id+name、后续只带 arguments；
+            // 无 id 的网关降级为打字机缺段，聚合结果不受影响）——见 LlmRequest.onToolCallDelta 注
+            const argsFragment = call.function?.arguments;
+            if (argsFragment !== undefined && argsFragment !== '' && req.onToolCallDelta !== undefined) {
+              const acc = toolCallMap.get(call.index);
+              if (acc !== undefined && acc.id !== '') {
+                req.onToolCallDelta({ index: call.index, id: acc.id, name: acc.name, fragment: argsFragment });
+              }
+            }
+          }
           const chunkUsage = chunk.data.usage;
           if (chunkUsage?.prompt_tokens !== undefined && chunkUsage?.completion_tokens !== undefined) {
             usage = { promptTokens: chunkUsage.prompt_tokens, completionTokens: chunkUsage.completion_tokens };

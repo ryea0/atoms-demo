@@ -15,6 +15,7 @@
  */
 import { projectEventBus, type StreamEvent } from '@/lib/agents/events';
 import { roleRegistry } from '@/lib/agents/registry';
+import { createWriteFileDeltaForwarder } from '@/lib/agents/write-file-stream';
 import {
   addTaskSubtasks,
   appendProgressLine,
@@ -1022,6 +1023,10 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
     const designSummary = appendInterventions(baseSummary, fileInterventions);
 
     c.emit({ runId: null, event: 'file_start', agent: 'engineer', path: node.path });
+    // 文件打字机只来自 write_file 参数流（真模型全文走 tool_calls.arguments，正文 content
+    // 在工具轮基本为空且只是收尾废话——不再转发进文件通道，防拼接污染）；
+    // 覆写修正/校验重试（新 call id）由转发器补发 file_start 重开新档
+    const forwardFileDelta = createWriteFileDeltaForwarder(node.path, 'engineer', c.emit);
     const result = await runEngineerFile({
       storage,
       projectId,
@@ -1031,7 +1036,7 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
       designSummary,
       signal: c.signal,
       callbacks: {
-        onDelta: (text) => c.emit({ runId: null, event: 'delta', agent: 'engineer', path: node.path, content: text }),
+        onToolCallDelta: forwardFileDelta,
         onReasoning: reasoningEmitOf(c.emit, 'engineer'),
       },
     });
