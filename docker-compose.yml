@@ -1,0 +1,37 @@
+# Atoms-Demo 本地/单机部署
+#
+# 用法：
+#   docker compose up --build          # 构建并启动（http://localhost:3000）
+#   LLM_PROVIDER=openai LLM_BASE_URL=... LLM_API_KEY=... LLM_MODEL=... docker compose up --build
+#
+# 环境变量从宿主 shell / 同目录 .env（compose 约定文件）读取，缺省全 mock 可离线跑通。
+# 数据卷：./data ↔ 容器 /app/data（SQLite 库 + WAL），重建容器数据不丢。
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      # LLM（env 晚绑定，仅服务端读取；不写死任何密钥）
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_MODEL_LEADER: ${LLM_MODEL_LEADER:-}
+      LLM_MODEL_PM: ${LLM_MODEL_PM:-}
+      LLM_MODEL_ARCHITECT: ${LLM_MODEL_ARCHITECT:-}
+      LLM_MODEL_ENGINEER: ${LLM_MODEL_ENGINEER:-}
+      # 其余角色同理：LLM_MODEL_<ROLE>（可选角色 ∈ leader|pm|architect|engineer|analyst|seo|ads）
+      LLM_MOCK_DELAY_MS: ${LLM_MOCK_DELAY_MS:-5}
+      LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-90000}
+      LLM_STREAM_IDLE_TIMEOUT_MS: ${LLM_STREAM_IDLE_TIMEOUT_MS:-45000}
+      LLM_STREAM_TOTAL_TIMEOUT_MS: ${LLM_STREAM_TOTAL_TIMEOUT_MS:-300000}
+      # 存储（compose 卷内绝对路径；schema 首连自举）
+      DB_DRIVER: sqlite
+      DB_FILE: /app/data/app.db
+      RETRIEVAL_PROVIDER: ${RETRIEVAL_PROVIDER:-grep}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
