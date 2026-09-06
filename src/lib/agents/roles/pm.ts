@@ -42,6 +42,8 @@ export interface PmContext {
   provider?: LlmProvider;
   /** 流式增量透传（编排器接打字机 SSE delta 用）；缺省不透传，行为不变 */
   onDelta?: (text: string) => void;
+  /** 思考流透传（编排器接 SSE reasoning 事件用，T31）；缺省不透传，行为不变 */
+  onReasoning?: (text: string) => void;
 }
 
 /** runPm 结果：任务 id + 实际落库的文件清单 */
@@ -148,7 +150,10 @@ export async function runPm(ctx: PmContext): Promise<PmResult> {
       model,
       ctx: { storage, projectId, role: 'pm' },
       provider,
-      callbacks: ctx.onDelta === undefined ? undefined : { onDelta: ctx.onDelta },
+      callbacks:
+        ctx.onDelta === undefined && ctx.onReasoning === undefined
+          ? undefined
+          : { onDelta: ctx.onDelta, onReasoning: ctx.onReasoning },
       signal: ctx.signal,
     });
 

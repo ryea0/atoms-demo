@@ -32,6 +32,18 @@ export interface LlmRequest {
   tools?: ToolDef[];
   maxTokens?: number;
   signal?: AbortSignal;
+  /**
+   * 思考流增量回调（T31，仅 stream 路径有意义，complete 不回调）：
+   * OpenAI 兼容接口在 delta.reasoning_content（部分网关叫 delta.reasoning）里吐思考片段，
+   * provider 解析到即回调；两者都没有则一次也不回调。
+   *
+   * 刻意挂在请求对象上（而非给 stream 加第三个参数）：计量装饰器/测试桩对 req 原样透传即可，
+   * LlmProvider 的全部实现与调用面零改动（与 signal 同类的「通道型」请求字段）。
+   *
+   * 计量口径：思考流**不进 content、不进估算公式**——completion tokens 只算正文（DESIGN §4.4
+   * 口径不变）；服务端 usage 里若已含思考 token 属 provider 侧口径，本层不做二次修正。
+   */
+  onReasoning?: (text: string) => void;
 }
 
 export interface LlmResult {

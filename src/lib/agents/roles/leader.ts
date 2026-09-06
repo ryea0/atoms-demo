@@ -62,6 +62,8 @@ export interface RouteLeaderInput {
   hasFiles: boolean;
   signal?: AbortSignal;
   provider?: LlmProvider;
+  /** 思考流透传（编排器接 SSE reasoning 事件用，T31）；缺省不透传，行为不变 */
+  onReasoning?: (text: string) => void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -390,6 +392,7 @@ export async function routeLeader(input: RouteLeaderInput): Promise<LeaderDecisi
       tools: createLeaderTools(collector),
       model,
       provider,
+      callbacks: input.onReasoning === undefined ? undefined : { onReasoning: input.onReasoning },
       ctx,
       signal: input.signal,
     });

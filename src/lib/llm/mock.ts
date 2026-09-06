@@ -108,6 +108,33 @@ function mockDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DELAY_MS;
 }
 
+/** 思考流开关 env（T31）：默认开——mock 演示链路同样有「思考中」直播；置 off 关掉回到纯正文流 */
+const REASONING_ENV = 'LLM_MOCK_REASONING';
+
+function mockReasoningEnabled(): boolean {
+  return (process.env[REASONING_ENV] ?? '').trim().toLowerCase() !== 'off';
+}
+
+/**
+ * 各场景的思考片段（T31）：2-3 段简短中文，走 onReasoning 同一通道，
+ * 让 mock 链路的「思考中」直播块与真实推理模型（delta.reasoning_content）行为一致。
+ * 只是对现场感的示意，不代表真实决策（决策仍在 render 的固定产出里，规则 1）。
+ */
+function reasoningSegmentsOf(scene: MockScene, requirement: string, target: string): string[] {
+  const topic = requirement === '' ? '这轮需求' : `「${requirement}」`;
+  const table: Record<MockScene, string[]> = {
+    leader: [`先判断 ${topic} 是新需求还是追问，决定要不要拆任务。`, '串行拆解：PM 出 PRD → 架构师出设计与文件树 → 工程师逐文件实现。'],
+    closer: ['盘点本轮产出与人工修改，挑出可复用的决策。', 'MEMORY 只沉淀选型理由、约束和偏好，不写流水账。'],
+    pm: [`把 ${topic} 拆成功能清单，先分优先级。`, '验收标准要可操作验证，不写「体验良好」这类不可测表述。'],
+    architect: ['先定模块边界与依赖方向，再画架构图。', 'file_tree 的 depends 声明就是检索索引，要写准。'],
+    engineer: [`目标是 ${target}，依赖文件全文已读。`, '按契约实现：后端 handle 返回状态码，前端 fetch 调用，不用 localStorage。'],
+    analyst: [`围绕 ${topic} 定北极星指标与护栏指标。`, '没有真实数据的结论一律标注「待验证」。'],
+    seo: ['先定主关键词与长尾词，再谈站内结构。', '建议要可落地，不承诺排名效果。'],
+    ads: ['先定投放目标与受众，再选渠道。', '转化目标要能被数据回溯。'],
+  };
+  return table[scene];
+}
+
 /** 已中止则抛 AbortError（规则 06：abort 必须级联生效） */
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted === true) {
@@ -374,6 +401,15 @@ export function createMockProvider(): LlmProvider {
     },
     async stream(req: LlmRequest, onDelta: (text: string) => void): Promise<LlmResult> {
       const { content, toolCalls } = render(req);
+      // 思考流（T31）：正文之前先吐思考片段；不进 content，completion 计量口径不变
+      if (mockReasoningEnabled()) {
+        const segments = reasoningSegmentsOf(detectScene(req), requirementOf(req.messages), targetPathOf(req.messages));
+        for (const segment of segments) {
+          throwIfAborted(req.signal);
+          req.onReasoning?.(segment);
+          await sleep(mockDelayMs(), req.signal);
+        }
+      }
       for (const chunk of chunkText(content)) {
         throwIfAborted(req.signal);
         onDelta(chunk);

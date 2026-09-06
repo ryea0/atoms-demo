@@ -195,7 +195,13 @@ const streamChunkSchema = z.object({
     .array(
       z.object({
         delta: z
-          .object({ content: z.string().nullish(), tool_calls: z.array(deltaToolCallSchema).nullish() })
+          .object({
+            content: z.string().nullish(),
+            tool_calls: z.array(deltaToolCallSchema).nullish(),
+            // 思考流（T31）：主流字段 reasoning_content，部分兼容网关用 reasoning 别名；都没有=不思考
+            reasoning_content: z.string().nullish(),
+            reasoning: z.string().nullish(),
+          })
           .partial()
           .nullish(),
       })
@@ -465,6 +471,9 @@ export function createOpenAiProvider(env: NodeJS.ProcessEnv = process.env): LlmP
             return;
           }
           const delta = chunk.data.choices?.[0]?.delta;
+          // 思考流先行（T31）：只回调、不进 content——completion 计量口径不受影响（见 LlmRequest 注）
+          const reasoning = delta?.reasoning_content ?? delta?.reasoning;
+          if (reasoning !== undefined && reasoning !== null && reasoning !== '') req.onReasoning?.(reasoning);
           const text = delta?.content;
           if (text !== undefined && text !== null && text !== '') {
             content += text;

@@ -87,6 +87,7 @@ function makeState(over: Partial<WorkspaceState> = {}): WorkspaceState {
     softLocked: [],
     connected: true,
     livePaths: [],
+    liveAgents: {},
     finished: false,
     error: null,
     ...over,
@@ -373,63 +374,85 @@ describe('产物工具卡', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* 直播活动行（T30）：只播报正在进行的任务，历史交时间线                     */
+/* 直播转录块（T31）：吸收取代 T30 活动行——思考流 + 产出尾流进聊天区        */
 /* ------------------------------------------------------------------ */
 
-describe('直播活动行', () => {
-  it('运行中的任务渲染活动行：角色 emoji + 中文名 + 「正在写 {path}」，区域 aria-live=polite', () => {
+describe('直播转录块', () => {
+  it('thinking 块：成员名 + 思考中徽章 + 思考流正文，区域 aria-live=polite', () => {
     mount(
       makeState({
-        runs: [
-          makeRun({
-            id: 21,
-            status: 'done',
-            endedAt: Date.now(),
-            task: '实现 app/done.js',
-            taskKey: 'engineer:app/done.js',
-          }),
-          makeRun({ id: 22, status: 'running', task: '', taskKey: 'engineer:app/main.js' }),
-        ],
+        liveAgents: {
+          pm: { reasoning: '先拆功能清单，再定验收标准。', outputPath: null, outputTail: '', status: 'thinking' },
+        },
       }),
     );
 
-    const region = screen.getByRole('region', { name: '进行中的活动' });
+    const region = screen.getByRole('region', { name: '进行中的成员' });
     expect(region).toHaveAttribute('aria-live', 'polite');
-    // 脉冲动画（运行中的「在动」信号）
-    expect(region.querySelector('.animate-pulse')).not.toBeNull();
-    expect(within(region).getByText('工程师')).toBeInTheDocument();
-    expect(screen.getByText('正在写 app/main.js')).toBeInTheDocument();
-    // 已结束的 run 不进直播区（时间线已管历史，这里只直播当下）
-    expect(screen.queryByText('正在写 app/done.js')).not.toBeInTheDocument();
+    expect(within(region).getByText('产品经理')).toBeInTheDocument();
+    expect(within(region).getByText('思考中…')).toBeInTheDocument();
+    expect(within(region).getByText(/先拆功能清单/)).toBeInTheDocument();
   });
 
-  it('点击活动行的文件路径回调 onOpenFile(path)，跳转查看器打字机', () => {
-    const onOpenFile = vi.fn();
-    mount(makeState({ runs: [makeRun({ status: 'running', task: '', taskKey: 'engineer:app/main.js' })] }), {
-      onOpenFile,
-    });
-
-    fireEvent.click(screen.getByRole('button', { name: '正在写 app/main.js' }));
-    expect(onOpenFile).toHaveBeenCalledWith('app/main.js');
-  });
-
-  it('无法解析出文件路径的任务：显示任务描述文本、不可点击', () => {
+  it('writing 块：正在写徽章可点 + 尾流预览 + 「打开文件」回调 onOpenFile', () => {
     const onOpenFile = vi.fn();
     mount(
-      makeState({ runs: [makeRun({ agent: 'pm', task: '梳理需求与优先级', taskKey: 'pm-prd', status: 'running' })] }),
+      makeState({
+        liveAgents: {
+          engineer: {
+            reasoning: '依赖已读',
+            outputPath: 'app/main.js',
+            outputTail: 'const a = 1;',
+            status: 'writing',
+          },
+        },
+      }),
       { onOpenFile },
     );
 
-    const region = screen.getByRole('region', { name: '进行中的活动' });
-    expect(within(region).getByText('产品经理')).toBeInTheDocument();
-    expect(within(region).getByText('梳理需求与优先级')).toBeInTheDocument();
-    expect(within(region).queryByRole('button')).not.toBeInTheDocument();
-    expect(onOpenFile).not.toHaveBeenCalled();
+    const region = screen.getByRole('region', { name: '进行中的成员' });
+    expect(within(region).getByText('工程师')).toBeInTheDocument();
+    fireEvent.click(within(region).getByText('正在写 app/main.js'));
+    expect(onOpenFile).toHaveBeenCalledWith('app/main.js');
+    fireEvent.click(within(region).getByRole('button', { name: '打开文件' }));
+    expect(onOpenFile).toHaveBeenCalledWith('app/main.js');
+    expect(within(region).getByText(/const a = 1;/)).toBeInTheDocument();
+    // 思考流与产出尾流同块并存
+    expect(within(region).getByText(/依赖已读/)).toBeInTheDocument();
   });
 
-  it('没有运行中的任务：不渲染活动区（不占版面）', () => {
+  it('done 块：已完成徽章 + 摘要；无思考流的块不渲染折叠按钮', () => {
+    mount(
+      makeState({
+        liveAgents: {
+          architect: { reasoning: '', outputPath: 'docs/system_design.md', outputTail: '', status: 'done', summary: '设计完成' },
+        },
+      }),
+    );
+    expect(screen.getByText('已完成')).toBeInTheDocument();
+    expect(screen.getByText('设计完成')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /思考/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '打开文件' })).not.toBeInTheDocument();
+  });
+
+  it('思考流可折叠：点击「思考」切换正文显隐（aria-expanded）', () => {
+    mount(
+      makeState({
+        liveAgents: {
+          pm: { reasoning: '第一段思考', outputPath: null, outputTail: '', status: 'thinking' },
+        },
+      }),
+    );
+    const toggle = screen.getByRole('button', { name: /思考/ });
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText(/第一段思考/)).not.toBeInTheDocument();
+  });
+
+  it('无活跃成员：不渲染直播区（不占版面）', () => {
     mount(makeState({ runs: [makeRun({ status: 'done', endedAt: Date.now() })] }));
-    expect(screen.queryByRole('region', { name: '进行中的活动' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: '进行中的成员' })).not.toBeInTheDocument();
   });
 });
 

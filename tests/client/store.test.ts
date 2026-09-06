@@ -381,6 +381,121 @@ describe('workspaceStore 事件分流', () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* 直播转录块（T31）：reasoning / 产出尾流 / 生命周期                      */
+/* ------------------------------------------------------------------ */
+
+describe('workspaceStore 直播转录（liveAgents）', () => {
+  const start = (over: Partial<StreamEvent> = {}): StreamEvent =>
+    ev({ event: 'agent_start', agent: 'pm', meta: { taskKey: 'pm-prd' }, ...over });
+
+  it('agent_start 开块（thinking）；reasoning 追加思考流；无 agent 的思考流忽略', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+
+    store.applyEvent(start());
+    expect(store.getState().liveAgents['pm']).toEqual({
+      reasoning: '',
+      outputPath: null,
+      outputTail: '',
+      status: 'thinking',
+    });
+
+    store.applyEvent(ev({ event: 'reasoning', agent: 'pm', content: '先拆功能清单…' }));
+    store.applyEvent(ev({ event: 'reasoning', agent: 'pm', content: '再定验收标准。' }));
+    expect(store.getState().liveAgents['pm']?.reasoning).toBe('先拆功能清单…再定验收标准。');
+    expect(store.getState().liveAgents['pm']?.status).toBe('thinking');
+
+    // 协议未带 agent：无从归属，不推进也不炸
+    store.applyEvent(ev({ event: 'reasoning', content: '无归属' }));
+    expect(store.getState().liveAgents['pm']?.reasoning).toBe('先拆功能清单…再定验收标准。');
+  });
+
+  it('file_start 写入中（尾流重置）→ delta 追加 → 思考流不再把状态拉回 thinking；重放 file_start 幂等', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+
+    store.applyEvent(start({ agent: 'engineer', meta: { taskKey: 'engineer:app/main.js' } }));
+    store.applyEvent(ev({ event: 'reasoning', agent: 'engineer', content: '读一下依赖' }));
+    store.applyEvent(ev({ event: 'file_start', agent: 'engineer', path: 'app/main.js' }));
+    expect(store.getState().liveAgents['engineer']).toMatchObject({ outputPath: 'app/main.js', outputTail: '', status: 'writing' });
+
+    store.applyEvent(ev({ event: 'delta', agent: 'engineer', path: 'app/main.js', content: 'const a' }));
+    store.applyEvent(ev({ event: 'delta', agent: 'engineer', path: 'app/main.js', content: ' = 1;' }));
+    expect(store.getState().liveAgents['engineer']?.outputTail).toBe('const a = 1;');
+
+    // 写作中途的思考不再把徽章闪回「思考中」（写作是更靠后的进度信号）
+    store.applyEvent(ev({ event: 'reasoning', agent: 'engineer', content: '（补一段思考）' }));
+    expect(store.getState().liveAgents['engineer']?.status).toBe('writing');
+    expect(store.getState().liveAgents['engineer']?.reasoning).toBe('读一下依赖（补一段思考）');
+
+    // Last-Event-ID 重放叠加：file_start 重开档，重放 delta 不重复拼接
+    store.applyEvent(ev({ event: 'file_start', agent: 'engineer', path: 'app/main.js' }));
+    store.applyEvent(ev({ event: 'delta', agent: 'engineer', path: 'app/main.js', content: 'const a = 1;' }));
+    expect(store.getState().liveAgents['engineer']?.outputTail).toBe('const a = 1;');
+  });
+
+  it('尾流只留尾部（600）、思考流只留尾部（3000）——内存有界', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+    store.applyEvent(start({ agent: 'engineer', meta: { taskKey: 'engineer:app/big.js' } }));
+    store.applyEvent(ev({ event: 'file_start', agent: 'engineer', path: 'app/big.js' }));
+    store.applyEvent(ev({ event: 'delta', agent: 'engineer', path: 'app/big.js', content: 'x'.repeat(900) }));
+    store.applyEvent(ev({ event: 'reasoning', agent: 'engineer', content: '想'.repeat(3200) }));
+
+    const live = store.getState().liveAgents['engineer'];
+    expect(live?.outputTail).toBe('x'.repeat(600));
+    expect(live?.reasoning).toBe('想'.repeat(3000));
+  });
+
+  it('agent_end → done + summary；块保留到下一块开始（全部 done 时整体清空）；done/stopped 收口清场', () => {
+    const store = createWorkspaceStore();
+    store.hydrate(makeSnapshot());
+
+    store.applyEvent(start());
+    store.applyEvent(ev({ event: 'agent_end', agent: 'pm', summary: 'PRD 完成' }));
+    expect(store.getState().liveAgents['pm']).toMatchObject({ status: 'done', summary: 'PRD 完成' });
+
+    // 下一块开始：现有块全部 done → 整体清空后开新块（任务间隙不闪烁消失）
+    store.applyEvent(start({ agent: 'architect', meta: { taskKey: 'architect-design' } }));
+    expect(Object.keys(store.getState().liveAgents)).toEqual(['architect']);
+
+    // 轮次收口：整体清空，不留跨轮残留
+    store.applyEvent(ev({ event: 'done' }));
+    expect(store.getState().liveAgents).toEqual({});
+  });
+
+  it('hydrate 播种在场占位：running 任务 → thinking 块（工程师带目标路径）；思考流本身不恢复', () => {
+    const store = createWorkspaceStore();
+    const running: AgentRun[] = [
+      {
+        id: 31,
+        projectId: PROJECT_ID,
+        taskKey: 'engineer:app/main.js',
+        agent: 'engineer',
+        task: '实现 app/main.js',
+        status: 'running',
+        summary: null,
+        startedAt: 1,
+        endedAt: null,
+        error: null,
+      },
+    ];
+    store.hydrate(makeSnapshot({ agentRuns: running }));
+    expect(store.getState().liveAgents['engineer']).toEqual({
+      reasoning: '',
+      outputPath: 'app/main.js',
+      outputTail: '',
+      status: 'thinking',
+    });
+
+    // 全部任务已收尾的快照：不播种（不渲染已完成任务的直播块）
+    const idle = createWorkspaceStore();
+    idle.hydrate(makeSnapshot({ agentRuns: [] }));
+    expect(idle.getState().liveAgents).toEqual({});
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* workspaceStore：快照 hydrate                                         */
 /* ------------------------------------------------------------------ */
 

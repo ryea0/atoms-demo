@@ -298,6 +298,18 @@ function injectedMetaOf(item: Message, targetTaskKey: string): MessageMeta {
 }
 
 /**
+ * 思考流接线（T31）：角色 LLM 调用的 reasoning 增量 → SSE reasoning 事件。
+ * runId 恒为 null（与该角色同处的 agent_start/file_start/delta 一致——run 行由角色层自建，
+ * 编排器派发时还拿不到 id）；reasoning 事件是 ephemeral（不进环形缓冲，见 events.ts 协议备注）。
+ */
+function reasoningEmitOf(
+  emit: (e: Omit<StreamEvent, 'seq' | 'projectId'>) => StreamEvent,
+  agent: AgentRole,
+): (text: string) => void {
+  return (text) => emit({ runId: null, event: 'reasoning', agent, content: text });
+}
+
+/**
  * 步骤边界取走待注入干预（DESIGN §3.5 两级边界共用的确定性通道）：
  * 先事件留痕再打戳（带项目作用域，CLAUDE.md 规则 9）；空列表不打戳不发作。
  * 任务边界（必检级）与工程师文件边界（每文件完成间）都走这里。
@@ -533,6 +545,7 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
       mentions: input.mentions,
       hasFiles: fileRows.length > 0,
       signal,
+      onReasoning: reasoningEmitOf(emit, 'leader'),
     });
 
     // 咨询问答：不派任务、不跑收尾，直接回答并收口
@@ -610,7 +623,12 @@ async function executeGeneration(input: StartGenerationInput, signal: AbortSigna
     // 收尾：领导汇报（一次 LLM 调用）→ assistant message → done
     await checkpointBefore(storage, projectId, '任务前:leader-closing');
     emit({ runId: null, event: 'agent_start', agent: 'leader', meta: { taskKey: 'leader-closing' } });
-    const closer = await runCloser({ storage, projectId, signal });
+    const closer = await runCloser({
+      storage,
+      projectId,
+      signal,
+      onReasoning: reasoningEmitOf(emit, 'leader'),
+    });
     emit({ runId: closer.runId, event: 'agent_end', agent: 'leader', summary: (await runSummaryOf(storage, projectId, closer.runId)) ?? undefined });
     const assistant = await storage.addMessage({ projectId, role: 'assistant', content: closer.report });
     emit({ runId: closer.runId, event: 'message', agent: 'leader', content: closer.report, meta: { role: 'assistant', messageId: assistant.id } });
@@ -667,6 +685,7 @@ async function dispatchPm(c: TaskContext, round: RoundState): Promise<TaskDispat
     fast: c.mode === 'fast',
     signal: c.signal,
     onDelta: (text) => c.emit({ runId: null, event: 'delta', agent: 'pm', path: PRD_PATH, content: text }),
+    onReasoning: reasoningEmitOf(c.emit, 'pm'),
   });
   const row = await storage.getFile(projectId, PRD_PATH);
   c.emit({ runId: result.runId, event: 'file_end', agent: 'pm', path: PRD_PATH, meta: { version: row?.version } });
@@ -686,7 +705,7 @@ async function dispatchArchitect(c: TaskContext, round: RoundState): Promise<Tas
     console.warn(`[orchestrator] 架构师任务无文本通道，干预指令未拼入（messageId=${item.id}）：${item.content}`);
   }
 
-  const result = await runArchitect({ storage, projectId, signal: c.signal });
+  const result = await runArchitect({ storage, projectId, signal: c.signal, onReasoning: reasoningEmitOf(c.emit, 'architect') });
   round.architectRan = true;
   round.tree = result.fileTree;
 
@@ -772,6 +791,7 @@ async function dispatchEngineer(c: TaskContext, round: RoundState): Promise<Task
       signal: c.signal,
       callbacks: {
         onDelta: (text) => c.emit({ runId: null, event: 'delta', agent: 'engineer', path: node.path, content: text }),
+        onReasoning: reasoningEmitOf(c.emit, 'engineer'),
       },
     });
     // file 事件以结果为准（保底模板路径不触发工具回调，T13 注）
@@ -828,6 +848,7 @@ async function dispatchExpert(c: TaskContext, round: RoundState): Promise<TaskDi
     instruction,
     signal: c.signal,
     onDelta: (text) => c.emit({ runId: null, event: 'delta', agent: role, path, content: text }),
+    onReasoning: reasoningEmitOf(c.emit, role),
   });
   const row = await storage.getFile(projectId, path);
   c.emit({ runId: result.runId, event: 'file_end', agent: role, path, meta: { version: row?.version } });

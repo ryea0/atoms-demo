@@ -80,6 +80,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       // 传副本：provider 不该持有内核这份还在增长的消息数组（防 history 被外部改写）
       messages: [...messages],
       tools: toolDefs.length > 0 ? toolDefs : undefined,
+      // 思考流通道（T31）：挂在请求对象上，计量装饰器/测试桩透传 req 即可拿到
+      onReasoning: opts.callbacks?.onReasoning,
       signal,
     };
 
