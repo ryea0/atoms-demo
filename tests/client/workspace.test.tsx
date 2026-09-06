@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Workspace } from '@/components/workspace/Workspace';
-import { clearWorkspaceStores, type WorkspaceSnapshot } from '@/lib/client/store';
+import { clearWorkspaceStores, createWorkspaceStore, type WorkspaceSnapshot } from '@/lib/client/store';
 import { roleRegistry } from '@/lib/agents/registry';
 import type { AgentRun, Project } from '@/lib/db/provider/types';
 
@@ -359,6 +359,100 @@ describe('窄屏底部栏目切换', () => {
     expect(filesTab).toHaveAttribute('aria-selected', 'true');
     expect(chatTab).toHaveAttribute('aria-selected', 'false');
     expect(viewerTab).toHaveAttribute('aria-selected', 'false');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 流式文件自动打开（T30）：打字机不用手动点开                             */
+/* ------------------------------------------------------------------ */
+
+describe('流式文件自动打开', () => {
+  it('新文件开始流式 → 自动选中该文件（查看器页签立即打开），窄屏同时切到查看栏', async () => {
+    mountWorkspace();
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+    // 初始无选中：查看器空态
+    expect(screen.getByText('在文件树中选择文件，在这里查看与编辑')).toBeInTheDocument();
+
+    act(() => {
+      createWorkspaceStore(PROJECT_ID).applyEvent({
+        seq: 1,
+        projectId: PROJECT_ID,
+        runId: 42,
+        event: 'file_start',
+        agent: 'engineer',
+        path: 'app/main.js',
+      });
+    });
+
+    expect(await screen.findByRole('tab', { selected: true, name: /main\.js/ })).toBeInTheDocument();
+    // <lg 单栏：新文件开始才切到查看栏（delta 不切）
+    expect(screen.getByRole('tab', { name: '查看' })).toHaveAttribute('data-state', 'active');
+  });
+
+  it('delta 内容推进不换焦点、不重复触发（只在有新文件开始时动作）', async () => {
+    mountWorkspace();
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+
+    act(() => {
+      createWorkspaceStore(PROJECT_ID).applyEvent({
+        seq: 1,
+        projectId: PROJECT_ID,
+        runId: 42,
+        event: 'file_start',
+        agent: 'engineer',
+        path: 'app/main.js',
+      });
+    });
+    expect(await screen.findByRole('tab', { selected: true, name: /main\.js/ })).toBeInTheDocument();
+
+    act(() => {
+      createWorkspaceStore(PROJECT_ID).applyEvent({
+        seq: 2,
+        projectId: PROJECT_ID,
+        runId: 42,
+        event: 'delta',
+        agent: 'engineer',
+        path: 'app/main.js',
+        content: 'define(',
+      });
+    });
+    // 同一个文件页签仍是唯一选中项（没有多开/闪烁）
+    expect(screen.getAllByRole('tab', { selected: true, name: /main\.js/ })).toHaveLength(1);
+  });
+
+  it('用户手动打开其他文件后不再被后续流式文件抢走焦点', async () => {
+    mountWorkspace();
+    expect(await screen.findByText('番茄钟应用')).toBeInTheDocument();
+
+    act(() => {
+      createWorkspaceStore(PROJECT_ID).applyEvent({
+        seq: 1,
+        projectId: PROJECT_ID,
+        runId: 42,
+        event: 'file_start',
+        agent: 'engineer',
+        path: 'app/main.js',
+      });
+    });
+    expect(await screen.findByRole('tab', { selected: true, name: /main\.js/ })).toBeInTheDocument();
+
+    // 用户主动点开 docs/prd.md（文件树）
+    fireEvent.click(screen.getByText('prd.md'));
+    expect(await screen.findByRole('tab', { selected: true, name: /prd\.md/ })).toBeInTheDocument();
+
+    // 之后新文件开始流式：不再抢焦点
+    act(() => {
+      createWorkspaceStore(PROJECT_ID).applyEvent({
+        seq: 2,
+        projectId: PROJECT_ID,
+        runId: 42,
+        event: 'file_start',
+        agent: 'engineer',
+        path: 'app/api.js',
+      });
+    });
+    expect(screen.getByRole('tab', { selected: true, name: /prd\.md/ })).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { selected: true, name: /api\.js/ })).not.toBeInTheDocument();
   });
 });
 

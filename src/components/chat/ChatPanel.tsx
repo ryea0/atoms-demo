@@ -12,8 +12,10 @@ import { useCallback, useEffect, useRef } from 'react';
 import type { ReactElement } from 'react';
 import { toast } from 'sonner';
 import { ChatInput, type ChatInputSendInput } from './ChatInput';
+import { ActivityFeed } from './ActivityFeed';
 import { MessageList } from './MessageList';
 import { Timeline } from './Timeline';
+import { runningActivitiesOf } from '@/lib/client/activity';
 import { isGenerationRunning } from '@/lib/client/format';
 import { sendProjectMessage, stopProjectGeneration } from '@/lib/client/session';
 import { createWorkspaceStore, type WorkspaceState } from '@/lib/client/store';
@@ -110,6 +112,8 @@ export function ChatPanel({ state, onOpenFile, onRollback }: ChatPanelProps): Re
           onOpenFile={onOpenFile}
           onSend={handleSendText}
         />
+        {/* 直播活动行（T30）：正在进行的任务（次级小字，区别于消息卡）；历史交时间线 */}
+        <ActivityFeed activities={runningActivitiesOf(state.runs)} onOpenFile={onOpenFile} />
         {state.runs.length > 0 && <Timeline runs={state.runs} onRollback={onRollback} running={running} />}
       </div>
 

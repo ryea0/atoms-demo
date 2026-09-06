@@ -15,7 +15,7 @@
  * 反向点亮文件树），经 initialPath 下发声明式打开。回滚同理收口在本层：确认 → POST restore
  * → 重拉快照对齐 store（回滚不发 file 事件）。
  */
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { ChatPanel } from '@/components/chat/ChatPanel';
 import { EditSwitch } from '@/components/common/EditSwitch';
@@ -56,19 +56,31 @@ export function Workspace({ projectId }: { projectId: number }) {
   const [rollbackTarget, setRollbackTarget] = useState<{ checkpointId: number; label: string } | null>(null);
   const [rollingBack, setRollingBack] = useState(false);
 
+  // 流式文件自动打开（T30）的跟随状态：是否已被用户手动接管、最近一次自动打开的路径、
+  // 上一帧在流路径（差分出新文件用）。先声明再被下方 handlers 引用。
+  const prevLivePathsRef = useRef<readonly string[]>([]);
+  const manuallySelectedRef = useRef(false);
+  const autoOpenedRef = useRef<string | null>(null);
+
   const handleViewChange = useCallback((next: WorkspaceView) => setView(next), []);
   const handlePaneChange = useCallback((value: string) => {
     if (isMobilePane(value)) setPane(value);
   }, []);
 
-  // 文件树点击 / 产物卡点击 → 打开并激活查看器页签；<lg 单栏下同时切到查看栏
-  // （否则页签在隐藏栏里打开，移动端毫无反馈——T25 R1 评审 Finding 2）
+  // 文件树点击 / 产物卡 / 直播活动行点击 → 打开并激活查看器页签；<lg 单栏下同时切到查看栏
+  // （否则页签在隐藏栏里打开，移动端毫无反馈——T25 R1 评审 Finding 2）。
+  // 显式选择同时记为「用户接管」：本轮之后流式文件不再自动抢焦点（见下方 effect 注释）。
   const handleOpenFile = useCallback((path: string) => {
+    manuallySelectedRef.current = true;
     setActivePath(path);
     setPane('viewer');
   }, []);
-  // 查看器页签切换/关闭 → 回写选中态（文件树高亮跟随，双向不回环：同值 setState 不触发渲染）
-  const handleActivePathChange = useCallback((path: string | null) => setActivePath(path), []);
+  // 查看器页签切换/关闭 → 回写选中态（文件树高亮跟随，双向不回环：同值 setState 不触发渲染）。
+  // 与自动打开目标不一致 = 用户在查看器里主动换页签/关页签，同样视为接管
+  const handleActivePathChange = useCallback((path: string | null) => {
+    if (path !== autoOpenedRef.current) manuallySelectedRef.current = true;
+    setActivePath(path);
+  }, []);
 
   /** 时间线「回到此任务前」：先解析该任务之前的检查点，命中才进确认闸 */
   const handleRollback = useCallback(
@@ -111,6 +123,32 @@ export function Workspace({ projectId }: { projectId: number }) {
     }
     return roles;
   }, [state.runs]);
+
+  /* ---------------------------------------------------------------- */
+  /* 流式文件自动打开（T30）                                             */
+  /* ---------------------------------------------------------------- */
+
+  // 启发式（不粗暴抢焦点）：只在「新文件开始流式」时跟随——livePaths 的增量差分，
+  // delta 与文件收尾都不动作；且用户一旦手动选过文件（文件树/产物卡/活动行点击、
+  // 查看器内换页签或关页签）就视为接管，本轮会话内不再自动跟随（不重置：刷新页面
+  // 才重新开始跟随，避免两次文件之间短暂空窗把标记洗掉、焦点又被抢回）。
+  // livePaths 数组引用随每次 delta 变化，依赖收敛成拼接串，避免 effect 空转
+  const livePathsKey = state.livePaths.join('\n');
+
+  useEffect(() => {
+    const livePaths = livePathsKey === '' ? [] : livePathsKey.split('\n');
+    const previous = prevLivePathsRef.current;
+    prevLivePathsRef.current = livePaths;
+
+    const fresh = livePaths.find((path) => !previous.includes(path));
+    // 无新文件开始（delta / 文件收尾），或用户已手动接管：不换焦点
+    if (fresh === undefined || manuallySelectedRef.current) return;
+
+    autoOpenedRef.current = fresh;
+    setActivePath(fresh);
+    // 窄屏同步切到查看栏（打字机立即可见）；桌面端该状态不影响三栏布局
+    setPane('viewer');
+  }, [livePathsKey]);
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-background">
