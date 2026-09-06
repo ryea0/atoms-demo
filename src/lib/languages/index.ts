@@ -37,3 +37,4 @@ export function defaultLanguageProfile(): LanguageProfile {
 }
 
 export { javascriptProfile } from './profiles/javascript';
+export { pythonProfile } from './profiles/python';

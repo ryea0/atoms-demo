@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   renderApiJs,
+  renderApiPy,
   renderApiTs,
   renderIndexHtml,
   renderStartSh,
@@ -237,7 +238,7 @@ function apiRoutesOf(messages: LlmMessage[]): string[] {
 /** 从最后一条用户消息提取目标文件路径（无则默认前端入口） */
 function targetPathOf(messages: LlmMessage[]): string {
   const lastUser = [...messages].reverse().find((m) => m.role === 'user');
-  const matches = [...(lastUser?.content ?? '').matchAll(/[\w./-]+\.(?:html?|js|mjs|json|md|sh|css|ts)/g)];
+  const matches = [...(lastUser?.content ?? '').matchAll(/[\w./-]+\.(?:html?|js|mjs|json|md|sh|css|ts|py)/g)];
   const last = matches.at(-1)?.[0];
   return last?.replace(/^\.\//, '') ?? 'app/frontend/index.html';
 }
@@ -248,6 +249,9 @@ function renderEngineerFile(path: string, messages: LlmMessage[]): string {
   const routes = apiRoutesOf(messages);
   if (path.endsWith('.ts')) {
     return renderApiTs(routes);
+  }
+  if (path.endsWith('.py')) {
+    return renderApiPy(routes);
   }
   if (path.endsWith('api.js') || path.endsWith('.js') || path.endsWith('.mjs')) {
     return renderApiJs(routes);

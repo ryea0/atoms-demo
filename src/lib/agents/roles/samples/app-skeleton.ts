@@ -618,6 +618,61 @@ export function renderApiTs(routes: string[]): string {
   return lines.join('\n');
 }
 
+/** Python 后端骨架：与 renderCrudApi 同语义（内存 CRUD + REST 信封），Pyodide 可跑（纯 list/dict） */
+export function renderApiPy(routes: string[]): string {
+  const list = routes.length > 0 ? routes : [DEFAULT_API_ROUTE];
+  const primary = resourceOf(list[0] ?? DEFAULT_API_ROUTE);
+  const lines: string[] = [
+    '"""内存态后端（Python、无框架、同构）：handle(method, path, body)',
+    '运行边界：浏览器 Pyodide 沙箱内执行——禁 fs/net/本地存储，刷新页面即重置。',
+    `路由：${list.join(', ')}`,
+    '响应统一为 {"code": int, "data"?: any, "message"?: str}；REST 状态码：200/201/400/404/405。',
+    '"""',
+    'db = {}',
+    'next_id = [1]',
+    ...list.flatMap((r) => [`db['${resourceOf(r)}'] = [{'id': next_id[0], 'title': '示例任务', 'done': False}]`, 'next_id[0] += 1', '']),
+    '',
+    'def handle(method, path, body):',
+    '    parts = [p for p in str(path or "").split("/") if p]',
+    `    resource = parts[1] if len(parts) > 1 else '${primary}'`,
+    '    item_id = int(parts[2]) if len(parts) > 2 else None',
+    '    bucket = db.get(resource)',
+    '    if bucket is None:',
+    '        return {"code": 404, "message": "未知资源：" + resource}',
+    '    action = str(method or "GET").upper()',
+    '    if action == "GET" and item_id is None:',
+    '        return {"code": 200, "data": bucket}',
+    '    if action == "POST":',
+    '        title = (body or {}).get("title", "").strip() if isinstance(body, dict) else ""',
+    '        if not title:',
+    '            return {"code": 400, "message": "title 不能为空"}',
+    '        created = {"id": next_id[0], "title": title, "done": False}',
+    '        next_id[0] += 1',
+    '        bucket.insert(0, created)',
+    '        return {"code": 201, "data": created}',
+    '    if action not in ("GET", "PUT", "PATCH", "DELETE"):',
+    '        return {"code": 405, "message": "不支持的方法：" + action}',
+    '    if item_id is None:',
+    '        return {"code": 404, "message": "缺少资源 id"}',
+    '    at = next((i for i, entry in enumerate(bucket) if entry["id"] == item_id), None)',
+    '    if at is None:',
+    '        return {"code": 404, "message": "条目不存在"}',
+    '    if action == "GET":',
+    '        return {"code": 200, "data": bucket[at]}',
+    '    if action in ("PUT", "PATCH"):',
+    '        patch = body if isinstance(body, dict) else {}',
+    '        if isinstance(patch.get("title"), str) and patch["title"].strip():',
+    '            bucket[at]["title"] = patch["title"].strip()',
+    '        if isinstance(patch.get("done"), bool):',
+    '            bucket[at]["done"] = patch["done"]',
+    '        return {"code": 200, "data": bucket[at]}',
+    '    removed = bucket.pop(at)',
+    '    return {"code": 200, "data": {"ok": True, "id": removed["id"]}}',
+    '',
+  ];
+  return lines.join('\n');
+}
+
 /** CRUD 后端：/api/<resource> 内存数组分桶，REST 增删改查（200/201/400/404/405） */
 function renderCrudApi(routes: string[]): string {
   const list = routes.length > 0 ? routes : [DEFAULT_API_ROUTE];
