@@ -43,6 +43,16 @@ export function notFound(message: string): Response {
   return Response.json({ error: message }, { status: 404 });
 }
 
+/** 409：状态冲突（如终端已被占用）；附加字段（code/runningCommand 等）merge 进响应体 */
+export function conflict(message: string, body: Record<string, unknown> = {}): Response {
+  return Response.json({ error: message, ...body }, { status: 409 });
+}
+
+/** 503：能力被配置关闭（如 EXEC_PROVIDER=disabled） */
+export function serviceUnavailable(message: string, body: Record<string, unknown> = {}): Response {
+  return Response.json({ error: message, ...body }, { status: 503 });
+}
+
 /** 500：兜底异常（完整错误只进服务端日志；响应只带一行 message） */
 export function internalError(error: unknown): Response {
   console.error('[api] 处理失败：', error);

@@ -7,6 +7,7 @@
  */
 import { z } from 'zod';
 import { projectEventBus } from '@/lib/agents/events';
+import { removeWorkspace } from '@/lib/exec/materialize';
 import { buildProjectSnapshot } from '@/lib/projects/service';
 import {
   applySessionCookie,
@@ -66,6 +67,8 @@ export async function DELETE(request: Request, ctx: { params: Promise<{ id: stri
     await owned.storage.deleteProject(owned.project.id);
     // ruling 12：删除时显式释放总线桶（清环形缓冲/订阅者/在流文本）
     projectEventBus.release(owned.project.id);
+    // 级联清理磁盘工作区投影（幂等 best-effort，失败只 warn 不阻断删除）
+    await removeWorkspace(owned.project.id);
     return applySessionCookie(Response.json({ ok: true }), owned.session);
   } catch (error) {
     return internalError(error);

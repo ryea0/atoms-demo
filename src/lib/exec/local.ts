@@ -22,6 +22,15 @@ const DENYLIST: { pattern: RegExp; label: string }[] = [
   { pattern: /\b(?:shutdown|reboot|poweroff|halt)\b/, label: '关机/重启' },
 ];
 
+/**
+ * 同步预检（路由层 400 用）：命中防手滑 denylist 返回 label，否则 null。
+ * 与 run 内拦截同一份规则（单一事实源），保证预检口径与执行口径一致。
+ */
+export function commandGuardLabel(command: string): string | null {
+  const hit = DENYLIST.find((item) => item.pattern.test(command));
+  return hit?.label ?? null;
+}
+
 const DEFAULT_MAX_OUTPUT_CHARS = 262_144;
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -44,11 +53,11 @@ export function createLocalExecutionProvider(env: NodeJS.ProcessEnv = process.en
 async function runLocal(options: ExecRunOptions, maxOutputChars: number): Promise<ExecResult> {
   const startedAt = Date.now();
 
-  const blocked = DENYLIST.find((item) => item.pattern.test(options.command));
-  if (blocked) {
+  const blockedLabel = commandGuardLabel(options.command);
+  if (blockedLabel !== null) {
     return {
       ok: false, exitCode: null, reason: 'blocked',
-      output: `命令被防误操作拦截（${blocked.label}）。如确需执行请手动在宿主机操作。`,
+      output: `命令被防误操作拦截（${blockedLabel}）。如确需执行请手动在宿主机操作。`,
       durationMs: 0,
     };
   }
