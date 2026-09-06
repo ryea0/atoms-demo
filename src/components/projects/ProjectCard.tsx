@@ -100,6 +100,10 @@ export function ProjectCard({ project, isSeed = false, onChanged, onDeleted }: P
         ) : (
           <Link
             href={isSeed ? `/api/projects/${project.id}/open` : `/p/${project.id}`}
+            /* 关闭 prefetch：/open 是带副作用的克隆端点，Next 生产构建会在卡片进入视口时预取
+               链接并默认跟随 302——不关，「打开即克隆」就退化成「渲染即克隆」（T25 R2）。
+               普通行指向 /p/{id}（无副作用），保留默认预取 */
+            prefetch={isSeed ? false : undefined}
             title={isSeed ? '打开示例：会复制一份到你的项目里' : '双击重命名'}
             onDoubleClick={isSeed ? undefined : startRename}
             className="min-w-0 flex-1 truncate text-sm font-medium"
@@ -117,7 +121,7 @@ export function ProjectCard({ project, isSeed = false, onChanged, onDeleted }: P
           <DropdownMenuContent align="end" className="w-40">
             {isSeed ? (
               <DropdownMenuItem asChild>
-                <Link href={`/api/projects/${project.id}/open`}>
+                <Link href={`/api/projects/${project.id}/open`} prefetch={false}>
                   <Sparkles aria-hidden />
                   打开示例
                 </Link>

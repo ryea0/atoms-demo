@@ -6,10 +6,37 @@
  * `/api/projects/[id]/open`（打开即克隆），不提供重命名/导出/删除。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createElement } from 'react';
+import { createElement, forwardRef } from 'react';
+import type { MouseEventHandler, ReactNode } from 'react';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { ProjectCard } from '@/components/projects/ProjectCard';
 import type { ProjectListItem } from '@/lib/db/provider/types';
+
+/* next/link 替身：把 Link 的 props 原样落到 <a>（真组件不会把 prefetch 透传到 DOM），
+   守卫测试据此断言「模板卡链接必须关闭 prefetch」——Next 15 生产构建下卡片进视口即发
+   RSC prefetch GET 且默认跟随 302，会把 /open 的克隆执行掉，「打开即克隆」退化成
+   「渲染即克隆」（T25 R2 评审 Important）。 */
+vi.mock('next/link', () => ({
+  // forwardRef 必须保留：DropdownMenuItem asChild（radix Slot）要向子元素转发 ref 与 props
+  default: forwardRef<
+    HTMLAnchorElement,
+    {
+      href: string;
+      prefetch?: boolean;
+      title?: string;
+      onDoubleClick?: MouseEventHandler<HTMLAnchorElement>;
+      className?: string;
+      children?: ReactNode;
+    }
+  >(function MockLink(props, ref) {
+    const { prefetch, children, ...rest } = props;
+    return createElement('a', {
+      ...rest,
+      ref,
+      'data-prefetch': prefetch === undefined ? 'unset' : String(prefetch),
+    }, children);
+  }),
+}));
 
 function makeProject(over: Partial<ProjectListItem> = {}): ProjectListItem {
   return {
@@ -42,6 +69,21 @@ afterEach(() => {
 });
 
 describe('ProjectCard 模板画廊行', () => {
+  it('seed 行的两个 open 链接（标题 + 菜单）必须 prefetch={false}（防「渲染即克隆」）', () => {
+    render(createElement(ProjectCard, { project: makeProject(), isSeed: true, onChanged: noop, onDeleted: noop }));
+    expect(screen.getByTitle('打开示例：会复制一份到你的项目里')).toHaveAttribute('data-prefetch', 'false');
+
+    openMenu(); // 菜单项挂在 body portal，不在 container 子树里
+    const openLinks = document.querySelectorAll<HTMLAnchorElement>('a[href="/api/projects/7/open"]');
+    expect(openLinks).toHaveLength(2); // 标题链接 + 菜单项
+    for (const link of openLinks) expect(link).toHaveAttribute('data-prefetch', 'false');
+  });
+
+  it('普通行链接不带关闭标记（/p/{id} 无副作用，可照常 prefetch）', () => {
+    render(createElement(ProjectCard, { project: makeProject(), onChanged: noop, onDeleted: noop }));
+    expect(screen.getByTitle('双击重命名')).toHaveAttribute('data-prefetch', 'unset');
+  });
+
   it('seed 行：示例角标 + 打开动作走 open 端点（克隆后进入副本）', () => {
     render(createElement(ProjectCard, { project: makeProject(), isSeed: true, onChanged: noop, onDeleted: noop }));
 
