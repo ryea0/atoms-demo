@@ -9,7 +9,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { ChatPanel } from '@/components/chat/ChatPanel';
 import {
   clearWorkspaceStores,
@@ -369,6 +369,67 @@ describe('产物工具卡', () => {
     fireEvent.click(screen.getByRole('button', { name: '打开 app/main.js' }));
     expect(onOpenFile).toHaveBeenCalledWith('app/main.js');
     expect(screen.getByText('生成中')).toBeInTheDocument();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 直播活动行（T30）：只播报正在进行的任务，历史交时间线                     */
+/* ------------------------------------------------------------------ */
+
+describe('直播活动行', () => {
+  it('运行中的任务渲染活动行：角色 emoji + 中文名 + 「正在写 {path}」，区域 aria-live=polite', () => {
+    mount(
+      makeState({
+        runs: [
+          makeRun({
+            id: 21,
+            status: 'done',
+            endedAt: Date.now(),
+            task: '实现 app/done.js',
+            taskKey: 'engineer:app/done.js',
+          }),
+          makeRun({ id: 22, status: 'running', task: '', taskKey: 'engineer:app/main.js' }),
+        ],
+      }),
+    );
+
+    const region = screen.getByRole('region', { name: '进行中的活动' });
+    expect(region).toHaveAttribute('aria-live', 'polite');
+    // 脉冲动画（运行中的「在动」信号）
+    expect(region.querySelector('.animate-pulse')).not.toBeNull();
+    expect(within(region).getByText('工程师')).toBeInTheDocument();
+    expect(screen.getByText('正在写 app/main.js')).toBeInTheDocument();
+    // 已结束的 run 不进直播区（时间线已管历史，这里只直播当下）
+    expect(screen.queryByText('正在写 app/done.js')).not.toBeInTheDocument();
+  });
+
+  it('点击活动行的文件路径回调 onOpenFile(path)，跳转查看器打字机', () => {
+    const onOpenFile = vi.fn();
+    mount(makeState({ runs: [makeRun({ status: 'running', task: '', taskKey: 'engineer:app/main.js' })] }), {
+      onOpenFile,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '正在写 app/main.js' }));
+    expect(onOpenFile).toHaveBeenCalledWith('app/main.js');
+  });
+
+  it('无法解析出文件路径的任务：显示任务描述文本、不可点击', () => {
+    const onOpenFile = vi.fn();
+    mount(
+      makeState({ runs: [makeRun({ agent: 'pm', task: '梳理需求与优先级', taskKey: 'pm-prd', status: 'running' })] }),
+      { onOpenFile },
+    );
+
+    const region = screen.getByRole('region', { name: '进行中的活动' });
+    expect(within(region).getByText('产品经理')).toBeInTheDocument();
+    expect(within(region).getByText('梳理需求与优先级')).toBeInTheDocument();
+    expect(within(region).queryByRole('button')).not.toBeInTheDocument();
+    expect(onOpenFile).not.toHaveBeenCalled();
+  });
+
+  it('没有运行中的任务：不渲染活动区（不占版面）', () => {
+    mount(makeState({ runs: [makeRun({ status: 'done', endedAt: Date.now() })] }));
+    expect(screen.queryByRole('region', { name: '进行中的活动' })).not.toBeInTheDocument();
   });
 });
 

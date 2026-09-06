@@ -36,6 +36,10 @@ describe('seedDemoProjects', () => {
       expect(paths).toContain('app/frontend/index.html');
       expect(paths).toContain('app/backend/api.js');
       expect(paths).toContain('app/start_app.sh');
+      // seed 与生成链路走同一 renderStartSh（T30）：端口契约（默认 3001 + 占用自救提示）随之生效
+      const startSh = (await storage.readAllFiles(project.id)).find((row) => row.path === 'app/start_app.sh');
+      expect(startSh?.content).toContain('PORT="${PORT:-3001}"');
+      expect(startSh?.content).toContain('若端口被占用：PORT=xxxx bash start_app.sh');
       // 全部按 seed 编辑者落库（文件树绿角标 = 预置文件）
       const rows = await storage.readAllFiles(project.id);
       expect(rows.length).toBeGreaterThan(0);

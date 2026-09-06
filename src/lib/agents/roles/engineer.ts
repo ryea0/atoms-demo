@@ -131,7 +131,7 @@ export function buildFastFileTree(requirement: string): FileTree {
     },
     {
       path: 'start_app.sh',
-      desc: '预览启动说明（浏览器内全栈，零依赖）',
+      desc: '预览启动脚本（本地静态服务，PORT 默认 3001，零依赖）',
       depends: ['app/frontend/index.html'],
     },
   ];
