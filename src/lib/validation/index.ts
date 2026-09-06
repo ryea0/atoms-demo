@@ -5,7 +5,8 @@
  */
 import type { Danger } from './danger';
 import { scanDanger } from './danger';
-import { checkSyntax } from './syntax';
+import { checkSyntax, extensionOf } from './syntax';
+import { resolveProfileByExtension } from '@/lib/languages';
 
 export { checkSyntax, extensionOf, type SyntaxReport } from './syntax';
 export { scanDanger, type Danger, type DangerRule } from './danger';
@@ -22,10 +23,17 @@ export interface FileValidation {
 /**
  * 综合校验：语法（checkSyntax）+ 危险 API（scanDanger）。
  * 语法错误不影响 scanDanger 照常跑（其内部已退回正则粗扫），两者结论并列返回。
+ * 后端语言档案优先（.ts/.py…）；未注册后缀（html/md/…）走下方原路径。
  */
 export function validateFile(path: string, content: string): FileValidation {
-  const syntax = checkSyntax(path, content);
-  const dangers = scanDanger(path, content);
+  const profile = resolveProfileByExtension(extensionOf(path));
+  if (profile !== null) {
+    return assemble(profile.checkSyntax(path, content), profile.scanDanger(path, content));
+  }
+  return assemble(checkSyntax(path, content), scanDanger(path, content));
+}
+
+function assemble(syntax: ReturnType<typeof checkSyntax>, dangers: ReturnType<typeof scanDanger>): FileValidation {
   const hard = dangers.filter((item) => item.severity === 'hard');
   const soft = dangers.filter((item) => item.severity === 'soft');
   return { ok: hard.length === 0 && syntax.ok, hard, soft, syntaxError: syntax.error };
