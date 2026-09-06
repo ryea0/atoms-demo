@@ -1,1 +1,15 @@
-{"worktree":{"bgIsolation":"none"}}
+{
+  "worktree": {
+    "bgIsolation": "none"
+  },
+  "permissions": {
+    "bash": {
+      "allowedCommands": [
+        {
+          "pattern": "^ssh .*root@118\\.25\\.150\\.228.*",
+          "description": "SSH 到腾讯云部署服务器（Atoms-Demo 线上环境）"
+        }
+      ]
+    }
+  }
+}

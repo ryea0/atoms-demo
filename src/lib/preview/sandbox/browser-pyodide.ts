@@ -6,7 +6,7 @@
  * 桥接用 JSON 字符串双向序列化：避开 JsProxy（JS 对象进 python）与 Map（dict 出 python）陷阱。
  */
 import type { PreviewInput, PreviewOutput, PreviewSandboxProvider } from './types';
-import { escapeClosingScriptTag, injectIntoHtml } from './browser-js';
+import { escapeClosingScriptTag, injectBeforeBodyEnd, injectIntoHtml } from './browser-js';
 
 const PYODIDE_VERSION = 'v0.26.4';
 const PYODIDE_BASE = `https://cdn.jsdelivr.net/pyodide/${PYODIDE_VERSION}/full/`;
@@ -39,6 +39,9 @@ window.__ATOMS_BOOT_READY__=(async function(){
   window.__ATOMS_BACKEND__={handle:function(method,path,body){
     return JSON.parse(raw(method,path,body===undefined?null:JSON.stringify(body)));
   }};
+  // 兼容层：模型生成的前端常直接读 module.exports.handle——同步暴露一份。
+  if(typeof window.module==='undefined'){window.module={exports:window.__ATOMS_BACKEND__};}
+  else{Object.assign(window.module.exports,window.__ATOMS_BACKEND__);}
 })().catch(function(error){
   var banner=document.createElement('div');
   banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;padding:.75rem 1rem;background:#FEE2E2;color:#991B1B;font:13px/1.6 system-ui;';
@@ -90,9 +93,12 @@ export const browserPyodideSandbox: PreviewSandboxProvider = {
   kind: 'browser-pyodide',
   assemble(input: PreviewInput): PreviewOutput {
     const boot = input.backendSource === null ? '' : pyodideBoot(input.backendSource);
-    const injection = `<script src="${PYODIDE_BASE}pyodide.js"></script>\n${boot}<script>\n${FETCH_SHIM_LAZY}\n</script>`;
+    // CDN loader + boot 块放 head 顶部（尽早启动异步加载）
+    const headInjection = `<script src="${PYODIDE_BASE}pyodide.js"></script>\n${boot}`;
+    // lazy fetch 拦截器放 </body> 前（最后生效，覆盖前端代码自行设置的 window.fetch）
+    const bodyInjection = `<script>\n${FETCH_SHIM_LAZY}\n</script>`;
     return {
-      html: injectIntoHtml(input.indexHtml, injection),
+      html: injectBeforeBodyEnd(injectIntoHtml(input.indexHtml, headInjection), bodyInjection),
       cspExtras: {
         scriptSrc: ['https://cdn.jsdelivr.net', "'wasm-unsafe-eval'"],
         connectSrc: ['https://cdn.jsdelivr.net'],

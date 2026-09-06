@@ -12,9 +12,15 @@ export function escapeClosingScriptTag(source: string): string {
   return source.replace(/<\/script/gi, '<\\/script');
 }
 
-/** ① 后端模块垫片：手工 CommonJS 求值（api.js 缺失时返回空串） */
+/** ① 后端模块垫片：手工 CommonJS 求值（api.js 缺失时返回空串）
+ *  同时挂到 window.module.exports——兼容模型生成的「前端直接读 module.exports.handle」模式。 */
 const backendWrapper = (apiJsSource: string | null): string =>
-  apiJsSource === null ? '' : `window.__ATOMS_BACKEND__=(function(){const module={exports:{}};${escapeClosingScriptTag(apiJsSource)};return module.exports;})();`;
+  apiJsSource === null
+    ? ''
+    : `window.__ATOMS_BACKEND__=(function(){const module={exports:{}};${escapeClosingScriptTag(apiJsSource)};return module.exports;})();` +
+      // 兼容层：如果模型自己定义了 module 且往 exports 挂东西，则与其合并；
+      // 如果模型没定义 module，则全局暴露 module.exports = __ATOMS_BACKEND__，前端直接读也能拿到。
+      `(function(){ if(typeof window.module==='undefined'){window.module={exports:window.__ATOMS_BACKEND__};}else{Object.assign(window.module.exports,window.__ATOMS_BACKEND__);} })();`;
 
 /** ② fetch 拦截器（占位兼容：handle 缺失时 /api/ 一律 503 信封） */
 export const FETCH_SHIM = [
@@ -70,9 +76,26 @@ export function injectIntoHtml(indexHtml: string, injection: string): string {
   return injection + indexHtml;
 }
 
-/** 纯函数装配（保留原导出名，seed/测试若有引用不断） */
+/** 尾部注入：</body> 前 → </html> 前 → 文档末尾。用于确保 fetch 拦截器最后生效（覆盖前端代码自行设置的 window.fetch）。 */
+export function injectBeforeBodyEnd(indexHtml: string, injection: string): string {
+  const bodyEnd = /<\/body>/i.exec(indexHtml);
+  if (bodyEnd !== null) {
+    return indexHtml.slice(0, bodyEnd.index) + injection + indexHtml.slice(bodyEnd.index);
+  }
+  const htmlEnd = /<\/html>/i.exec(indexHtml);
+  if (htmlEnd !== null) {
+    return indexHtml.slice(0, htmlEnd.index) + injection + indexHtml.slice(htmlEnd.index);
+  }
+  return indexHtml + injection;
+}
+
+/** 纯函数装配（保留原导出名，seed/测试若有引用不断）
+ *  后端模块注入到 <head> 顶部（提前暴露），fetch 拦截器注入到 </body> 前（保证最后生效，
+ *  覆盖模型生成的前端代码自行设置的 window.fetch）。 */
 export function assemblePreviewHtml(indexHtml: string, apiJsSource: string | null): string {
-  return injectIntoHtml(indexHtml, injectionBlock(apiJsSource));
+  const headInjection = `<script>\n${backendWrapper(apiJsSource)}\n</script>`;
+  const bodyInjection = `<script>\n${FETCH_SHIM}\n</script>`;
+  return injectBeforeBodyEnd(injectIntoHtml(indexHtml, headInjection), bodyInjection);
 }
 
 export const browserJsSandbox: PreviewSandboxProvider = {
